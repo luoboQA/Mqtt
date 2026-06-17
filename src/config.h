@@ -66,7 +66,7 @@
 #define VERSION                  "0.18.5"
 #define DEFAULT_SOCKET_FAMILY    INET
 #define DEFAULT_LOG_LEVEL        DEBUG
-#define DEFAULT_CONF_PATH        "/etc/sol/sol.conf"
+#define DEFAULT_CONF_PATH        "etc/conf/sol.conf"
 #define DEFAULT_HOSTNAME         "127.0.0.1"
 #define DEFAULT_PORT             "1883"
 #define DEFAULT_MAX_MEMORY       "2GB"
