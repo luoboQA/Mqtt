@@ -255,51 +255,56 @@ exit:
 }
 
 /*
- * Check if a topic match a wildcard subscription. It works with + and # as
- * well
+ * Check if a topic matches a subscription filter, supporting the single level
+ * wildcard '+' and the multilevel wildcard '#'.
+ *
+ * Both the topic and the filter are normalized by the caller to end with a
+ * trailing '/', i.e. "foo/bar" becomes "foo/bar/", so levels are simply the
+ * sequences of characters separated by '/'.
  */
 static inline int match_subscription(const char *topic, const char *wtopic,
                                      bool multilevel)
 {
-    size_t len = strlen(wtopic);
-    int i = 0, j = 0;
-    bool found   = false;
-    char *ptopic = (char *)topic;
-    /*
-     * Cycle through the wildcard topic, char by char, seeking for '+' char and
-     * at the same time assuring that every char is equal in the topic as well,
-     * we don't want to accept different topics
-     */
-    while (i < len && wtopic[i]) {
-        j = 0;
-        for (; i < len; ++i) {
-            if (wtopic[i] == '+') {
-                found = true;
-                break;
-            } else if (!ptopic || (wtopic[i] != ptopic[j])) {
-                return -SOL_ERR;
-            }
-            j++;
-        }
-        /*
-         * Get a pointer to the next '/', called two times because we want to
-         * skip the first occurence, like foo/bar/baz, cause at this point we'
-         * re already at /bar/baz and we don't need a pointer to /bar/baz
-         * again
-         */
-        if (ptopic[0] == '/')
-            ptopic++;
-        ptopic = index(ptopic, '/');
-        if (ptopic[0] == '/')
-            ptopic = index(ptopic + 1, '/');
-        i++;
-    }
-    if (!found && ptopic && multilevel == true)
+    const char *w = wtopic;
+    const char *t = topic;
+
+    /* A bare '#' subscription matches every topic */
+    if (w[0] == '#' && (w[1] == '\0' || w[1] == '/'))
         return SOL_OK;
-    if (ptopic && (ptopic[0] == '/' || ptopic[1] != '\0') &&
-        multilevel == false)
-        return -SOL_ERR;
-    return SOL_OK;
+
+    while (*w) {
+        const char *wend = strchr(w, '/');
+        const char *tend = strchr(t, '/');
+        size_t wlen      = wend ? (size_t)(wend - w) : strlen(w);
+        size_t tlen      = tend ? (size_t)(tend - t) : strlen(t);
+
+        /* '#' at any other position matches the rest of the topic */
+        if (wlen == 1 && w[0] == '#')
+            return SOL_OK;
+
+        /* The topic has less levels than the filter: no match */
+        if (tlen == 0 && !tend)
+            return -SOL_ERR;
+
+        /*
+         * '+' consumes exactly one level, whatever it contains, every other
+         * level is a literal that must match the topic one character by
+         * character
+         */
+        if (!(wlen == 1 && w[0] == '+') &&
+            (wlen != tlen || strncmp(w, t, wlen) != 0))
+            return -SOL_ERR;
+
+        w = wend ? wend + 1 : w + wlen;
+        t = tend ? tend + 1 : t + tlen;
+    }
+
+    /*
+     * The filter is exhausted: the topic must be exhausted as well, unless
+     * the filter ends with a multilevel wildcard consuming the remaining
+     * levels
+     */
+    return (*t == '\0' || multilevel) ? SOL_OK : -SOL_ERR;
 }
 
 /*
@@ -532,10 +537,41 @@ static void recursive_sub(struct trie_node *node, void *arg)
     list_push(s->session->subscriptions, t);
 }
 
+/*
+ * Argument passed to retained_match while scanning the whole topic store
+ */
+struct retained_delivery {
+    struct client *c;
+    const char *filter;
+    bool multilevel;
+};
+
+/*
+ * Callback applied to every topic of the store: if the topic holds a retained
+ * message matching the requested wildcard filter, it is copied in the client
+ * write buffer to be flushed right after the SUBACK, as required by the MQTT
+ * v3.1.1 spec when a subscription is made after a message has been retained
+ */
+static void retained_match(struct trie_node *node, void *arg)
+{
+    if (!node || !node->data)
+        return;
+    struct topic *t             = node->data;
+    struct retained_delivery *r = arg;
+
+    if (!t->retained_msg)
+        return;
+    if (match_subscription(t->name, r->filter, r->multilevel) != SOL_OK)
+        return;
+    size_t len = alloc_size(t->retained_msg);
+    if (r->c->towrite + len > conf->max_request_size)
+        return;
+    memcpy(r->c->wbuf + r->c->towrite, t->retained_msg, len);
+    r->c->towrite += len;
+}
+
 static int subscribe_handler(struct io_event *e)
 {
-
-    bool wildcard            = false;
     struct mqtt_subscribe *s = &e->data.subscribe;
 
     /*
@@ -545,8 +581,17 @@ static int subscribe_handler(struct io_event *e)
     unsigned char rcs[s->tuples_len];
     struct client *c = e->client;
 
+    /*
+     * Subscription filters, kept to flush the retained messages matching them
+     * right after the SUBACK has been sent
+     */
+    struct retained_delivery rd[s->tuples_len];
+    unsigned rd_len = 0;
+
     /* Subscribe packets contains a list of topics and QoS tuples */
     for (unsigned i = 0; i < s->tuples_len; i++) {
+
+        bool wildcard = false;
 
         log_debug("Received SUBSCRIBE from %s", c->client_id);
 
@@ -558,15 +603,20 @@ static int subscribe_handler(struct io_event *e)
         snprintf(topic, s->tuples[i].topic_len + 1, "%s", s->tuples[i].topic);
 
         log_debug("\t%s (QoS %i)", topic, s->tuples[i].qos);
-        /* Recursive subscribe to all children topics if the topic ends with
-         * "/#" */
-        if (topic[s->tuples[i].topic_len - 1] == '#' &&
-            topic[s->tuples[i].topic_len - 2] == '/') {
-            topic[s->tuples[i].topic_len - 1] = '\0';
-            wildcard                          = true;
-        } else if (topic[s->tuples[i].topic_len - 1] != '/') {
-            topic[s->tuples[i].topic_len]     = '/';
-            topic[s->tuples[i].topic_len + 1] = '\0';
+        unsigned tlen = s->tuples[i].topic_len;
+        /*
+         * Recursive subscribe to all children topics if the topic ends with
+         * "/#" (or is a bare "#"): the wildcard part is stripped from the
+         * stored filter and flagged as multilevel
+         */
+        if (tlen >= 2 && topic[tlen - 1] == '#' && topic[tlen - 2] == '/') {
+            topic[tlen - 1] = '\0';
+            wildcard        = true;
+        } else if (tlen == 1 && topic[0] == '#') {
+            wildcard = true;
+        } else if (topic[tlen - 1] != '/') {
+            topic[tlen]     = '/';
+            topic[tlen + 1] = '\0';
         }
 
         struct topic *t = topic_store_get_or_put(server.store, topic);
@@ -606,18 +656,17 @@ static int subscribe_handler(struct io_event *e)
                 subscriber_new(e->client->session, s->tuples[i].qos);
             add_wildcard(topic, sub, wildcard);
         }
+        /*
+         * Retained messages matching the subscriptions must be flushed after
+         * the SUBACK, keep a copy of every filter to scan the store for them
+         * once the SUBACK has been packed
+         */
+        rd[rd_len].c          = c;
+        rd[rd_len].filter     = try_strdup(topic);
+        rd[rd_len].multilevel = wildcard;
+        rd_len++;
 #if THREADSNR > 0
         pthread_mutex_unlock(&mutex);
-#endif
-
-        // Retained message? Publish it
-        // TODO move after SUBACK response
-        if (t->retained_msg) {
-            size_t len = alloc_size(t->retained_msg);
-            memcpy(c->wbuf + c->towrite, t->retained_msg, len);
-            c->towrite += len;
-        }
-#if THREADSNR > 0
         pthread_mutex_unlock(&c->mutex);
 #endif
         rcs[i] = s->tuples[i].qos;
@@ -628,11 +677,19 @@ static int subscribe_handler(struct io_event *e)
 
 #if THREADSNR > 0
     pthread_mutex_lock(&c->mutex);
+    pthread_mutex_lock(&mutex);
 #endif
     size_t len = mqtt_size(&pkt, NULL);
     mqtt_pack(&pkt, c->wbuf + c->towrite);
     c->towrite += len;
+
+    /* Retained messages? Publish them, right after the SUBACK */
+    for (unsigned i = 0; i < rd_len; i++) {
+        topic_store_map(server.store, NULL, retained_match, &rd[i]);
+        free_memory((char *)rd[i].filter);
+    }
 #if THREADSNR > 0
+    pthread_mutex_unlock(&mutex);
     pthread_mutex_unlock(&c->mutex);
 #endif
 
@@ -716,7 +773,7 @@ static int publish_handler(struct io_event *e)
     struct topic *t = topic_store_get_or_put(server.store, topic);
 
     /* Check for # wildcards subscriptions */
-    if (topic_store_wildcards_empty(server.store)) {
+    if (!topic_store_wildcards_empty(server.store)) {
         topic_store_wildcards_foreach(item, server.store)
         {
             struct subscription *s = item->data;
@@ -790,10 +847,20 @@ static int puback_handler(struct io_event *e)
 #if THREADSNR > 0
     pthread_mutex_lock(&c->mutex);
 #endif
-    inflight_msg_clear(&c->session->i_msgs[pkt_id]);
+    /*
+     * A PUBACK may refer to a message we're not tracking anymore (retained
+     * messages are flushed without an inflight entry, or the entry has been
+     * cleared by a duplicate acknowledgement): in that case there's nothing
+     * to release
+     */
+    if (!c->session)
+        return NOREPLY;
+    if (c->session->i_msgs[pkt_id].packet) {
+        inflight_msg_clear(&c->session->i_msgs[pkt_id]);
+        --c->session->inflights;
+    }
     c->session->i_msgs[pkt_id].packet = NULL;
     c->session->i_acks[pkt_id]        = -1;
-    --c->session->inflights;
 #if THREADSNR > 0
     pthread_mutex_unlock(&c->mutex);
 #endif
@@ -845,9 +912,11 @@ static int pubcomp_handler(struct io_event *e)
     pthread_mutex_lock(&c->mutex);
 #endif
     c->session->i_acks[pkt_id] = -1;
-    inflight_msg_clear(&c->session->i_msgs[pkt_id]);
+    if (c->session->i_msgs[pkt_id].packet) {
+        inflight_msg_clear(&c->session->i_msgs[pkt_id]);
+        --c->session->inflights;
+    }
     c->session->i_msgs[pkt_id].packet = NULL;
-    --c->session->inflights;
 #if THREADSNR > 0
     pthread_mutex_unlock(&c->mutex);
 #endif
