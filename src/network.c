@@ -33,6 +33,7 @@
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <openssl/err.h>
+#include <stdlib.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -171,14 +172,25 @@ int make_listen(const char *host, const char *port, int s_family)
 
     int sfd;
 
-    if ((sfd = create_and_bind(host, port, s_family)) == -1)
-        abort();
+    /*
+     * A bind/listen failure at startup is not a crash: refuse to start with
+     * a clear message and a normal exit code instead of abort(), which would
+     * look like a SIGABRT crash (134) whenever a previous instance is still
+     * shutting down and still holds the port
+     */
+    if ((sfd = create_and_bind(host, port, s_family)) == -1) {
+        fprintf(stderr,
+                "Unable to listen on %s:%s, is another broker instance "
+                "already running on that address?\n",
+                host, port);
+        exit(EXIT_FAILURE);
+    }
 
     if ((set_nonblocking(sfd)) == -1)
-        abort();
+        exit(EXIT_FAILURE);
 
     if ((set_cloexec(sfd)) == -1)
-        abort();
+        exit(EXIT_FAILURE);
 
     // Set TCP_NODELAY only for TCP sockets
     if (s_family == INET)
@@ -186,7 +198,7 @@ int make_listen(const char *host, const char *port, int s_family)
 
     if ((listen(sfd, conf->tcp_backlog)) == -1) {
         perror("listen");
-        abort();
+        exit(EXIT_FAILURE);
     }
 
     return sfd;

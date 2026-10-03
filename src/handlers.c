@@ -50,6 +50,14 @@ static int pubrel_handler(struct io_event *);
 static int pubcomp_handler(struct io_event *);
 static int pingreq_handler(struct io_event *);
 
+/*
+ * Rejects the packet types a client must never send to the broker, i.e.
+ * CONNACK, SUBACK, UNSUBACK, PINGRESP and the reserved ones: they have no
+ * handler of their own and used to be NULL slots, dereferenced blindly by
+ * handle_command.
+ */
+static int protocol_violation_handler(struct io_event *);
+
 static void session_init(struct client_session *, const char *);
 
 static struct client_session *client_session_alloc(const char *);
@@ -58,22 +66,31 @@ static unsigned next_free_mid(struct client_session *);
 
 static void inflight_msg_init(struct inflight_msg *, struct mqtt_packet *);
 
-/* Command handler mapped usign their position paired with their type */
-static handler *handlers[15] = {NULL,
-                                connect_handler,
-                                NULL,
-                                publish_handler,
-                                puback_handler,
-                                pubrec_handler,
-                                pubrel_handler,
-                                pubcomp_handler,
-                                subscribe_handler,
-                                NULL,
-                                unsubscribe_handler,
-                                NULL,
-                                pingreq_handler,
-                                NULL,
-                                disconnect_handler};
+/*
+ * Command handler mapped usign their position paired with their type, one
+ * slot for each of the 16 possible values of the 4 bits packet type, so that
+ * an unexpected type can never index past the end of the table. Slots that
+ * don't hold a real handler point to protocol_violation_handler instead of
+ * NULL.
+ */
+static handler *handlers[16] = {
+    protocol_violation_handler, /* 0:  reserved */
+    connect_handler,            /* 1:  CONNECT    (client to server) */
+    protocol_violation_handler, /* 2:  CONNACK    (server to client) */
+    publish_handler,            /* 3:  PUBLISH    (client to server) */
+    puback_handler,             /* 4:  PUBACK     (client to server) */
+    pubrec_handler,             /* 5:  PUBREC     (client to server) */
+    pubrel_handler,             /* 6:  PUBREL     (client to server) */
+    pubcomp_handler,            /* 7:  PUBCOMP    (client to server) */
+    subscribe_handler,          /* 8:  SUBSCRIBE  (client to server) */
+    protocol_violation_handler, /* 9:  SUBACK     (server to client) */
+    unsubscribe_handler,        /* 10: UNSUBSCRIBE(client to server) */
+    protocol_violation_handler, /* 11: UNSUBACK   (server to client) */
+    pingreq_handler,            /* 12: PINGREQ    (client to server) */
+    protocol_violation_handler, /* 13: PINGRESP   (server to client) */
+    disconnect_handler,         /* 14: DISCONNECT (client to server) */
+    protocol_violation_handler  /* 15: reserved */
+};
 
 /*
  * =========================
@@ -95,6 +112,11 @@ static void session_free(const struct ref *refcount)
     }
     free_memory(session->i_acks);
     free_memory(session->i_msgs);
+    /*
+     * Release the strings of the will (delivered or not): the packet is
+     * embedded in the session so only its members are heap owned
+     */
+    mqtt_packet_destroy(&session->lwt_msg);
     free_memory(session);
 }
 
@@ -108,6 +130,8 @@ static void session_init(struct client_session *session, const char *session_id)
     session->i_acks = try_calloc(MAX_INFLIGHT_MSGS, sizeof(time_t));
     session->i_msgs =
         try_calloc(MAX_INFLIGHT_MSGS, sizeof(struct inflight_msg));
+    /* Well defined (all zeros) until a CONNECT carrying a will fills it */
+    session->lwt_msg = (struct mqtt_packet){0};
     session->refcount = (struct ref){session_free, 0};
 }
 
@@ -221,6 +245,13 @@ int publish_message(struct mqtt_packet *pkt, const struct topic *t)
 #endif
             all_at_most_once = false;
         }
+        /*
+         * A QoS 0 message has nowhere to go if the subscriber is offline
+         * (or gone): packing it into a deactivated client would lock a
+         * destroyed mutex and enqueue a write on a closed descriptor
+         */
+        if (!sc || sc->online == false)
+            continue;
 #if THREADSNR > 0
         pthread_mutex_lock(&sc->mutex);
 #endif
@@ -243,8 +274,20 @@ int publish_message(struct mqtt_packet *pkt, const struct topic *t)
     }
 
     // add return code
-    if (all_at_most_once == true)
+    if (all_at_most_once == true) {
         count = 0;
+        /*
+         * Returning 0 asks the caller to DECREF the packet: when every
+         * delivery was QoS 0 no reference was ever taken, so take the one
+         * the caller's DECREF balances to release the packet (and the topic
+         * and payload strings only it owns, io.data is left untouched for
+         * PUBLISH) exactly once instead of leaking it on every message.
+         * Callers that do not DECREF (stats, LWT) are unaffected: they
+         * leave the counter above 0
+         */
+        if (pkt->refcount.count == 0)
+            INCREF(pkt, struct mqtt_packet);
+    }
 
 exit:
 
@@ -438,12 +481,39 @@ static int connect_handler(struct io_event *e)
         const char *will_topic   = (const char *)c->payload.will_topic;
         const char *will_message = (const char *)c->payload.will_message;
         // TODO check for will_topic != NULL
-        struct topic *t = topic_store_get_or_put(server.store, will_topic);
-        if (!topic_store_contains(server.store, t->name))
-            topic_store_put(server.store, t);
         // I'm sure that the string will be NUL terminated by unpack function
-        size_t msg_len       = strlen(will_message);
-        size_t tpc_len       = strlen(will_topic);
+        size_t msg_len = strlen(will_message);
+        size_t tpc_len = strlen(will_topic);
+
+        /*
+         * The will topic is indexed under its normalized name (trailing '/',
+         * like every other topic in the store) so that the delivery finds
+         * the very same node subscriptions are attached to. The insert runs
+         * with the global mutex held, a concurrent SUBSCRIBE or PUBLISH
+         * mutates the very same trie from its own critical section
+         */
+        char will_store_name[tpc_len + 2];
+        if (tpc_len > 0 && will_topic[tpc_len - 1] != '/')
+            snprintf(will_store_name, tpc_len + 2, "%s/", will_topic);
+        else
+            snprintf(will_store_name, tpc_len + 1, "%s", will_topic);
+#if THREADSNR > 0
+        pthread_mutex_lock(&mutex);
+#endif
+        struct topic *t = topic_store_get_or_put(server.store, will_store_name);
+#if THREADSNR > 0
+        pthread_mutex_unlock(&mutex);
+#endif
+
+        /*
+         * A session kept across a reconnect still holds the strings of the
+         * previous will: release them before installing the new one (a
+         * fresh session is all zeros, destroy is a no-op on it). While an
+         * inflight message still points at the embedded packet its strings
+         * must stay alive, that rare case is left to session_free()
+         */
+        if (!has_inflight(cc->session))
+            mqtt_packet_destroy(&cc->session->lwt_msg);
 
         cc->session->lwt_msg = (struct mqtt_packet){
             .header  = (union mqtt_header){.byte = PUBLISH_B},
@@ -455,6 +525,13 @@ static int connect_handler(struct io_event *e)
                 .payload    = (unsigned char *)try_strdup(will_message)}};
 
         cc->session->lwt_msg.header.bits.qos = c->bits.will_qos;
+        /*
+         * The packet is embedded in the session: park its reference count at
+         * 1 so that the bookkeeping INCREFs publish_message() makes for
+         * QoS > 0 inflight tracking can never bring it back to 0, which
+         * would call a free function on the middle of the session struct
+         */
+        cc->session->lwt_msg.refcount.count = 1;
         // We must store the retained message in the topic
         if (c->bits.will_retain == 1) {
             size_t publen          = mqtt_size(&cc->session->lwt_msg, NULL);
@@ -462,7 +539,13 @@ static int connect_handler(struct io_event *e)
             mqtt_pack(&cc->session->lwt_msg, payload);
             // We got a ready-to-be-sent bytestring in the retained message
             // field
+#if THREADSNR > 0
+            pthread_mutex_lock(&mutex);
+#endif
             t->retained_msg = payload;
+#if THREADSNR > 0
+            pthread_mutex_unlock(&mutex);
+#endif
         }
         log_info("Will message specified (%lu bytes)",
                  cc->session->lwt_msg.publish.payloadlen);
@@ -529,45 +612,91 @@ static void recursive_sub(struct trie_node *node, void *arg)
     struct subscriber *s = subscriber_clone(arg), *tmp;
     HASH_FIND_STR(t->subscribers, s->id, tmp);
     if (!tmp) {
+        s->origins = SUBSCRIBER_WILD;
         INCREF(s, struct subscriber);
         HASH_ADD_STR(t->subscribers, id, s);
+        log_debug("Adding subscriber %s to topic %s", s->session->session_id,
+                  t->name);
+        list_push(s->session->subscriptions, t);
+    } else {
+        /*
+         * Already attached to this very topic (typically by an exact
+         * SUBSCRIBE): remember that a wildcard subscription covers it too so
+         * that an UNSUBSCRIBE of the filter keeps the exact one alive, the
+         * unused copy is dropped instead of being leaked
+         */
+        tmp->origins |= SUBSCRIBER_WILD;
+        list_push(tmp->session->subscriptions, t);
+        free_memory(s);
     }
-    log_debug("Adding subscriber %s to topic %s", s->session->session_id,
-              t->name);
-    list_push(s->session->subscriptions, t);
 }
 
 /*
- * Argument passed to retained_match while scanning the whole topic store
+ * One filter of the SUBSCRIBE packet, kept until the retained messages have
+ * been flushed right after the SUBACK
  */
 struct retained_delivery {
-    struct client *c;
     const char *filter;
     bool multilevel;
 };
 
 /*
- * Callback applied to every topic of the store: if the topic holds a retained
- * message matching the requested wildcard filter, it is copied in the client
- * write buffer to be flushed right after the SUBACK, as required by the MQTT
+ * Normalize a subscription filter the way the store keys every topic: filters
+ * ending in "/#" are stripped to their prefix, keeping only the multilevel
+ * semantics in the returned flag, a bare "#" is kept as is and anything else
+ * gains a trailing '/'. Shared by SUBSCRIBE and UNSUBSCRIBE so both look up
+ * the very same trie node and wildcard index entry. `dst` must be distinct
+ * from `src` and hold strlen(src) + 2 bytes, returns true when the filter is
+ * multilevel ('#')
+ */
+static bool normalize_filter(char *dst, const char *src)
+{
+    size_t len = strlen(src);
+
+    if (len >= 2 && src[len - 1] == '#' && src[len - 2] == '/') {
+        snprintf(dst, len + 1, "%s", src);
+        dst[len - 1] = '\0';
+        return true;
+    }
+    if (len == 1 && src[0] == '#') {
+        snprintf(dst, 2, "%s", src);
+        return true;
+    }
+    if (len > 0 && src[len - 1] == '/')
+        snprintf(dst, len + 1, "%s", src);
+    else
+        snprintf(dst, len + 2, "%s/", src);
+    return false;
+}
+
+/*
+ * Argument passed to retained_collect while scanning the whole topic store
+ */
+struct retained_collection {
+    struct topic **topics; /* Topics holding a retained message, in store order */
+    size_t len;
+    size_t cap;
+};
+
+/*
+ * Callback applied to every topic of the store: collects the topics holding a
+ * retained message so that all the filters of the SUBSCRIBE can be matched
+ * against them after the SUBACK has been packed, as required by the MQTT
  * v3.1.1 spec when a subscription is made after a message has been retained
  */
-static void retained_match(struct trie_node *node, void *arg)
+static void retained_collect(struct trie_node *node, void *arg)
 {
     if (!node || !node->data)
         return;
-    struct topic *t             = node->data;
-    struct retained_delivery *r = arg;
-
+    struct topic *t = node->data;
     if (!t->retained_msg)
         return;
-    if (match_subscription(t->name, r->filter, r->multilevel) != SOL_OK)
-        return;
-    size_t len = alloc_size(t->retained_msg);
-    if (r->c->towrite + len > conf->max_request_size)
-        return;
-    memcpy(r->c->wbuf + r->c->towrite, t->retained_msg, len);
-    r->c->towrite += len;
+    struct retained_collection *rc = arg;
+    if (rc->len == rc->cap) {
+        rc->cap    = rc->cap ? rc->cap * 2 : 16;
+        rc->topics = try_realloc(rc->topics, rc->cap * sizeof(*rc->topics));
+    }
+    rc->topics[rc->len++] = t;
 }
 
 static int subscribe_handler(struct io_event *e)
@@ -591,8 +720,6 @@ static int subscribe_handler(struct io_event *e)
     /* Subscribe packets contains a list of topics and QoS tuples */
     for (unsigned i = 0; i < s->tuples_len; i++) {
 
-        bool wildcard = false;
-
         log_debug("Received SUBSCRIBE from %s", c->client_id);
 
         /*
@@ -603,33 +730,31 @@ static int subscribe_handler(struct io_event *e)
         snprintf(topic, s->tuples[i].topic_len + 1, "%s", s->tuples[i].topic);
 
         log_debug("\t%s (QoS %i)", topic, s->tuples[i].qos);
-        unsigned tlen = s->tuples[i].topic_len;
+
         /*
          * Recursive subscribe to all children topics if the topic ends with
          * "/#" (or is a bare "#"): the wildcard part is stripped from the
-         * stored filter and flagged as multilevel
+         * stored filter and flagged as multilevel, see normalize_filter()
          */
-        if (tlen >= 2 && topic[tlen - 1] == '#' && topic[tlen - 2] == '/') {
-            topic[tlen - 1] = '\0';
-            wildcard        = true;
-        } else if (tlen == 1 && topic[0] == '#') {
-            wildcard = true;
-        } else if (topic[tlen - 1] != '/') {
-            topic[tlen]     = '/';
-            topic[tlen + 1] = '\0';
-        }
+        bool wildcard =
+            normalize_filter(topic, (const char *)s->tuples[i].topic);
 
-        struct topic *t = topic_store_get_or_put(server.store, topic);
         /*
          * Let's explore two possible scenarios:
          * 1. Normal topic (no single level wildcard '+') which can end with
          *    multilevel wildcard '#'
          * 2. A topic contaning one or more single level wildcard '+'
+         *
+         * The store is always mutated with the global mutex held first and
+         * the client mutex second, the canonical order shared with
+         * publish_message() delivery, otherwise an ABBA deadlock between a
+         * SUBSCRIBE and a concurrent PUBLISH would be possible
          */
 #if THREADSNR > 0
-        pthread_mutex_lock(&c->mutex);
         pthread_mutex_lock(&mutex);
+        pthread_mutex_lock(&c->mutex);
 #endif
+        struct topic *t = topic_store_get_or_put(server.store, topic);
         if (!index(topic, '+')) {
             struct subscriber *tmp;
             HASH_FIND_STR(t->subscribers, c->client_id, tmp);
@@ -639,18 +764,39 @@ static int subscribe_handler(struct io_event *e)
                                                s->tuples[i].qos);
                     // we increment reference for the subscriptions session
                     INCREF(tmp, struct subscriber);
+                    /*
+                     * A fresh entry living on a wildcard filter's own trie
+                     * node is the record of that filter, not an exact
+                     * subscription of the node's topic
+                     */
+                    if (wildcard)
+                        tmp->origins = SUBSCRIBER_WILD;
                 }
                 list_push(e->client->session->subscriptions, t);
                 if (wildcard == true) {
+                    /*
+                     * The entry covers the filter (and its own topic, as
+                     * "a/#" matches "a"): remember it so that UNSUBSCRIBE
+                     * of the wildcard drops the record too
+                     */
+                    tmp->origins |= SUBSCRIBER_WILD;
                     add_wildcard(topic, tmp, wildcard);
                     topic_store_map(server.store, topic, recursive_sub, tmp);
+                } else {
+                    /*
+                     * The entry now doubles as an explicit subscription of
+                     * this very topic: remembering the origin lets a
+                     * concurrent wildcard covering it survive its
+                     * UNSUBSCRIBE (and vice versa)
+                     */
+                    tmp->origins |= SUBSCRIBER_EXACT;
                 }
             }
         } else {
             /*
              * Here we encountered at least 1 single level wildcard '+', we add
-             * the topic to the wildcards list as we can't know at this point
-             * which topic it will match
+             * the subscription to the wildcard index as we can't know at this
+             * point which topic it will match
              */
             struct subscriber *sub =
                 subscriber_new(e->client->session, s->tuples[i].qos);
@@ -661,7 +807,6 @@ static int subscribe_handler(struct io_event *e)
          * the SUBACK, keep a copy of every filter to scan the store for them
          * once the SUBACK has been packed
          */
-        rd[rd_len].c          = c;
         rd[rd_len].filter     = try_strdup(topic);
         rd[rd_len].multilevel = wildcard;
         rd_len++;
@@ -676,18 +821,37 @@ static int subscribe_handler(struct io_event *e)
     mqtt_suback(&pkt, s->pkt_id, rcs, s->tuples_len);
 
 #if THREADSNR > 0
-    pthread_mutex_lock(&c->mutex);
     pthread_mutex_lock(&mutex);
+    pthread_mutex_lock(&c->mutex);
 #endif
     size_t len = mqtt_size(&pkt, NULL);
     mqtt_pack(&pkt, c->wbuf + c->towrite);
     c->towrite += len;
 
-    /* Retained messages? Publish them, right after the SUBACK */
+    /*
+     * Retained messages matching the subscriptions are published right after
+     * the SUBACK: the store is walked a single time collecting the topics
+     * holding a retained message and every filter is then matched against
+     * them. The output is identical to scanning the whole store once per
+     * filter, but the cost no longer grows with filters x topics
+     */
+    struct retained_collection rc = {NULL, 0, 0};
+    topic_store_map(server.store, NULL, retained_collect, &rc);
     for (unsigned i = 0; i < rd_len; i++) {
-        topic_store_map(server.store, NULL, retained_match, &rd[i]);
+        for (size_t j = 0; j < rc.len; j++) {
+            struct topic *t = rc.topics[j];
+            if (match_subscription(t->name, rd[i].filter,
+                                   rd[i].multilevel) != SOL_OK)
+                continue;
+            size_t rlen = alloc_size(t->retained_msg);
+            if (c->towrite + rlen > conf->max_request_size)
+                continue;
+            memcpy(c->wbuf + c->towrite, t->retained_msg, rlen);
+            c->towrite += rlen;
+        }
         free_memory((char *)rd[i].filter);
     }
+    free_memory(rc.topics);
 #if THREADSNR > 0
     pthread_mutex_unlock(&mutex);
     pthread_mutex_unlock(&c->mutex);
@@ -700,6 +864,54 @@ static int subscribe_handler(struct io_event *e)
     return REPLY;
 }
 
+/*
+ * Drop the explicit (exact topic) subscription of a client from a topic: the
+ * entry survives when a wildcard subscription also covers the same topic, so
+ * that UNSUBSCRIBE stops only what it names
+ */
+static void detach_exact(struct topic *t, struct client_session *session)
+{
+    struct subscriber *sub = NULL;
+
+    if (!session)
+        return;
+    HASH_FIND_STR(t->subscribers, session->session_id, sub);
+    if (!sub)
+        return;
+    sub->origins &= ~SUBSCRIBER_EXACT;
+    if (sub->origins != 0)
+        return;
+    HASH_DEL(t->subscribers, sub);
+    DECREF(sub, struct subscriber);
+}
+
+/*
+ * Stop the wildcard deliveries a filter drives: every session topic matching
+ * it loses its WILD origin (the filter record on its own trie node included),
+ * entries still held by an exact subscription stay alive and keep delivering
+ */
+static void detach_wild_attached(struct client_session *session,
+                                 const char *filter, bool multilevel)
+{
+    if (!session || !session->subscriptions)
+        return;
+    list_foreach(item, session->subscriptions)
+    {
+        struct topic *t = item->data;
+        if (match_subscription(t->name, filter, multilevel) != SOL_OK)
+            continue;
+        struct subscriber *sub = NULL;
+        HASH_FIND_STR(t->subscribers, session->session_id, sub);
+        if (!sub || !(sub->origins & SUBSCRIBER_WILD))
+            continue;
+        sub->origins &= ~SUBSCRIBER_WILD;
+        if (sub->origins == 0) {
+            HASH_DEL(t->subscribers, sub);
+            DECREF(sub, struct subscriber);
+        }
+    }
+}
+
 static int unsubscribe_handler(struct io_event *e)
 {
 
@@ -708,15 +920,33 @@ static int unsubscribe_handler(struct io_event *e)
     log_debug("Received UNSUBSCRIBE from %s", c->client_id);
 
 #if THREADSNR > 0
-    pthread_mutex_lock(&c->mutex);
     pthread_mutex_lock(&mutex);
+    pthread_mutex_lock(&c->mutex);
 #endif
-    struct topic *t = NULL;
     for (int i = 0; i < e->data.unsubscribe.tuples_len; ++i) {
-        t = topic_store_get(server.store,
-                            (const char *)e->data.unsubscribe.tuples[i].topic);
-        if (t)
-            topic_del_subscriber(t, c);
+        const char *raw = (const char *)e->data.unsubscribe.tuples[i].topic;
+
+        /*
+         * The filter is normalized exactly like SUBSCRIBE does, both must
+         * address the very same trie node and wildcard index entry
+         */
+        char filter[strlen(raw) + 2];
+        bool multilevel = normalize_filter(filter, raw);
+
+        if (multilevel || index(filter, '+')) {
+            /*
+             * A wildcard filter: drop it from the index so that no further
+             * publish attaches the client to new topics, then stop the
+             * deliveries it already drives on the topics attached so far
+             */
+            topic_store_remove_wildcard_filter(server.store, filter,
+                                                c->client_id);
+            detach_wild_attached(c->session, filter, multilevel);
+        } else {
+            struct topic *t = topic_store_get(server.store, filter);
+            if (t)
+                detach_exact(t, c->session);
+        }
     }
 #if THREADSNR > 0
     pthread_mutex_unlock(&mutex);
@@ -730,9 +960,82 @@ static int unsubscribe_handler(struct io_event *e)
 
     log_debug("Sending UNSUBACK to %s", c->client_id);
 
-    mqtt_packet_destroy(&e->data);
+    /*
+     * The packet is deliberately NOT destroyed here: process_message()
+     * owns io.data and releases it once the REPLY has been enqueued,
+     * destroying it in the handler as well would free the tuples twice
+     * and abort the broker on the second free
+     */
 
     return REPLY;
+}
+
+/*
+ * Callback invoked for every wildcard subscription matching the topic being
+ * published, `arg` is the topic the subscriber has to be attached to: the
+ * subscriber is lazily attached so that it takes part to this delivery (and
+ * to the following ones)
+ */
+static void wildcard_match(struct subscription *s, void *arg)
+{
+    struct topic *t                  = arg;
+    struct client_session *session   = s->subscriber->session;
+    struct subscriber *ex            = NULL;
+
+    HASH_FIND_STR(t->subscribers, session->session_id, ex);
+    if (ex) {
+        /*
+         * Already attached (typically by an exact SUBSCRIBE of this very
+         * topic): remember that a wildcard covers it too, so that an
+         * UNSUBSCRIBE of the filter stops only what it names
+         */
+        ex->origins |= SUBSCRIBER_WILD;
+        return;
+    }
+    /*
+     * We need to make a copy of the subscriber cause UTHASH needs
+     * a proper handle to work correctly, otherwise we'll end up
+     * freeing the same refernce on disconnect and break the table
+     */
+    struct subscriber *copy = subscriber_clone(s->subscriber);
+    copy->origins           = SUBSCRIBER_WILD;
+    INCREF(copy, struct subscriber);
+    HASH_ADD_STR(t->subscribers, id, copy);
+    list_push(session->subscriptions, t);
+}
+
+/*
+ * Deliver the Last Will message: it mirrors the store interaction a normal
+ * PUBLISH performs (trailing '/' topic key, wildcard subscribers attached to
+ * the concrete topic) instead of bypassing it, which is what used to leave
+ * the will undelivered. The locks are released before the delivery, which
+ * acquires the global mutex itself
+ */
+void publish_lwt(struct mqtt_packet *will)
+{
+    struct mqtt_publish *p = &will->publish;
+
+    if (!p->topic || p->topiclen == 0)
+        return;
+
+    char topic[p->topiclen + 2];
+    if (p->topic[p->topiclen - 1] != '/')
+        snprintf(topic, p->topiclen + 2, "%s/", (const char *)p->topic);
+    else
+        snprintf(topic, p->topiclen + 1, "%s", (const char *)p->topic);
+
+#if THREADSNR > 0
+    pthread_mutex_lock(&mutex);
+#endif
+    struct topic *t = topic_store_get_or_put(server.store, topic);
+    if (!topic_store_wildcards_empty(server.store))
+        topic_store_match_wildcards(server.store, topic, wildcard_match, t);
+#if THREADSNR > 0
+    pthread_mutex_unlock(&mutex);
+#endif
+
+    if (t)
+        publish_message(will, t);
 }
 
 static int publish_handler(struct io_event *e)
@@ -763,8 +1066,8 @@ static int publish_handler(struct io_event *e)
         snprintf(topic, p->topiclen + 1, "%s", (const char *)p->topic);
 
 #if THREADSNR > 0
-    pthread_mutex_lock(&c->mutex);
     pthread_mutex_lock(&mutex);
+    pthread_mutex_lock(&c->mutex);
 #endif
     /*
      * Retrieve the topic from the global map, if it wasn't created before,
@@ -772,40 +1075,39 @@ static int publish_handler(struct io_event *e)
      */
     struct topic *t = topic_store_get_or_put(server.store, topic);
 
-    /* Check for # wildcards subscriptions */
-    if (!topic_store_wildcards_empty(server.store)) {
-        topic_store_wildcards_foreach(item, server.store)
-        {
-            struct subscription *s = item->data;
-            int matched = match_subscription(topic, s->topic, s->multilevel);
-            if (matched == SOL_OK &&
-                !is_subscribed(t, s->subscriber->session)) {
-                /*
-                 * We need to make a copy of the subscriber cause UTHASH needs
-                 * a proper handle to work correctly, otherwise we'll end up
-                 * freeing the same refernce on disconnect and break the table
-                 */
-                struct subscriber *copy = subscriber_clone(s->subscriber);
-                INCREF(copy, struct subscriber);
-                HASH_ADD_STR(t->subscribers, id, copy);
-                list_push(s->subscriber->session->subscriptions, t);
-            }
-        }
-    }
+    /*
+     * Attach to the topic every subscriber of a matching wildcard
+     * subscription ('+' or '#'), the index only walks the levels of this
+     * topic instead of scanning all the registered filters
+     */
+    if (!topic_store_wildcards_empty(server.store))
+        topic_store_match_wildcards(server.store, topic, wildcard_match, t);
 #if THREADSNR > 0
-    pthread_mutex_unlock(&mutex);
+    pthread_mutex_unlock(&c->mutex);
 #endif
 
     struct mqtt_packet *pkt = mqtt_packet_alloc(e->data.header.byte);
     // TODO must perform a deep copy here
     pkt->publish            = e->data.publish;
 
+    /*
+     * The retained message is store state: it is written with the global
+     * mutex still held (released just after) and with the client mutex
+     * already dropped, delivery below re-acquires the global one itself.
+     * A new retained message replaces the previous one (a zero length
+     * payload clears it, as MQTT requires): the old bytes are released
+     * first or they would be silently lost on every overwrite
+     */
     if (hdr->bits.retain == 1) {
-        t->retained_msg = try_alloc(mqtt_size(&e->data, NULL));
-        mqtt_pack(&e->data, t->retained_msg);
+        free_memory(t->retained_msg);
+        t->retained_msg = NULL;
+        if (p->payloadlen > 0) {
+            t->retained_msg = try_alloc(mqtt_size(&e->data, NULL));
+            mqtt_pack(&e->data, t->retained_msg);
+        }
     }
 #if THREADSNR > 0
-    pthread_mutex_unlock(&c->mutex);
+    pthread_mutex_unlock(&mutex);
 #endif
 
     if (publish_message(pkt, t) == 0)
@@ -853,8 +1155,12 @@ static int puback_handler(struct io_event *e)
      * cleared by a duplicate acknowledgement): in that case there's nothing
      * to release
      */
-    if (!c->session)
+    if (!c->session) {
+#if THREADSNR > 0
+        pthread_mutex_unlock(&c->mutex);
+#endif
         return NOREPLY;
+    }
     if (c->session->i_msgs[pkt_id].packet) {
         inflight_msg_clear(&c->session->i_msgs[pkt_id]);
         --c->session->inflights;
@@ -881,7 +1187,9 @@ static int pubrec_handler(struct io_event *e)
     pthread_mutex_unlock(&c->mutex);
 #endif
     // Update inflight acks table
-    c->session->i_acks[pkt_id] = time(NULL);
+    if (c->session) {
+        c->session->i_acks[pkt_id] = time(NULL);
+    }
     log_debug("Sending PUBREL to %s (m%u)", c->client_id, pkt_id);
     return REPLY;
 }
@@ -911,6 +1219,13 @@ static int pubcomp_handler(struct io_event *e)
 #if THREADSNR > 0
     pthread_mutex_lock(&c->mutex);
 #endif
+    /* A PUBCOMP can only arrive after a CONNECT, guard the session anyway */
+    if (!c->session) {
+#if THREADSNR > 0
+        pthread_mutex_unlock(&c->mutex);
+#endif
+        return NOREPLY;
+    }
     c->session->i_acks[pkt_id] = -1;
     if (c->session->i_msgs[pkt_id].packet) {
         inflight_msg_clear(&c->session->i_msgs[pkt_id]);
@@ -940,10 +1255,26 @@ static int pingreq_handler(struct io_event *e)
 }
 
 /*
+ * A client sent a packet that only the broker is allowed to send (or a
+ * reserved type): there's no handler for it, log the violation and ask the
+ * caller to drop the connection instead of dereferencing a NULL slot.
+ */
+static int protocol_violation_handler(struct io_event *e)
+{
+    log_error("Protocol violation: packet type %u received from %s is only "
+              "valid server to client",
+              e->data.header.bits.type, e->client->client_id);
+    return -ERRPACKETERR;
+}
+
+/*
  * This is the only public API we expose from this module beside
  * publish_message. It just give access to handlers mapped by message type.
  */
 int handle_command(unsigned type, struct io_event *event)
 {
+    /* The type is 4 bits wide, still never index the table out of bounds */
+    if (type >= sizeof(handlers) / sizeof(*handlers))
+        return protocol_violation_handler(event);
     return handlers[type](event);
 }

@@ -209,6 +209,24 @@ static const char *solerr(int rc)
  * Publish statistics periodic task, it will be called once every N config
  * defined seconds, it publishes some informations on predefined topics
  */
+
+/*
+ * Store lookups performed by the stats routine must hold the global mutex:
+ * publish_message() is called with the lock released (it acquires it
+ * itself), so the lookup and the publish cannot share one critical section
+ */
+static struct topic *stats_topic(const char *name)
+{
+#if THREADSNR > 0
+    pthread_mutex_lock(&mutex);
+#endif
+    struct topic *t = topic_store_get(server.store, name);
+#if THREADSNR > 0
+    pthread_mutex_unlock(&mutex);
+#endif
+    return t;
+}
+
 static void publish_stats(struct ev_ctx *ctx, void *data)
 {
     (void)data;
@@ -246,7 +264,7 @@ static void publish_stats(struct ev_ctx *ctx, void *data)
                                 .payloadlen = strlen(utime),
                                 .payload    = (unsigned char *)&utime}};
 
-    publish_message(&p, topic_store_get(server.store, sys_topics[2].name));
+    publish_message(&p, stats_topic(sys_topics[2].name));
 
     // $SOL/broker/uptime/sol
     p.publish.topiclen   = sys_topics[3].len;
@@ -254,7 +272,7 @@ static void publish_stats(struct ev_ctx *ctx, void *data)
     p.publish.payloadlen = strlen(sutime);
     p.publish.payload    = (unsigned char *)&sutime;
 
-    publish_message(&p, topic_store_get(server.store, sys_topics[3].name));
+    publish_message(&p, stats_topic(sys_topics[3].name));
 
     // $SOL/broker/clients/connected
     p.publish.topiclen   = sys_topics[4].len;
@@ -262,7 +280,7 @@ static void publish_stats(struct ev_ctx *ctx, void *data)
     p.publish.payloadlen = strlen(cclients);
     p.publish.payload    = (unsigned char *)&cclients;
 
-    publish_message(&p, topic_store_get(server.store, sys_topics[4].name));
+    publish_message(&p, stats_topic(sys_topics[4].name));
 
     // $SOL/broker/bytes/sent
     p.publish.topiclen   = sys_topics[6].len;
@@ -270,7 +288,7 @@ static void publish_stats(struct ev_ctx *ctx, void *data)
     p.publish.payloadlen = strlen(bsent);
     p.publish.payload    = (unsigned char *)&bsent;
 
-    publish_message(&p, topic_store_get(server.store, sys_topics[6].name));
+    publish_message(&p, stats_topic(sys_topics[6].name));
 
     // $SOL/broker/messages/sent
     p.publish.topiclen   = sys_topics[8].len;
@@ -278,7 +296,7 @@ static void publish_stats(struct ev_ctx *ctx, void *data)
     p.publish.payloadlen = strlen(msent);
     p.publish.payload    = (unsigned char *)&msent;
 
-    publish_message(&p, topic_store_get(server.store, sys_topics[8].name));
+    publish_message(&p, stats_topic(sys_topics[8].name));
 
     // $SOL/broker/messages/received
     p.publish.topiclen   = sys_topics[9].len;
@@ -286,7 +304,7 @@ static void publish_stats(struct ev_ctx *ctx, void *data)
     p.publish.payloadlen = strlen(mrecv);
     p.publish.payload    = (unsigned char *)&mrecv;
 
-    publish_message(&p, topic_store_get(server.store, sys_topics[9].name));
+    publish_message(&p, stats_topic(sys_topics[9].name));
 
     // $SOL/broker/memory/used
     p.publish.topiclen   = sys_topics[10].len;
@@ -294,7 +312,7 @@ static void publish_stats(struct ev_ctx *ctx, void *data)
     p.publish.payloadlen = strlen(mem);
     p.publish.payload    = (unsigned char *)&mem;
 
-    publish_message(&p, topic_store_get(server.store, sys_topics[10].name));
+    publish_message(&p, stats_topic(sys_topics[10].name));
 }
 
 /*
@@ -412,11 +430,24 @@ static void client_init(struct client *client)
 static void client_deactivate(struct client *client)
 {
 
+    /*
+     * Canonical lock order: the global mutex is always taken before the
+     * per-client one. publish_message() and inflight_msg_check() acquire the
+     * global lock first and a client lock second, so taking them in the
+     * opposite order here would create the ABBA cycle that freezes the whole
+     * broker when a SUBSCRIBE or a disconnect races with a PUBLISH
+     */
 #if THREADSNR > 0
+    pthread_mutex_lock(&mutex);
     pthread_mutex_lock(&client->mutex);
 #endif
-    if (client->online == false)
+    if (client->online == false) {
+#if THREADSNR > 0
+        pthread_mutex_unlock(&client->mutex);
+        pthread_mutex_unlock(&mutex);
+#endif
         return;
+    }
 
     client->rpos = client->toread = client->read = 0;
     client->wrote = client->towrite = 0;
@@ -424,9 +455,6 @@ static void client_deactivate(struct client *client)
 
     client->online = false;
 
-#if THREADSNR > 0
-    pthread_mutex_lock(&mutex);
-#endif
     if (client->clean_session == true) {
         if (client->session) {
             topic_store_remove_wildcard(server.store, client->client_id);
@@ -439,16 +467,27 @@ static void client_deactivate(struct client *client)
         }
         if (client->connected == true)
             HASH_DEL(server.clients_map, client);
-        memorypool_free(server.pool, client);
     }
-#if THREADSNR > 0
-    pthread_mutex_unlock(&mutex);
-#endif
+    /*
+     * All accesses to the client must happen before the pool can recycle
+     * the slot: touching the struct after memorypool_free() would corrupt
+     * whatever connection reuses it
+     */
     client->connected    = false;
     client->client_id[0] = '\0';
 #if THREADSNR > 0
     pthread_mutex_unlock(&client->mutex);
+    /*
+     * Destroying while the global mutex is still held is safe: every other
+     * thread that locks a client mutex does so only after acquiring the
+     * global one, so no waiter can exist on this mutex right now
+     */
     pthread_mutex_destroy(&client->mutex);
+#endif
+    if (client->clean_session == true)
+        memorypool_free(server.pool, client);
+#if THREADSNR > 0
+    pthread_mutex_unlock(&mutex);
 #endif
 }
 
@@ -561,8 +600,13 @@ static ssize_t recv_packet(struct client *c)
         c->rpos   = pos + 1;
         c->toread = pktlen + pos + 1; // pos = bytes used to store length
 
-        /* Looks like we got an ACK packet, we're done reading */
-        if (pktlen <= 4)
+        /*
+         * Looks like we got a packet of 4 bytes or less (ACKs, PINGREQ,
+         * DISCONNECT), we're done reading: the test is made on the total
+         * packet size and not on the remaining length, as a 5 bytes packet
+         * (e.g. a PUBLISH on a 1 char topic) still needs one more byte
+         */
+        if (c->toread <= 4)
             goto exit;
 
         c->status = WAITING_DATA;
@@ -806,16 +850,20 @@ static void read_callback(struct ev_ctx *ctx, void *data)
          */
         log_error("Closing connection with %s (%s): %s", c->client_id,
                   c->conn.ip, solerr(rc));
+        /*
+         * Deliver the LWT, if any: publish_lwt() runs the same normalized
+         * path a normal PUBLISH takes (trailing '/' topic key, wildcard
+         * subscriber attach) and takes the locks it needs itself. Doing the
+         * lookup while holding the global mutex and then calling
+         * publish_message(), which acquires that same non-recursive mutex
+         * on entry, would deadlock this very thread and freeze the broker
+         * (and make a later SIGTERM hang on the thread join)
+         */
+        if (c->has_lwt == true && c->session)
+            publish_lwt(&c->session->lwt_msg);
 #if THREADSNR > 0
         pthread_mutex_lock(&mutex);
 #endif
-        // Publish, if present, LWT message
-        if (c->has_lwt == true) {
-            char *tname     = (char *)c->session->lwt_msg.publish.topic;
-            struct topic *t = topic_store_get(server.store, tname);
-            if (t)
-                publish_message(&c->session->lwt_msg, t);
-        }
         // Clean resources
         ev_del_fd(ctx, c->conn.fd);
         // Remove from subscriptions for now
@@ -862,9 +910,23 @@ static void process_message(struct ev_ctx *ctx, struct client *c)
      * Unpack received bytes into a mqtt_packet structure and execute the
      * correct handler based on the type of the operation.
      */
-    mqtt_unpack(c->rbuf + c->rpos, &io.data, *c->rbuf, c->read - c->rpos);
+    int rc = mqtt_unpack(c->rbuf + c->rpos, &io.data, *c->rbuf,
+                         c->read - c->rpos);
     c->toread = c->read = c->rpos = 0;
-    c->rc = handle_command(io.data.header.bits.type, &io);
+    if (rc != MQTT_OK) {
+        /*
+         * The packet is malformed or it's a type a client must never send
+         * (CONNACK, SUBACK, UNSUBACK, PINGRESP or a reserved one): there's
+         * nothing decoded beside the fixed header, so no handler can be run
+         * safely, report it as a protocol error and let the switch below
+         * close the connection.
+         */
+        log_error("Protocol error: undecodable packet type %u sent by %s",
+                  io.data.header.bits.type, c->client_id);
+        c->rc = -ERRPACKETERR;
+    } else {
+        c->rc = handle_command(io.data.header.bits.type, &io);
+    }
     switch (c->rc) {
     case REPLY:
     case MQTT_NOT_AUTHORIZED:
@@ -880,6 +942,12 @@ static void process_message(struct ev_ctx *ctx, struct client *c)
             mqtt_packet_destroy(&io.data);
         break;
     case -ERRCLIENTDC:
+    case -ERRPACKETERR:
+        /*
+         * The client sent a DISCONNECT or broke the protocol: the packet is
+         * either partially decoded or holds no allocation we own, so it is
+         * deliberately not destroyed here, just drop the connection.
+         */
         ev_del_fd(ctx, c->conn.fd);
         client_deactivate(io.client);
         // Update stats

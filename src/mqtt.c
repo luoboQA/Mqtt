@@ -427,9 +427,23 @@ int mqtt_unpack(u8 *buf, struct mqtt_packet *pkt, u8 byte, usize len)
 
     pkt->header = (union mqtt_header){.byte = byte};
 
-    /* Call the appropriate unpack handler based on the message type */
+    /*
+     * PINGREQ, PINGRESP and DISCONNECT carry no payload, there is nothing to
+     * decode for them
+     */
     if (type >= PINGREQ && type <= DISCONNECT)
         return rc;
+
+    /*
+     * Every other type must have its own decoding routine: the types a
+     * client is not allowed to send (CONNACK, SUBACK, UNSUBACK) and the
+     * reserved ones have no slot in the table, refuse the packet instead of
+     * reading past the end of the table or calling a NULL pointer. The
+     * caller (process_message) reports the failure as a protocol error.
+     */
+    if (type >= sizeof(unpack_handlers) / sizeof(*unpack_handlers) ||
+        !unpack_handlers[type])
+        return -MQTT_ERR;
 
     rc = unpack_handlers[type](buf, pkt, len);
 
@@ -565,6 +579,12 @@ void mqtt_packet_publish(struct mqtt_packet *pkt, u16 pkt_id, usize topiclen,
                                          .payload    = payload};
 }
 
+/*
+ * Release the heap resources owned by the packet. Every freed pointer is
+ * reset to NULL so that destroying the same packet twice (e.g. a handler
+ * and its caller both releasing the IO data) degrades to a no-op instead
+ * of a double free abort
+ */
 void mqtt_packet_destroy(struct mqtt_packet *pkt)
 {
 
@@ -577,20 +597,29 @@ void mqtt_packet_destroy(struct mqtt_packet *pkt)
         if (pkt->connect.bits.will == 1) {
             free_memory(pkt->connect.payload.will_message);
             free_memory(pkt->connect.payload.will_topic);
+            pkt->connect.payload.will_message = NULL;
+            pkt->connect.payload.will_topic   = NULL;
         }
+        pkt->connect.payload.username = NULL;
+        pkt->connect.payload.password = NULL;
         break;
     case SUBSCRIBE:
     case UNSUBSCRIBE:
         for (unsigned i = 0; i < pkt->subscribe.tuples_len; i++)
             free_memory(pkt->subscribe.tuples[i].topic);
         free_memory(pkt->subscribe.tuples);
+        pkt->subscribe.tuples     = NULL;
+        pkt->subscribe.tuples_len = 0;
         break;
     case SUBACK:
         free_memory(pkt->suback.rcs);
+        pkt->suback.rcs = NULL;
         break;
     case PUBLISH:
         free_memory(pkt->publish.topic);
         free_memory(pkt->publish.payload);
+        pkt->publish.topic   = NULL;
+        pkt->publish.payload = NULL;
         break;
     default:
         break;

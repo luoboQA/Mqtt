@@ -90,24 +90,32 @@ void list_iter_next(struct iterator *);
  * previously defined and passed in as a function pointer, accept two void
  * *args, which generally means a node and his subsequent
  */
+/*
+ * Remove every node satisfying compare_func criteria from the list, calling
+ * the list destructor on each removed node. The iteration advances `prev`
+ * only on non matching nodes so that the head is rewritten exclusively when
+ * the head node itself is removed, and the next pointer is cached before the
+ * destructor runs because the destructor frees the current node
+ */
 #define list_remove(list, ptr, cmp)                                            \
     do {                                                                       \
-        struct list_node *prev = NULL, *tmp = NULL;                            \
-        struct list_node *curr = (list)->head;                                 \
+        struct list_node *prev = NULL, *curr = (list)->head;                   \
         while (curr != NULL) {                                                 \
+            struct list_node *next = curr->next;                               \
             if ((cmp)(curr, (ptr))) {                                          \
-                tmp = curr;                                                    \
-                if (prev == NULL)                                              \
-                    (list)->head = curr->next;                                 \
+                if (prev)                                                      \
+                    prev->next = next;                                         \
                 else                                                           \
-                    prev->next = curr->next;                                   \
-                curr = curr->next;                                             \
+                    (list)->head = next;                                       \
+                if ((list)->tail == curr)                                      \
+                    (list)->tail = prev;                                       \
                 if ((list)->destructor)                                        \
-                    (list)->destructor(tmp);                                   \
+                    (list)->destructor(curr);                                  \
                 (list)->len--;                                                 \
             } else {                                                           \
-                curr = curr->next;                                             \
+                prev = curr;                                                   \
             }                                                                  \
+            curr = next;                                                       \
         }                                                                      \
     } while (0);
 

@@ -630,13 +630,15 @@ static int ev_process_event(struct ev_ctx *ctx, int idx, int mask)
     struct ev *e = ev_api_fetch_event(ctx, idx, mask);
     int err = 0, fired = 0, fd = e->fd;
     if (mask & EV_CLOSEFD) {
-#ifdef __linux__
-        err = eventfd_read(fd, &(eventfd_t){0});
-#else
-        err = read(fd, &(unsigned long){0}, sizeof(unsigned long));
-#endif // __linux__
-        if (err < 0)
-            return EV_OK;
+        /*
+         * The descriptor (the shared run eventfd) is watched by every event
+         * loop thread: it must NOT be read here, because reading resets the
+         * counter for everyone and the loops that lose the race would get an
+         * EAGAIN below and never fire their stop callback, hanging the
+         * shutdown on pthread_join. Leaving the counter untouched keeps the
+         * fd level-triggered ready until every loop has observed it; the
+         * descriptor is released together with the process anyway
+         */
         e->rcallback(ctx, e->rdata);
         ++fired;
     } else {

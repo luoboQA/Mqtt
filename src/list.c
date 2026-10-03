@@ -57,15 +57,17 @@ void list_destroy(List *l, int deep)
     struct list_node *tmp;
     // free all nodes
     while (l->len--) {
+        /* Defensive: never dereference a NULL node if len and chain ever go
+         * out of sync, stop walking instead of crashing */
+        if (!h)
+            break;
         tmp = h->next;
         if (l->destructor) {
             l->destructor(h);
         } else {
-            if (h) {
-                if (h->data && deep == 1)
-                    free_memory(h->data);
-                free_memory(h);
-            }
+            if (h->data && deep == 1)
+                free_memory(h->data);
+            free_memory(h);
         }
         h = tmp;
     }
@@ -90,13 +92,16 @@ void list_clear(List *l, int deep)
     // free all nodes
     while (l->len--) {
 
+        /* Defensive: stop if the chain is shorter than the recorded length
+         * instead of dereferencing a NULL node */
+        if (!h)
+            break;
+
         tmp = h->next;
 
-        if (h) {
-            if (h->data && deep == 1)
-                free_memory(h->data);
-            free_memory(h);
-        }
+        if (h->data && deep == 1)
+            free_memory(h->data);
+        free_memory(h);
 
         h = tmp;
     }
@@ -191,16 +196,29 @@ static struct list_node *list_remove_single_node(struct list_node *head,
 struct list_node *list_remove_node(List *list, void *data, compare_func cmp)
 {
 
-    if (list->len == 0 || !list)
+    if (!list || list->len == 0)
         return NULL;
 
     struct list_node *node = NULL;
 
-    list_remove_single_node(list->head, data, &node, cmp);
+    /*
+     * The recursive helper returns the new head when the head node itself is
+     * the one removed: the return value must be stored back into the list,
+     * otherwise list->head would keep pointing to the detached node and the
+     * chain would be truncated at its next pointer while len is decremented
+     */
+    list->head = list_remove_single_node(list->head, data, &node, cmp);
 
     if (node) {
         list->len--;
         node->next = NULL;
+        /* If the removed node was the tail, walk to the new tail */
+        if (list->tail == node) {
+            list->tail = list->head;
+            if (list->tail)
+                while (list->tail->next)
+                    list->tail = list->tail->next;
+        }
     }
 
     return node;

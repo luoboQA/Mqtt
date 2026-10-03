@@ -34,6 +34,13 @@ struct io_event;
 
 int publish_message(struct mqtt_packet *, const struct topic *);
 
+/*
+ * Deliver an LWT message through the same normalized path a normal PUBLISH
+ * takes (trailing '/', wildcard subscriber attach): acquires the locks it
+ * needs itself
+ */
+void publish_lwt(struct mqtt_packet *);
+
 int handle_command(unsigned, struct io_event *);
 
 #endif

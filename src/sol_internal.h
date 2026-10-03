@@ -82,6 +82,9 @@ struct topic {
     struct subscriber *subscribers; /* UTHASH handle pointer, must be NULL */
 };
 
+/* The wildcard subscriptions index, an opaque segment trie (topic_store.c) */
+struct wild_index;
+
 /*
  * Topic store keep track of all topics and wildcards registered, using a
  * trie as underlying data structure
@@ -89,9 +92,10 @@ struct topic {
 struct topic_store {
     // The main topics Trie structure
     Trie *topics;
-    // A list of wildcards subscriptions, as it's not possible to know in
-    // advance what topics will match some wildcard subscriptions
-    List *wildcards;
+    // The wildcard subscriptions ('+' and '#'), indexed in a segment trie so
+    // that a PUBLISH only walks the levels of the published topic instead of
+    // scanning every registered filter. Opaque, defined in topic_store.c
+    struct wild_index *wildcards;
 };
 
 /*
@@ -103,9 +107,20 @@ struct topic_store {
  * It's hashable according to UTHASH APIs. For more info check
  * https://troydhanson.github.io/uthash/userguide.html
  */
+/*
+ * Why a subscriber entry sits on a topic: an explicit SUBSCRIBE of the
+ * topic itself, a wildcard subscription that got attached to it (by a
+ * "#"/"+" filter matching it), or both. UNSUBSCRIBE drops only the origin
+ * it names, so unsubscribing "foo/#" keeps an exact "foo/bar" alive (and
+ * vice versa)
+ */
+#define SUBSCRIBER_EXACT 0x1
+#define SUBSCRIBER_WILD 0x2
+
 struct subscriber {
     struct client_session *session; /* Session referring to a client */
     unsigned char granted_qos; /* The QoS given by the server for each topic */
+    unsigned char origins; /* SUBSCRIBER_EXACT | SUBSCRIBER_WILD */
     char id[MQTT_CLIENT_ID_LEN]; /* Client ID key */
     UT_hash_handle hh; /* UTHASH handle, needed to use UTHASH macros */
     struct ref
@@ -370,6 +385,14 @@ void topic_store_add_wildcard(struct topic_store *, struct subscription *);
 void topic_store_remove_wildcard(struct topic_store *, char *);
 
 /*
+ * Remove the subscriptions registered for one specific filter by a given
+ * client from the wildcard index (no-op for exact filters, which are never
+ * indexed), used by UNSUBSCRIBE to stop the wildcard delivery
+ */
+void topic_store_remove_wildcard_filter(struct topic_store *, const char *,
+                                        const char *);
+
+/*
  * Run a function to each node of the topic_store trie holding the topic
  * entries
  */
@@ -377,12 +400,24 @@ void topic_store_map(struct topic_store *, const char *,
                      void (*fn)(struct trie_node *, void *), void *);
 
 /*
- * Check if the wildcards list of the topic_store is empty
+ * Callback invoked once for each wildcard subscription matching a topic, the
+ * subscription pointer is only valid for the duration of the call
+ */
+typedef void (*wildcard_cb)(struct subscription *, void *);
+
+/*
+ * Invoke the callback for every wildcard subscription matching the given
+ * topic, the topic must be normalized to end with a trailing '/' as the rest
+ * of the codebase does. Only the levels of the topic are walked, so the cost
+ * is O(levels) rather than O(registered wildcard subscriptions)
+ */
+void topic_store_match_wildcards(struct topic_store *, const char *,
+                                 wildcard_cb, void *);
+
+/*
+ * Check if the store holds any wildcard subscription
  */
 bool topic_store_wildcards_empty(const struct topic_store *);
-
-#define topic_store_wildcards_foreach(item, store)                             \
-    list_foreach(item, store->wildcards)
 
 #define has_inflight(session)   ((session)->inflights > 0)
 

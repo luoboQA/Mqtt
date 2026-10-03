@@ -41,6 +41,7 @@ struct subscriber *subscriber_new(struct client_session *s, unsigned char qos)
     struct subscriber *sub = try_alloc(sizeof(*sub));
     sub->session           = s;
     sub->granted_qos       = qos;
+    sub->origins           = SUBSCRIBER_EXACT;
     sub->refcount = (struct ref){.count = 0, .free = subscriber_destroy};
     memcpy(sub->id, s->session_id, MQTT_CLIENT_ID_LEN);
     return sub;
@@ -58,6 +59,7 @@ struct subscriber *subscriber_clone(const struct subscriber *s)
     struct subscriber *sub = try_alloc(sizeof(*sub));
     sub->session           = s->session;
     sub->granted_qos       = s->granted_qos;
+    sub->origins           = s->origins;
     sub->refcount = (struct ref){.count = 0, .free = subscriber_destroy};
     memcpy(sub->id, s->id, MQTT_CLIENT_ID_LEN);
     return sub;
