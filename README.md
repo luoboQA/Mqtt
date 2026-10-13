@@ -12,6 +12,30 @@ the [tutorial branch](https://github.com/codepr/sol/tree/tutorial); the master
 branch is the most up-to-date and tested.
 **Not for production use**.
 
+                    ┌─────────────────────────────┐
+                    │         sol.c (main)        │
+                    │  解析命令行 / 加载配置 / 启动   │
+                    └──────────────┬──────────────┘
+                                   │
+                    ┌──────────────▼──────────────┐
+                    │      server.c (核心)         │
+                    │  event-loop + 回调 + 客户端池  │
+                    └──┬────────┬────────┬─────────┘
+                       │        │        │
+        ┌──────────────▼─┐ ┌────▼────┐ ┌─▼──────────┐
+        │ ev.c (多路复用) │ │network.c│ │handlers.c  │
+        │epoll/poll/select││socket/TLS││各MQTT命令   │
+        └────────────────┘ └─────────┘ └─┬──────────┘
+                                         │
+                       ┌─────────────────▼─────────────────┐
+                       │  mqtt.c (编解码) + pack.c (字节序)  │
+                       └─────────────────┬─────────────────┘
+                                         │
+        ┌────────────────────────────────▼──────────────────────────┐
+        │ 数据结构: trie.c(主题树) bst.c(AVL子节点) list.c iterator.c  │
+        │          topic_store.c(通配符索引) memory/memorypool.c      │
+        └───────────────────────────────────────────────────────────┘
+
 ### Features
 
 It's still a work in progress but it already handles the most of the basic
