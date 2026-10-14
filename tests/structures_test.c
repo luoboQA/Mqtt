@@ -219,6 +219,59 @@ static char *test_trie_delete(void)
 }
 
 /*
+ * Destructor for the delete test below: releases the payload and reports the
+ * delete as successful, exactly what the topic store does with its topics
+ */
+static bool test_payload_destructor(struct trie_node *node, bool flag)
+{
+    (void)flag;
+    if (!node || !node->data)
+        return false;
+    free_memory(node->data);
+    return true;
+}
+
+/*
+ * Tests the delete on a trie owning its payloads through a destructor, the
+ * very configuration of the topic store: the node must not keep a pointer to
+ * the payload it just released (a later find() would hand out freed memory)
+ * and the nodes the removals empty have to be released too
+ */
+static char *test_trie_delete_with_destructor(void)
+{
+    struct Trie *root = trie_new(test_payload_destructor);
+    const char *key1  = "persist/topic";
+    const char *key2  = "persist";
+    trie_insert(root, key1, try_strdup("a"));
+    trie_insert(root, key2, try_strdup("b"));
+
+    ASSERT("trie::trie_delete_with_destructor...FAIL",
+           trie_delete(root, key1) == true);
+
+    void *payload = NULL;
+    bool found    = trie_find(root, key1, &payload);
+    ASSERT("trie::trie_delete_with_destructor...FAIL (dangling payload)",
+           found == false && payload == NULL);
+
+    /* The sibling key survives the pruning of the deleted branch */
+    found = trie_find(root, key2, &payload);
+    ASSERT("trie::trie_delete_with_destructor...FAIL (sibling lost)",
+           found == true && payload != NULL);
+    ASSERT("trie::trie_delete_with_destructor...FAIL (size)",
+           trie_size(root) == 1);
+
+    ASSERT("trie::trie_delete_with_destructor...FAIL",
+           trie_delete(root, key2) == true);
+    /* Nothing is left: every node the removals emptied is gone */
+    ASSERT("trie::trie_delete_with_destructor...FAIL (empty nodes kept)",
+           trie_size(root) == 0 && trie_is_free_node(root->root) == true);
+
+    trie_destroy(root);
+    printf("trie::trie_delete_with_destructor...OK\n");
+    return 0;
+}
+
+/*
  * Tests the prefix delete on the trie
  */
 static char *test_trie_prefix_delete(void)
@@ -299,6 +352,7 @@ char *structures_test(void)
     RUN_TEST(test_trie_insert);
     RUN_TEST(test_trie_find);
     RUN_TEST(test_trie_delete);
+    RUN_TEST(test_trie_delete_with_destructor);
     RUN_TEST(test_trie_prefix_delete);
     RUN_TEST(test_trie_prefix_count);
 

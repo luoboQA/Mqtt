@@ -96,6 +96,12 @@ size_t trie_size(const Trie *);
  */
 struct node_data *trie_insert(Trie *, const char *, const void *);
 
+/*
+ * Remove a key from the trie, releasing its payload through the trie
+ * destructor when one is set. The nodes the removal leaves empty (no payload,
+ * no child) are released as well, so deleting a key gives the memory back
+ * instead of only detaching the value from a growing skeleton
+ */
 bool trie_delete(Trie *, const char *);
 
 /*

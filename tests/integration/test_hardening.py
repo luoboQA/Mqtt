@@ -98,6 +98,11 @@ class TestHardening(base_testcase.BaseTestcase):
                 buf += chunk
         return out
 
+    def unsubscribe(self, conn, mid, topic):
+        conn.sendall(sol_test.create_unsubscribe(mid, topic))
+        code, _ = sol_test.read_ack(conn.recv(100))
+        self.assertEqual(code, 0xB0)
+
     def assert_broker_alive(self):
         conn, _ = self.connect('alive-check')
         self.send_disconnect(conn)
@@ -243,6 +248,28 @@ class TestHardening(base_testcase.BaseTestcase):
             # Acknowledge them so the queue drains before the session ends
             for _, _, _, mid in publishes:
                 sub.sendall(sol_test.create_puback(mid))
+        finally:
+            sub.close()
+        self.assert_broker_alive()
+
+    def test_wildcard_unsubscribe_leaves_no_phantom_subscription(self):
+        """'phantom' and 'phantom/#' share the very same node of the topic
+        tree: the entry a multilevel filter creates there used to be marked as
+        an exact subscription of the bare topic as well, so unsubscribing
+        'phantom/#' kept delivering 'phantom' to a client that had never
+        subscribed to it"""
+        sub, _ = self.connect('phantom-sub')
+        try:
+            self.subscribe(sub, 1, {'phantom/#': 0})
+            self.unsubscribe(sub, 2, 'phantom/#')
+            pub, _ = self.connect('phantom-pub')
+            try:
+                pub.sendall(sol_test.create_publish('phantom', 'bare'))
+                pub.sendall(sol_test.create_publish('phantom/x', 'under'))
+                time.sleep(0.5)
+                self.assert_nothing_follows(sub)
+            finally:
+                pub.close()
         finally:
             sub.close()
         self.assert_broker_alive()

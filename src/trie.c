@@ -168,6 +168,37 @@ struct node_data *trie_insert(Trie *trie, const char *key, const void *data)
     return cursor->data;
 }
 
+/*
+ * Drop the chain of nodes a removal left without purpose: a node holding no
+ * payload and no child can no longer be reached by any key, it would only
+ * keep the trie growing on a long lived store. Called with the root and the
+ * deleted key, it walks the very same path backwards and returns true when
+ * the node it was called on ended up empty and has been unlinked from its
+ * parent AVL tree (releasing the bst_node itself, see bst_delete())
+ */
+static bool trie_prune(struct trie_node *node, const char *key)
+{
+    if (!node)
+        return false;
+
+    /* End of the key: this node stays when it has children or holds data */
+    if (*key == '\0')
+        return node->data == NULL && node->children == NULL;
+
+    struct bst_node *child = bst_search(node->children, *key);
+    if (!child)
+        return false;
+
+    struct trie_node *next = child->data;
+    if (!trie_prune(next, key + 1))
+        return false;
+
+    node->children = bst_delete(node->children, *key);
+    free_memory(next);
+
+    return node->data == NULL && node->children == NULL;
+}
+
 bool trie_delete(Trie *trie, const char *key)
 {
 
@@ -176,6 +207,9 @@ bool trie_delete(Trie *trie, const char *key)
     struct trie_node *retnode = trie->root;
 
     if (strlen(key) > 0) {
+
+        /* Kept to walk the path again and prune what the removal empties */
+        const char *prune_key = key;
 
         // Move to the end of the prefix first
         for (; *key; ++key) {
@@ -190,23 +224,30 @@ bool trie_delete(Trie *trie, const char *key)
             retnode = child->data;
         }
         if (trie->destructor) {
-            bool ret = false;
-            if ((ret = trie->destructor(retnode, true)) == true)
-                trie->size--;
-            return ret;
+            /*
+             * The destructor releases the payload, but the node keeps
+             * pointing at it: leaving a dangling `data` behind made every
+             * later trie_find() on this key hand out freed memory, so clear
+             * the slot as soon as the delete succeeded
+             */
+            if (trie->destructor(retnode, true) == false)
+                return false;
+            retnode->data = NULL;
+            trie->size--;
         } else {
-            if (retnode->data) {
-                free_memory(retnode->data);
-                retnode->data = NULL;
-                trie->size--;
-            } else {
+            if (!retnode->data) {
                 /*
                  * The node exists but holds no data: nothing has been
                  * deleted, report the failure instead of claiming success
                  */
                 return false;
             }
+            free_memory(retnode->data);
+            retnode->data = NULL;
+            trie->size--;
         }
+        /* Release every node the removal left empty, the root excluded */
+        trie_prune(trie->root, prune_key);
         return true;
     }
 

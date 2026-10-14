@@ -169,6 +169,42 @@ class TestDelivery(base_testcase.BaseTestcase):
             sub.close()
         self.assert_broker_alive()
 
+    def test_subscribe_unsubscribe_churn_keeps_heap_flat(self):
+        """A client alternating SUBSCRIBE and UNSUBSCRIBE on the same topic
+        used to leave a copy of the topic behind in its session list on every
+        cycle: the list only ever grew, and every topic left in it became
+        permanently unreclaimable for the broker"""
+        # Two connections on purpose: the one reading the memory stat is
+        # subscribed to $SOL and would see a stats tick land between the
+        # SUBACKs of the other one
+        watcher, _ = self.connect('churn-watch')
+        churn, _ = self.connect('churn-client')
+        try:
+            self.subscribe(watcher, 1, {'$SOL/broker/memory/used/': 0})
+            before = self.read_memstat(watcher)
+            mid = 10
+            for _ in range(1000):
+                churn.sendall(sol_test.create_subscribe(mid, {'churn/topic': 1}))
+                code, ack_mid, _ = sol_test.read_suback(churn.recv(100))
+                self.assertEqual(code, 0x90)
+                self.assertEqual(ack_mid, mid)
+                churn.sendall(sol_test.create_unsubscribe(mid, 'churn/topic'))
+                code, _ = sol_test.read_ack(churn.recv(100))
+                self.assertEqual(code, 0xB0)
+                mid += 1
+            time.sleep(1.2)
+            self.drain_stats(watcher)
+            after = self.read_memstat(watcher)
+            # The session list is a set now: measured, the cycle costs ~3
+            # bytes against ~51 before the fix (the growing list of topic
+            # pointers), so 1000 cycles stay far below the threshold while the
+            # old behaviour lands around +50KB
+            self.assertLess(after - before, 16384)
+        finally:
+            churn.close()
+            watcher.close()
+        self.assert_broker_alive()
+
     def test_retained_message(self):
         pub, _ = self.connect('ret-pub')
         try:

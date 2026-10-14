@@ -60,6 +60,10 @@ static int protocol_violation_handler(struct io_event *);
 
 static void session_init(struct client_session *, const char *);
 
+/* Keep the session list of the topics it holds a subscriber entry on in sync */
+static void session_track_topic(struct client_session *, struct topic *);
+static void session_untrack_topic(struct client_session *, struct topic *);
+
 static struct client_session *client_session_alloc(const char *);
 
 static unsigned short next_free_mid(struct client_session *);
@@ -1061,7 +1065,7 @@ static void recursive_sub(struct trie_node *node, void *arg)
         HASH_ADD_STR(t->subscribers, id, s);
         log_debug("Adding subscriber %s to topic %s", s->session->session_id,
                   t->name);
-        list_push(s->session->subscriptions, t);
+        session_track_topic(s->session, t);
     } else {
         /*
          * Already attached to this very topic (typically by an exact
@@ -1070,7 +1074,7 @@ static void recursive_sub(struct trie_node *node, void *arg)
          * unused copy is dropped instead of being leaked
          */
         tmp->origins |= SUBSCRIBER_WILD;
-        list_push(tmp->session->subscriptions, t);
+        session_track_topic(tmp->session, t);
         free_memory(s);
     }
 }
@@ -1271,14 +1275,23 @@ static int subscribe_handler(struct io_event *e)
                 // we increment reference for the subscriptions session
                 INCREF(tmp, struct subscriber);
                 /*
-                 * Push only on the first subscription of this node: a
-                 * repeated SUBSCRIBE used to append the same topic again,
-                 * growing the list (and the teardown loop) with every
-                 * duplicate. Also note a fresh entry living on a wildcard
-                 * filter's own trie node is the record of that filter, not
-                 * an exact subscription of the node's topic
+                 * A fresh entry takes its origin from the filter that made
+                 * it, not from the generic EXACT default subscriber_new()
+                 * seeds: the entry a multilevel filter creates on its own
+                 * node (the "a" node of "a/#") is the record of that filter,
+                 * and marking it exact as well made a later UNSUBSCRIBE of
+                 * "a/#" keep delivering the bare "a" as if it were still
+                 * subscribed. The origin is set here, the WILD branch below
+                 * completes the filter registration
                  */
-                list_push(e->client->session->subscriptions, t);
+                tmp->origins = wildcard ? 0 : SUBSCRIBER_EXACT;
+                /*
+                 * Track the topic once, on the first subscription of this
+                 * node: a repeated SUBSCRIBE used to append the same topic
+                 * again, growing the list (and the teardown loop) with every
+                 * duplicate
+                 */
+                session_track_topic(e->client->session, t);
             } else {
                 /*
                  * MQTT v3.1.1 §3.8.4: a SUBSCRIBE for a filter already
@@ -1416,6 +1429,34 @@ static int subscribe_handler(struct io_event *e)
 }
 
 /*
+ * The session keeps the list of the topics it holds a subscriber entry on:
+ * it is what the teardown walks to detach them all, and what tells the topic
+ * store which nodes are still referenced. Both helpers keep it a *set*,
+ * exactly mirroring the entries that exist at any moment
+ */
+static void session_track_topic(struct client_session *s, struct topic *t)
+{
+    list_foreach(item, s->subscriptions)
+    {
+        if (item->data == t)
+            return;
+    }
+    list_push(s->subscriptions, t);
+}
+
+/* Comparator for list_remove_node(): 0 marks the node to unlink */
+static int topic_ptr_cmp(const void *node_ptr, const void *topic_ptr)
+{
+    return ((const struct list_node *)node_ptr)->data == topic_ptr ? 0 : 1;
+}
+
+static void session_untrack_topic(struct client_session *s, struct topic *t)
+{
+    struct list_node *node = list_remove_node(s->subscriptions, t, topic_ptr_cmp);
+    free_memory(node);
+}
+
+/*
  * Drop the explicit (exact topic) subscription of a client from a topic: the
  * entry survives when a wildcard subscription also covers the same topic, so
  * that UNSUBSCRIBE stops only what it names
@@ -1434,6 +1475,7 @@ static void detach_exact(struct topic *t, struct client_session *session)
         return;
     HASH_DEL(t->subscribers, sub);
     DECREF(sub, struct subscriber);
+    session_untrack_topic(session, t);
 }
 
 /*
@@ -1446,20 +1488,29 @@ static void detach_wild_attached(struct client_session *session,
 {
     if (!session || !session->subscriptions)
         return;
-    list_foreach(item, session->subscriptions)
-    {
-        struct topic *t = item->data;
-        if (match_subscription(t->name, filter, multilevel) != SOL_OK)
-            continue;
-        struct subscriber *sub = NULL;
-        HASH_FIND_STR(t->subscribers, session->session_id, sub);
-        if (!sub || !(sub->origins & SUBSCRIBER_WILD))
-            continue;
-        sub->origins &= ~SUBSCRIBER_WILD;
-        if (sub->origins == 0) {
-            HASH_DEL(t->subscribers, sub);
-            DECREF(sub, struct subscriber);
+    /*
+     * The walk is done by hand instead of with list_foreach: an entry that
+     * loses its last origin is removed from this very list, and the macro
+     * reads the next pointer of the node it just visited, which would be
+     * freed memory by then
+     */
+    struct list_node *item = session->subscriptions->head;
+    while (item) {
+        struct list_node *next = item->next;
+        struct topic *t        = item->data;
+        if (match_subscription(t->name, filter, multilevel) == SOL_OK) {
+            struct subscriber *sub = NULL;
+            HASH_FIND_STR(t->subscribers, session->session_id, sub);
+            if (sub && (sub->origins & SUBSCRIBER_WILD)) {
+                sub->origins &= ~SUBSCRIBER_WILD;
+                if (sub->origins == 0) {
+                    HASH_DEL(t->subscribers, sub);
+                    DECREF(sub, struct subscriber);
+                    session_untrack_topic(session, t);
+                }
+            }
         }
+        item = next;
     }
 }
 
@@ -1564,7 +1615,8 @@ static void wildcard_match(struct subscription *s, void *arg)
         /*
          * Already attached (typically by an exact SUBSCRIBE of this very
          * topic): remember that a wildcard covers it too, so that an
-         * UNSUBSCRIBE of the filter stops only what it names
+         * UNSUBSCRIBE of the filter stops only what it names. The topic is
+         * already tracked by the exact subscription that attached it
          */
         ex->origins |= SUBSCRIBER_WILD;
         return;
@@ -1578,7 +1630,7 @@ static void wildcard_match(struct subscription *s, void *arg)
     copy->origins           = SUBSCRIBER_WILD;
     INCREF(copy, struct subscriber);
     HASH_ADD_STR(t->subscribers, id, copy);
-    list_push(session->subscriptions, t);
+    session_track_topic(session, t);
 }
 
 /*

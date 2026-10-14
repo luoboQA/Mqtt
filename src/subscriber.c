@@ -41,7 +41,12 @@ struct subscriber *subscriber_new(struct client_session *s, unsigned char qos)
     struct subscriber *sub = try_alloc(sizeof(*sub));
     sub->session           = s;
     sub->granted_qos       = qos;
-    sub->origins           = SUBSCRIBER_EXACT;
+    /*
+     * No origin yet: an entry is attached either to a topic, and the caller
+     * marks it EXACT or WILD depending on the filter that created it, or to
+     * the wildcard index alone
+     */
+    sub->origins  = 0;
     sub->refcount = (struct ref){.count = 0, .free = subscriber_destroy};
     memcpy(sub->id, s->session_id, MQTT_CLIENT_ID_LEN);
     return sub;
