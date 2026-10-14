@@ -510,6 +510,44 @@ void topic_store_remove_wildcard_filter(struct topic_store *store,
 }
 
 /*
+ * Look up the subscription one client registered for one specific wildcard
+ * filter, performing the same walk as topic_store_remove_wildcard_filter
+ * but returning the record instead of dropping it. NULL means the client
+ * holds no record of the filter yet, which is how a repeat SUBSCRIBE is
+ * told apart from a first one: the former may only re-grant the QoS on the
+ * existing entry instead of indexing one duplicate record on every repeat
+ */
+struct subscription *topic_store_find_wildcard_filter(struct topic_store *store,
+                                                      const char *filter,
+                                                      const char *id)
+{
+    struct wild_index *index = store->wildcards;
+    struct wild_node *node   = index->root;
+    const char *p            = filter;
+    size_t len;
+    const char *level;
+
+    while ((level = wild_next_level(&p, &len)) != NULL) {
+        /* Same stop condition of wild_index_add: '#' sits above the node */
+        if (len == 1 && level[0] == '#')
+            break;
+        node = wild_child(node, level, len, false);
+        if (!node)
+            return NULL;
+    }
+
+    if (!node->subs)
+        return NULL;
+    list_foreach(item, node->subs)
+    {
+        struct subscription *s = item->data;
+        if (strncmp(s->subscriber->id, id, MQTT_CLIENT_ID_LEN) == 0)
+            return s;
+    }
+    return NULL;
+}
+
+/*
  * Run a function to each node of the topic_store trie holding the topic
  * entries
  */

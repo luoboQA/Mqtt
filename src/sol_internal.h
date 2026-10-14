@@ -272,6 +272,17 @@ struct client_session {
     u16 *pending_mids;
     unsigned pending_len; /* Number of identifiers in pending_mids */
     unsigned pending_cap; /* Allocated slots of pending_mids */
+    /*
+     * Inbound QoS 2 flow state: packet identifiers for which a PUBREC has
+     * been sent and the PUBREL is still outstanding. A retransmitted PUBLISH
+     * carrying one of them is a duplicate and must not be delivered twice
+     * (§4.3.3 exactly-once), while PUBREL clears the entry. Same dynamic
+     * array shape as pending_mids, entries can never exceed the 1-65535
+     * identifier space and are removed as each flow completes
+     */
+    u16 *q2_recv_mids;
+    unsigned q2_recv_len; /* Number of identifiers in q2_recv_mids */
+    unsigned q2_recv_cap; /* Allocated slots of q2_recv_mids */
     UT_hash_handle hh; /* UTHASH handle, needed to use UTHASH macros */
     struct ref
         refcount; /* Reference counting struct, to share the struct easily */
@@ -410,6 +421,15 @@ void topic_store_remove_wildcard(struct topic_store *, char *);
  */
 void topic_store_remove_wildcard_filter(struct topic_store *, const char *,
                                         const char *);
+
+/*
+ * Look up the subscription one client registered for one specific wildcard
+ * filter, NULL when the client holds no record of it (used to make a repeat
+ * SUBSCRIBE re-grant the QoS instead of indexing a duplicate entry)
+ */
+struct subscription *topic_store_find_wildcard_filter(struct topic_store *,
+                                                      const char *,
+                                                      const char *);
 
 /*
  * Run a function to each node of the topic_store trie holding the topic

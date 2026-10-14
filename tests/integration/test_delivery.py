@@ -1,4 +1,5 @@
 import socket
+import time
 import unittest
 import sol_test
 import base_testcase
@@ -54,6 +55,117 @@ class TestDelivery(base_testcase.BaseTestcase):
             finally:
                 pub.close()
         finally:
+            sub.close()
+        self.assert_broker_alive()
+
+    def test_wildcard_resubscribe_regrants_qos(self):
+        """MQTT v3.1.1 §3.8.4: re-SUBSCRIBing a '+' filter with a higher
+        QoS must re-grant it on the existing wildcard index entry instead
+        of indexing a duplicate record on every repeat (which grew the
+        index and the teardown loop for nothing): the first delivery after
+        the re-subscribe leaves at the new QoS, and the message arrives
+        exactly once"""
+        sub, _ = self.connect('wildqos-sub')
+        try:
+            self.subscribe(sub, 1, {'re/+': 0})
+            self.subscribe(sub, 2, {'re/+': 2})  # repeated, higher QoS
+            pub, _ = self.connect('wildqos-pub')
+            try:
+                pub.sendall(sol_test.create_publish('re/x', 'q', qos=2,
+                                                    mid=7))
+                self.assertEqual(pub.recv(100)[0], 0x50)  # PUBREC
+                pub.sendall(sol_test.create_pubrel(7))
+                self.assertEqual(pub.recv(100)[0], 0x70)  # PUBCOMP
+            finally:
+                pub.close()
+            header, topic, payload, mid = sol_test.read_publish(sub.recv(100))
+            self.assertEqual(payload, b'q')
+            # The re-granted QoS governs: re-subscribing at a higher QoS
+            # must leave the delivery at that QoS, exactly once
+            self.assertEqual((header >> 1) & 0x03, 2)
+            sub.sendall(sol_test.create_pubrec(mid))
+            self.assertEqual(sub.recv(100)[0], 0x62)  # PUBREL
+            sub.sendall(sol_test.create_pubcomp(mid))
+            # Repeats never duplicated a delivery (the match side always
+            # deduplicated): pin the single-copy behaviour down anyway
+            sub.settimeout(2)
+            with self.assertRaises(socket.timeout):
+                sub.recv(100)
+        finally:
+            sub.close()
+        self.assert_broker_alive()
+
+    def read_memstat(self, conn):
+        """Read the next $SOL/broker/memory/used/ payload: a plain integer
+        of the bytes the broker currently holds on its allocator. Stats
+        ticks arrive glued into a single recv, so the packet is cut at its
+        Remaining Length boundary instead of trusting read_publish on a
+        raw buffer"""
+        conn.settimeout(5)
+        buf = b''
+        while True:
+            while len(buf) < 4:
+                got = conn.recv(2048)
+                self.assertTrue(got, 'broker closed while reading stats')
+                buf += got
+            body, remaining = sol_test.mqtt_decode_len(buf)
+            total = len(buf) - len(body) + remaining
+            if len(buf) < total:
+                got = conn.recv(2048)
+                self.assertTrue(got, 'broker closed while reading stats')
+                buf += got
+                continue
+            packet, buf = buf[:total], buf[total:]
+            _, topic, payload, _ = sol_test.read_publish(packet)
+            if topic == '$SOL/broker/memory/used/':
+                return int(payload)
+
+    def drain_stats(self, conn):
+        """Discard every stats message already queued so the next blocking
+        read waits for a tick published after the caller's workload: a
+        message published mid-flood would show only partial growth"""
+        conn.settimeout(0)
+        try:
+            while True:
+                try:
+                    if not conn.recv(4096):
+                        return
+                except (BlockingIOError, TimeoutError):
+                    return
+        finally:
+            conn.settimeout(5)
+
+    def test_repeated_wildcard_subscribe_keeps_heap_flat(self):
+        """MQTT v3.1.1 §3.8.4: re-SUBSCRIBing a '+' filter must re-use the
+        wildcard index entry instead of appending a fresh subscriber record
+        on every repeat, so 300 repeats leave the broker heap flat. The old
+        behavior silently grew it by a few hundred bytes per repeat while
+        delivery kept deduplicating, an invisible leak per duplicate
+        SUBSCRIBE"""
+        sub, _ = self.connect('memwatch-sub')
+        pub = None
+        try:
+            self.subscribe(sub, 1, {'$SOL/broker/memory/used/': 0})
+            # The publisher's own session tables dominate the heap: connect
+            # it before the baseline is read so only the flood is measured
+            pub, _ = self.connect('memwatch-pub')
+            before = self.read_memstat(sub)
+            for mid in range(10, 310):
+                pub.sendall(sol_test.create_subscribe(mid, {'mem/+': 0}))
+                code, ack_mid, _ = sol_test.read_suback(pub.recv(100))
+                self.assertEqual(code, 0x90)
+                self.assertEqual(ack_mid, mid)
+            # Let a stats tick pass, discard whatever queued up during the
+            # flood and compare against a value published after it
+            time.sleep(1.2)
+            self.drain_stats(sub)
+            after = self.read_memstat(sub)
+            # The fix grows by the one shared trie node (hundreds of
+            # bytes); the duplicate records were ~180 bytes each
+            self.assertLess(after - before, 8192)
+        finally:
+            if pub:
+                pub.close()
             sub.close()
         self.assert_broker_alive()
 
@@ -203,6 +315,43 @@ class TestDelivery(base_testcase.BaseTestcase):
                     sub.sendall(sol_test.create_pubcomp(mid))
             finally:
                 pub.close()
+        finally:
+            sub.close()
+        self.assert_broker_alive()
+
+    def test_qos_two_duplicate_publish_deduplicated(self):
+        """A QoS 2 PUBLISH retransmitted while its PUBREL is still
+        outstanding names an already-open exactly-once flow (§4.3.3): the
+        repeat must only earn the PUBREC again and never reach the
+        subscribers twice, exactly what the pre-fix broker violated"""
+        sub, _ = self.connect('q2dedup-sub')
+        try:
+            self.subscribe(sub, 1, {'dedup/topic': 2})
+            pub, _ = self.connect('q2dedup-pub')
+            try:
+                publish = sol_test.create_publish('dedup/topic', 'once',
+                                                  qos=2, mid=11)
+                pub.sendall(publish)
+                self.assertEqual(pub.recv(100)[0], 0x50)  # PUBREC
+                # The PUBREC "got lost": the client resends the very same
+                # packet, identifier alone marks it as the open flow
+                pub.sendall(publish)
+                self.assertEqual(pub.recv(100)[0], 0x50)  # PUBREC again
+                pub.sendall(sol_test.create_pubrel(11))
+                self.assertEqual(pub.recv(100)[0], 0x70)  # PUBCOMP
+            finally:
+                pub.close()
+            # Exactly one delivery came out of the two PUBLISHes
+            header, topic, payload, mid = sol_test.read_publish(sub.recv(100))
+            self.assertEqual(payload, b'once')
+            self.assertEqual((header >> 1) & 0x03, 2)
+            sub.sendall(sol_test.create_pubrec(mid))
+            self.assertEqual(sub.recv(100)[0], 0x62)  # PUBREL
+            sub.sendall(sol_test.create_pubcomp(mid))
+            # Without the dedup the repeat would sit in the socket here
+            sub.settimeout(2)
+            with self.assertRaises(socket.timeout):
+                sub.recv(100)
         finally:
             sub.close()
         self.assert_broker_alive()

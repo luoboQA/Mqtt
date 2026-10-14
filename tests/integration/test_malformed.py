@@ -82,6 +82,47 @@ class TestMalformed(base_testcase.BaseTestcase):
             conn.close()
         self.assert_broker_alive()
 
+    def assert_dropped(self, conn, packet):
+        """Send a malformed packet and require the broker to close from its
+        side: recv returning EOF (or a reset) is the drop, a broker still
+        talking after the timeout accepted what it must refuse"""
+        conn.sendall(packet)
+        try:
+            self.assertEqual(conn.recv(100), b'')
+        except (ConnectionResetError, BrokenPipeError):
+            pass  # a reset while draining is a close too
+
+    def test_publish_qos_three_rejected(self):
+        # QoS 3 does not exist in MQTT 3.1.1: a PUBLISH carrying it is
+        # malformed (§3.3.1.2). The old unpacker accepted it, treated it as
+        # QoS 1 and forwarded the payload: the connection must be dropped
+        # instead, before anything is decoded or allocated
+        conn = self.get_connection()
+        conn.settimeout(2)
+        try:
+            conn.sendall(sol_test.create_connect('qos3'))
+            conn.recv(100)
+            self.assert_dropped(
+                conn, sol_test.create_publish('bad/qos', 'nope', qos=3))
+        finally:
+            conn.close()
+        self.assert_broker_alive()
+
+    def test_publish_zero_mid_rejected(self):
+        # The identifier of a QoS > 0 PUBLISH must be non-zero (§2.2.1):
+        # mid 0 can never name an acknowledgement flow that completes, so
+        # the packet is malformed and drops the connection
+        conn = self.get_connection()
+        conn.settimeout(2)
+        try:
+            conn.sendall(sol_test.create_connect('zero-mid'))
+            conn.recv(100)
+            self.assert_dropped(
+                conn, sol_test.create_publish('bad/mid', 'x', qos=1, mid=0))
+        finally:
+            conn.close()
+        self.assert_broker_alive()
+
     def test_pingresp_from_client(self):
         # PINGRESP (13) is a server to client packet only
         conn = self.get_connection()

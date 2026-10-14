@@ -340,6 +340,14 @@ static int unpack_mqtt_publish(u8 *buf, struct mqtt_packet *pkt, usize len)
 {
     usize avail = len;
 
+    /*
+     * A PUBLISH with QoS 3 is malformed (§3.3.1.2): reject it while only
+     * the fixed header has been read, so no allocation exists yet and the
+     * caller can drop the connection without anything to release
+     */
+    if (pkt->header.bits.qos > EXACTLY_ONCE)
+        return -MQTT_ERR;
+
     /* Read topic length and topic of the soon-to-be-published message */
     pkt->publish.topiclen = unpack_string16(&buf, &avail, &pkt->publish.topic);
 
@@ -368,6 +376,17 @@ static int unpack_mqtt_publish(u8 *buf, struct mqtt_packet *pkt, usize len)
             return -MQTT_ERR;
         pkt->publish.pkt_id = unpack_integer(&buf, 'H');
         avail -= sizeof(u16);
+        /*
+         * A QoS > 0 PUBLISH must name a non-zero identifier (§2.2.1), reject
+         * it before the payload is allocated: only the topic is owned at
+         * this point, release it here since the caller's error path never
+         * destroys a PUBLISH
+         */
+        if (pkt->publish.pkt_id == 0) {
+            free_memory(pkt->publish.topic);
+            pkt->publish.topic = NULL;
+            return -MQTT_ERR;
+        }
     }
 
     /*

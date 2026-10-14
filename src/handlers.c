@@ -117,6 +117,7 @@ static void session_free(const struct ref *refcount)
         }
     }
     free_memory(session->pending_mids);
+    free_memory(session->q2_recv_mids);
     free_memory(session->i_acks);
     free_memory(session->i_msgs);
     /*
@@ -140,6 +141,9 @@ static void session_init(struct client_session *session, const char *session_id)
     session->pending_mids = NULL;
     session->pending_len  = 0;
     session->pending_cap  = 0;
+    session->q2_recv_mids = NULL;
+    session->q2_recv_len  = 0;
+    session->q2_recv_cap  = 0;
     /* Well defined (all zeros) until a CONNECT carrying a will fills it */
     session->lwt_msg = (struct mqtt_packet){0};
     session->refcount = (struct ref){session_free, 0};
@@ -179,6 +183,49 @@ void inflight_untrack_mid(struct client_session *session, unsigned short mid)
         if (session->pending_mids[i] == mid) {
             /* Swap with the last element: the order is not significant */
             session->pending_mids[i] = session->pending_mids[--session->pending_len];
+            return;
+        }
+    }
+}
+
+/*
+ * Inbound QoS 2 bookkeeping: while a mid sits in this set a PUBREC has been
+ * sent for it and the PUBREL has not landed yet, so the identifier belongs to
+ * an exactly-once flow already delivered. Lookups are O(q2_recv_len), which
+ * is a handful of entries in practice (one per message the publisher still
+ * owes a PUBREL for)
+ */
+static bool inbound_q2_find(const struct client_session *session,
+                            unsigned short mid)
+{
+    for (unsigned i = 0; i < session->q2_recv_len; ++i)
+        if (session->q2_recv_mids[i] == mid)
+            return true;
+    return false;
+}
+
+static void inbound_q2_track(struct client_session *session, unsigned short mid)
+{
+    /* Idempotent: a mid already open must never appear twice in the array */
+    if (inbound_q2_find(session, mid))
+        return;
+    if (session->q2_recv_len == session->q2_recv_cap) {
+        unsigned newcap = session->q2_recv_cap ? session->q2_recv_cap * 2 : 8;
+        session->q2_recv_mids =
+            try_realloc(session->q2_recv_mids, newcap * sizeof(u16));
+        session->q2_recv_cap = newcap;
+    }
+    session->q2_recv_mids[session->q2_recv_len++] = mid;
+}
+
+static void inbound_q2_untrack(struct client_session *session,
+                               unsigned short mid)
+{
+    for (unsigned i = 0; i < session->q2_recv_len; ++i) {
+        if (session->q2_recv_mids[i] == mid) {
+            /* Swap with the last element: the order is not significant */
+            session->q2_recv_mids[i] =
+                session->q2_recv_mids[--session->q2_recv_len];
             return;
         }
     }
@@ -999,10 +1046,27 @@ static int subscribe_handler(struct io_event *e)
              * Here we encountered at least 1 single level wildcard '+', we add
              * the subscription to the wildcard index as we can't know at this
              * point which topic it will match
+             *
+             * MQTT v3.1.1 §3.8.4: a SUBSCRIBE for a filter already subscribed
+             * replaces the previous subscription, only the granted QoS may
+             * differ. Indexing a fresh record on every repeat grew the
+             * wildcard index (and with it the client teardown loop) without
+             * bound while delivery kept deduplicating anyway, so a repeat now
+             * re-grants the QoS on the existing entry. The new QoS governs
+             * every topic this filter has not been matched against yet; a
+             * topic already carrying a cloned subscriber keeps the QoS it was
+             * attached with, an overlap MQTT 3.1.1 leaves to the server
              */
-            struct subscriber *sub =
-                subscriber_new(e->client->session, s->tuples[i].qos);
-            add_wildcard(topic, sub, wildcard);
+            struct subscription *ex =
+                topic_store_find_wildcard_filter(server.store, topic,
+                                                 c->client_id);
+            if (ex) {
+                ex->subscriber->granted_qos = s->tuples[i].qos;
+            } else {
+                struct subscriber *sub =
+                    subscriber_new(e->client->session, s->tuples[i].qos);
+                add_wildcard(topic, sub, wildcard);
+            }
         }
         /*
          * Retained messages matching the subscriptions must be flushed after
@@ -1259,6 +1323,43 @@ static int publish_handler(struct io_event *e)
     unsigned char qos = hdr->bits.qos;
 
     /*
+     * QoS 2 is exactly-once (§4.3.3): an identifier still open in the
+     * session's inbound set has already been delivered below and answered
+     * with a PUBREC, only the PUBREL is outstanding. A retransmission of
+     * that very PUBLISH (the client never saw the PUBREC and resends with
+     * DUP) must not reach the subscribers a second time: it only earns the
+     * PUBREC again, and pubrel_handler() closes the flow when the PUBREL
+     * lands. The set lives in the session, so a persistent session keeps
+     * deduplicating across a reconnect where the client retransmits what it
+     * still had in flight. Duplicates are recognised by the identifier alone
+     */
+    if (qos == EXACTLY_ONCE && orig_mid != 0 && c->session) {
+#if THREADSNR > 0
+        pthread_mutex_lock(&c->mutex);
+#endif
+        bool dup = inbound_q2_find(c->session, orig_mid);
+        if (dup) {
+            mqtt_pack_mono(c->wbuf + c->towrite, PUBREC, orig_mid);
+            c->towrite += MQTT_ACK_LEN;
+        }
+#if THREADSNR > 0
+        pthread_mutex_unlock(&c->mutex);
+#endif
+        if (dup) {
+            log_debug("Duplicate QoS 2 PUBLISH from %s (m%u), PUBREC resent",
+                      c->client_id, orig_mid);
+            /*
+             * The topic and payload unpacked from this duplicate are still
+             * owned here: no packet was built to take them over and
+             * process_message() never destroys a PUBLISH, so release them
+             * now or every retransmission would leak them
+             */
+            mqtt_packet_destroy(&e->data);
+            return REPLY;
+        }
+    }
+
+    /*
      * For convenience we assure that all topics ends with a '/', indicating a
      * hierarchical level
      */
@@ -1335,6 +1436,14 @@ static int publish_handler(struct io_event *e)
     mqtt_ack(&e->data, ptype == PUBACK ? PUBACK_B : PUBREC_B);
     mqtt_pack_mono(c->wbuf + c->towrite, ptype, orig_mid);
     c->towrite += MQTT_ACK_LEN;
+    /*
+     * Open the exactly-once flow: while this identifier sits in the set, a
+     * retransmitted PUBLISH naming it is a duplicate to be answered with the
+     * PUBREC only, and the PUBREL closes the entry (identifier 0 can never
+     * name a flow, §2.2.1, so it is never tracked and behaves as before)
+     */
+    if (qos == EXACTLY_ONCE && orig_mid != 0 && c->session)
+        inbound_q2_track(c->session, orig_mid);
 #if THREADSNR > 0
     pthread_mutex_unlock(&c->mutex);
 #endif
@@ -1433,6 +1542,15 @@ static int pubrel_handler(struct io_event *e)
 #if THREADSNR > 0
     pthread_mutex_lock(&c->mutex);
 #endif
+    /*
+     * The PUBREL completes the inbound exactly-once flow (§4.3.3): drop the
+     * identifier so a later PUBLISH reusing it is a fresh message again. A
+     * PUBREL for an identifier that is not open (duplicate PUBREL, stray
+     * packet) is a no-op here and still earns the PUBCOMP below, which is
+     * exactly what the spec wants for a retransmitted PUBREL
+     */
+    if (c->session)
+        inbound_q2_untrack(c->session, (unsigned short) pkt_id);
     mqtt_pack_mono(c->wbuf + c->towrite, PUBCOMP, pkt_id);
     c->towrite += MQTT_ACK_LEN;
 #if THREADSNR > 0
