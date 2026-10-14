@@ -96,8 +96,8 @@ usize unpack(u8 *, char *, ...);
 
 i64 unpack_integer(u8 **, i8);
 
-u8 *unpack_bytes(u8 **, usize);
+u8 *unpack_bytes(u8 **, usize, usize);
 
-u16 unpack_string16(u8 **, u8 **);
+u16 unpack_string16(u8 **, usize *, u8 **);
 
 #endif

@@ -7,7 +7,8 @@ import subprocess
 
 def start_broker(host='127.0.0.1', port=1883):
     proc = subprocess.Popen(
-        f'./sol -a {host} -p {port}'.split(),
+        f'./sol -a {host} -p {port} '
+        f'-c tests/integration/sol_test.conf'.split(),
         stdout=subprocess.PIPE,
         preexec_fn=os.setsid
     )
@@ -82,7 +83,7 @@ def create_connect(client_id=None, clean_session=True, keepalive=60,
 
     packet_len = mqtt_encode_len(remaining_length)
     packet = struct.pack("!B" + str(len(packet_len)) + "s", 0x10, packet_len)
-    packet += struct.pack("!H4sBBH", len(b"MQTT"), b"MQTT", 5, flags, keepalive)
+    packet += struct.pack("!H4sBBH", len(b"MQTT"), b"MQTT", 4, flags, keepalive)
 
     if client_id != None:
         packet += struct.pack("!H" + str(len(client_id)) + "s", len(client_id), bytes(client_id))
@@ -108,7 +109,10 @@ def create_disconnect(rc=0):
 
 
 def read_connack(packet):
-    cmd, _, _, rc = struct.unpack('!BBBB', packet)
+    # The CONNACK can share a single TCP segment with whatever follows it
+    # (e.g. the queued messages flushed on a resumed session): only its
+    # first four bytes belong to the packet itself
+    cmd, _, _, rc = struct.unpack('!BBBB', packet[:4])
     return cmd, rc
 
 
@@ -141,3 +145,53 @@ def read_suback(packet):
     pack_format = "!" + "B" * len(packet)
     granted_qos = struct.unpack(pack_format, packet)
     return header, mid, granted_qos[0]
+
+
+def create_publish(topic, payload, qos=0, mid=1, retain=False):
+    topic = topic.encode("utf-8") if isinstance(topic, str) else topic
+    payload = payload.encode("utf-8") if isinstance(payload, str) else payload
+    header = 0x30 | ((qos & 0x03) << 1) | (1 if retain else 0)
+    remaining = 2 + len(topic) + len(payload) + (2 if qos > 0 else 0)
+    packet = struct.pack("!B", header) + mqtt_encode_len(remaining)
+    packet += struct.pack("!H", len(topic)) + topic
+    if qos > 0:
+        packet += struct.pack("!H", mid)
+    packet += payload
+    return packet
+
+
+def read_publish(packet):
+    """Decode the first PUBLISH of a buffer: (header, topic, payload, mid)"""
+    header = packet[0]
+    qos = (header >> 1) & 0x03
+    body, _ = mqtt_decode_len(packet)
+    tlen = struct.unpack('!H', body[:2])[0]
+    topic = body[2:2 + tlen].decode('utf-8')
+    pos = 2 + tlen
+    mid = None
+    if qos > 0:
+        mid = struct.unpack('!H', body[pos:pos + 2])[0]
+        pos += 2
+    return header, topic, body[pos:], mid
+
+
+def create_ack(header, mid):
+    """PUBACK/PUBREC/PUBREL/PUBCOMP share the same 4 bytes shape, only the
+    fixed header byte changes"""
+    return struct.pack("!BBH", header, 2, mid)
+
+
+def create_puback(mid):
+    return create_ack(0x40, mid)
+
+
+def create_pubrec(mid):
+    return create_ack(0x50, mid)
+
+
+def create_pubrel(mid):
+    return create_ack(0x62, mid)
+
+
+def create_pubcomp(mid):
+    return create_ack(0x70, mid)

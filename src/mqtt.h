@@ -37,6 +37,13 @@
 
 #define MQTT_HEADER_LEN                    2
 #define MQTT_ACK_LEN                       4
+
+/*
+ * Maximum length in bytes of the Remaining Length field of the fixed header,
+ * MQTT v3.1.1 §2.2.3: more than 4 bytes makes the packet malformed
+ */
+#define MQTT_MAX_LEN_BYTES                 4
+
 #define MQTT_CLIENT_ID_LEN                 64 // including nul char
 
 // Return codes for connect packet
@@ -275,7 +282,7 @@ int mqtt_encode_length(u8 *, usize);
 /*
  * The reverse of the encoding function, returns the value of the size decoded
  */
-usize mqtt_decode_length(u8 *, unsigned *);
+usize mqtt_decode_length(u8 *, unsigned *, unsigned);
 
 /*
  * Pack to binary an MQTT packet, internally it uses a dispatch table to call

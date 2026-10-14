@@ -178,7 +178,9 @@ static struct list_node *list_remove_single_node(struct list_node *head,
     if (!head)
         return NULL;
 
-    // We want the first match
+    // We want the first match (this comparator follows the strcmp
+    // convention: 0 means equal — note the list_remove macro at the other
+    // end of this header expects the opposite, a truthy value to remove)
     if (cmp(head, data) == 0 && !*ret) {
 
         struct list_node *tmp_next = head->next;

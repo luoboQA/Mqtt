@@ -36,13 +36,23 @@
  * be pre-allocated and re-use of memory blocks, so no size have to be
  * specified like in a normal malloc but only alloc and free of a pointer is
  * possible.
+ *
+ * The blocks are grouped in chunks linked together: a chunk is never moved
+ * once allocated (the pool only ever appends a new one), so every pointer
+ * handed out stays valid for the lifetime of the pool. The previous
+ * implementation grew a single arena with realloc(), which can move it and
+ * leave every block already in use dangling. Free blocks are threaded on an
+ * intrusive LIFO list, the pointer to the next free block living in the
+ * first bytes of the free block itself
  */
+struct memorypool_chunk;
+
 struct memorypool {
-    void *memory;
-    void *free;
-    int block_used;
-    size_t blocks_nr;
-    size_t blocksize;
+    void *free;                     /* Head of the free list of blocks */
+    struct memorypool_chunk *chunks; /* Every chunk ever allocated */
+    size_t blocks_nr;               /* Number of blocks per chunk */
+    size_t blocksize;               /* Size of a block, >= sizeof(void *) */
+    size_t allocated;               /* Blocks currently handed out */
 };
 
 struct memorypool *memorypool_new(size_t, size_t);

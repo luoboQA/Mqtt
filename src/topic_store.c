@@ -575,5 +575,12 @@ static int subscription_cmp(const void *ptr_s1, const void *ptr_s2)
 {
     struct subscription *s1 = ((struct list_node *)ptr_s1)->data;
     const char *id          = ptr_s2;
-    return STREQ(s1->subscriber->id, id, MQTT_CLIENT_ID_LEN);
+    /*
+     * Case sensitive on purpose: sessions and clients are keyed by
+     * HASH_FIND_STR (a memcmp), so "foo" and "Foo" are two distinct clients.
+     * The old STREQ (strncasecmp) here removed the wildcard entries of both
+     * whenever either one unsubscribed or disconnected
+     */
+    return strncmp(s1->subscriber->id, id, MQTT_CLIENT_ID_LEN) == 0 ? true
+                                                                    : false;
 }

@@ -73,8 +73,9 @@ int main(int argc, char **argv)
     signal(SIGINT, sigint_handler);
     signal(SIGTERM, sigint_handler);
 
-    char *addr     = DEFAULT_HOSTNAME;
-    char *port     = DEFAULT_PORT;
+    /* NULL means "not given on the command line" */
+    char *addr     = NULL;
+    char *port     = NULL;
     char *confpath = DEFAULT_CONF_PATH;
     int debug = 0, daemon = 0;
     int opt;
@@ -82,18 +83,16 @@ int main(int argc, char **argv)
     // Set default configuration
     config_set_default();
 
-    while ((opt = getopt(argc, argv, "a:c:p:m:vhdn:")) != -1) {
+    while ((opt = getopt(argc, argv, "a:c:p:vhd")) != -1) {
         switch (opt) {
         case 'a':
             addr = optarg;
-            strcpy(conf->hostname, addr);
             break;
         case 'c':
             confpath = optarg;
             break;
         case 'p':
             port = optarg;
-            strcpy(conf->port, port);
             break;
         case 'v':
             debug = 1;
@@ -111,11 +110,35 @@ int main(int argc, char **argv)
         }
     }
 
-    // Override default DEBUG mode
-    conf->loglevel = debug == 1 ? DEBUG : WARNING;
-
     // Try to load a configuration, if found
     config_load(confpath);
+
+    /*
+     * The command line has the last word: the options are applied after the
+     * configuration file has been read. They used to be applied before it,
+     * so an `ip_address`/`ip_port` entry of the conf file silently overrode
+     * an explicit -a/-p and the broker listened somewhere else than asked
+     * (this very bug made the integration tests connect to a closed port)
+     */
+    if (addr) {
+        if (strlen(addr) >= sizeof(conf->hostname)) {
+            fprintf(stderr, "Address too long\n");
+            exit(EXIT_FAILURE);
+        }
+        strcpy(conf->hostname, addr);
+    }
+    if (port) {
+        if (strlen(port) >= sizeof(conf->port)) {
+            fprintf(stderr, "Port too long\n");
+            exit(EXIT_FAILURE);
+        }
+        strcpy(conf->port, port);
+    }
+
+    /* -v forces DEBUG, without it the level set by the conf file (or the
+     * default one) stands */
+    if (debug == 1)
+        conf->loglevel = DEBUG;
 
     sol_log_init(conf->logpath, conf->loglevel);
 

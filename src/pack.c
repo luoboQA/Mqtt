@@ -408,8 +408,16 @@ i64 unpack_integer(u8 **buf, i8 size)
     return val;
 }
 
-u8 *unpack_bytes(u8 **buf, usize len)
+/*
+ * Copy `len` bytes out of the packet buffer: `avail` is the number of bytes
+ * still available to read, a packet declaring more bytes than the buffer
+ * holds returns NULL instead of reading past its end (and sizing an
+ * allocation from an attacker controlled length)
+ */
+u8 *unpack_bytes(u8 **buf, usize avail, usize len)
 {
+    if (len > avail)
+        return NULL;
     u8 *dest = try_alloc(len + 1);
     memcpy(dest, *buf, len);
     dest[len] = '\0';
@@ -417,9 +425,22 @@ u8 *unpack_bytes(u8 **buf, usize len)
     return dest;
 }
 
-u16 unpack_string16(u8 **buf, u8 **dest)
+/*
+ * Read a MQTT UTF-8 encoded string: a 2 bytes length followed by the bytes.
+ * `avail` tracks the bytes left in the packet and is updated on success, on
+ * a truncated packet *dest is set to NULL so the caller can reject it
+ */
+u16 unpack_string16(u8 **buf, usize *avail, u8 **dest)
 {
+    if (*avail < sizeof(u16)) {
+        *dest = NULL;
+        return 0;
+    }
     u16 len = unpack_integer(buf, 'H');
-    *dest   = unpack_bytes(buf, len);
+    *avail -= sizeof(u16);
+    *dest = unpack_bytes(buf, *avail, len);
+    if (!*dest)
+        return 0;
+    *avail -= len;
     return len;
 }

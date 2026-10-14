@@ -654,11 +654,16 @@ static int ev_process_event(struct ev_ctx *ctx, int idx, int mask)
         }
         if (err < 0)
             return EV_OK;
-        if (mask & EV_READ) {
+        if (mask & EV_READ && e->rcallback) {
+            /*
+             * A descriptor removed from the loop while this batch of events
+             * was already fired leaves a zeroed slot behind: skip it
+             * instead of calling through a NULL pointer
+             */
             e->rcallback(ctx, e->rdata);
             ++fired;
         }
-        if (mask & EV_WRITE) {
+        if (mask & EV_WRITE && e->wcallback) {
             if (!fired || e->wcallback != e->rcallback) {
                 e->wcallback(ctx, e->wdata);
                 ++fired;

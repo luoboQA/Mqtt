@@ -220,6 +220,16 @@ struct client {
     bool has_lwt; /* States if the connection packet carried a LWT message */
     bool clean_session;    /* States if the connection packet was set to clean
                               session */
+    bool close_after_write; /* Drop the connection as soon as the bytes
+                               pending in the write buffer have been flushed:
+                               MQTT v3.1.1 §3.2.2.3 requires a CONNACK with a
+                               non-zero return code to be followed by closing
+                               the network connection */
+    bool kick_pending;  /* A duplicate CONNECT took this id over: the victim
+                           has been detached from its session and from the
+                           clients map on the spot, but its struct can only
+                           be released by its own event loop (kick_callback):
+                           every other close path must leave it alone */
     pthread_mutex_t mutex; /* Inner lock for the client, this avoid
                               race-conditions on shared parts */
     UT_hash_handle hh;     /* UTHASH handle, needed to use UTHASH macros */
@@ -253,6 +263,15 @@ struct client_session {
     time_t *i_acks; /* Inflight ACKs that must be cleared */
     struct inflight_msg *
         i_msgs; /* Inflight MSGs that must be sent out DUP in case of timeout */
+    /*
+     * Packet identifiers currently awaiting an acknowledgement, kept as a
+     * small dynamic array so that the periodic retransmission scan (and the
+     * session teardown) walk only what is actually pending instead of the
+     * whole 1-65535 identifier space once per client per second
+     */
+    u16 *pending_mids;
+    unsigned pending_len; /* Number of identifiers in pending_mids */
+    unsigned pending_cap; /* Allocated slots of pending_mids */
     UT_hash_handle hh; /* UTHASH handle, needed to use UTHASH macros */
     struct ref
         refcount; /* Reference counting struct, to share the struct easily */
@@ -422,3 +441,12 @@ bool topic_store_wildcards_empty(const struct topic_store *);
 #define has_inflight(session)   ((session)->inflights > 0)
 
 #define inflight_msg_clear(msg) DECREF((msg)->packet, struct mqtt_packet)
+
+/*
+ * Track/drop a packet identifier awaiting PUBACK/PUBCOMP in the session
+ * pending list, keeping it consistent with the i_msgs/i_acks tables. Both
+ * are idempotent: untracking an identifier that is not pending is a no-op
+ * (a duplicate PUBACK for a retained flush is valid)
+ */
+void inflight_track_mid(struct client_session *, unsigned short);
+void inflight_untrack_mid(struct client_session *, unsigned short);

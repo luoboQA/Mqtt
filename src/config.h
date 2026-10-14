@@ -73,6 +73,7 @@
 #define DEFAULT_MAX_REQUEST_SIZE "512KB"
 #define DEFAULT_STATS_INTERVAL   "10s"
 #define DEFAULT_KEEPALIVE        "60s"
+#define DEFAULT_RETRANSMIT       "20s"
 #ifdef TLS1_3_VERSION
 #define DEFAULT_TLS_PROTOCOLS (SOL_TLSv1_2 | SOL_TLSv1_3)
 #else
@@ -113,6 +114,11 @@ struct config {
      * **CURRENTLY USED AS ACK TIMER AS WELL**
      */
     size_t keepalive;
+    /*
+     * Seconds after which an unacknowledged QoS 1/2 message (or a PUBREL
+     * still waiting for its PUBCOMP) is re-transmitted with the DUP flag
+     */
+    size_t retransmit_interval;
     /* TLS flag */
     bool tls;
     /* TLS protocol version */

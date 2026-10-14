@@ -62,7 +62,7 @@ static void session_init(struct client_session *, const char *);
 
 static struct client_session *client_session_alloc(const char *);
 
-static unsigned next_free_mid(struct client_session *);
+static unsigned short next_free_mid(struct client_session *);
 
 static void inflight_msg_init(struct inflight_msg *, struct mqtt_packet *);
 
@@ -104,12 +104,19 @@ static void session_free(const struct ref *refcount)
         container_of(refcount, struct client_session, refcount);
     list_destroy(session->subscriptions, 0);
     list_destroy(session->outgoing_msgs, 0);
-    if (has_inflight(session)) {
-        for (int i = 0; i < MAX_INFLIGHT_MSGS; ++i) {
-            if (session->i_msgs[i].packet)
-                DECREF(session->i_msgs[i].packet, struct mqtt_packet);
+    /*
+     * Release the packets still awaiting an acknowledgement: the pending
+     * list mirrors the i_msgs table, so there is no need to walk all 65535
+     * slots of it
+     */
+    for (unsigned i = 0; i < session->pending_len; ++i) {
+        struct inflight_msg *imsg = &session->i_msgs[session->pending_mids[i]];
+        if (imsg->packet) {
+            DECREF(imsg->packet, struct mqtt_packet);
+            imsg->packet = NULL;
         }
     }
+    free_memory(session->pending_mids);
     free_memory(session->i_acks);
     free_memory(session->i_msgs);
     /*
@@ -130,6 +137,9 @@ static void session_init(struct client_session *session, const char *session_id)
     session->i_acks = try_calloc(MAX_INFLIGHT_MSGS, sizeof(time_t));
     session->i_msgs =
         try_calloc(MAX_INFLIGHT_MSGS, sizeof(struct inflight_msg));
+    session->pending_mids = NULL;
+    session->pending_len  = 0;
+    session->pending_cap  = 0;
     /* Well defined (all zeros) until a CONNECT carrying a will fills it */
     session->lwt_msg = (struct mqtt_packet){0};
     session->refcount = (struct ref){session_free, 0};
@@ -142,11 +152,54 @@ static struct client_session *client_session_alloc(const char *session_id)
     return session;
 }
 
-static inline unsigned next_free_mid(struct client_session *session)
+/*
+ * Keep the pending list in sync with the i_msgs/i_acks tables: the periodic
+ * retransmission scan walks it once per second per client while holding both
+ * the global and the client mutex, the old code walked all 65535 slots of
+ * the tables instead. The list only ever holds a handful of identifiers in
+ * practice, so every operation below is O(pending)
+ */
+void inflight_track_mid(struct client_session *session, unsigned short mid)
 {
-    if (session->next_free_mid == MAX_INFLIGHT_MSGS)
-        session->next_free_mid = 1;
-    return session->next_free_mid++;
+    for (unsigned i = 0; i < session->pending_len; ++i)
+        if (session->pending_mids[i] == mid)
+            return;
+    if (session->pending_len == session->pending_cap) {
+        unsigned newcap = session->pending_cap ? session->pending_cap * 2 : 16;
+        session->pending_mids =
+            try_realloc(session->pending_mids, newcap * sizeof(u16));
+        session->pending_cap = newcap;
+    }
+    session->pending_mids[session->pending_len++] = mid;
+}
+
+void inflight_untrack_mid(struct client_session *session, unsigned short mid)
+{
+    for (unsigned i = 0; i < session->pending_len; ++i) {
+        if (session->pending_mids[i] == mid) {
+            /* Swap with the last element: the order is not significant */
+            session->pending_mids[i] = session->pending_mids[--session->pending_len];
+            return;
+        }
+    }
+}
+
+/*
+ * Return a packet identifier not currently awaiting an acknowledgement.
+ * Reusing one that is still in flight would overwrite its inflight entry,
+ * losing the reference to the message and its retransmission state
+ */
+static inline unsigned short next_free_mid(struct client_session *session)
+{
+    for (unsigned tries = 0; tries < MAX_INFLIGHT_MSGS - 1; ++tries) {
+        unsigned mid = session->next_free_mid;
+        session->next_free_mid =
+            (mid + 1 >= MAX_INFLIGHT_MSGS) ? 1 : (unsigned)(mid + 1);
+        if (!session->i_msgs[mid].packet && session->i_acks[mid] <= 0)
+            return (unsigned short)mid;
+    }
+    /* Identifier space exhausted, the client is not acknowledging */
+    return 0;
 }
 
 static inline void inflight_msg_init(struct inflight_msg *imsg,
@@ -210,9 +263,19 @@ int publish_message(struct mqtt_packet *pkt, const struct topic *t)
          * message, proceed with the publish towards online subscriber.
          */
         if (pkt->header.bits.qos > AT_MOST_ONCE) {
-            mid                 = next_free_mid(s);
+            mid = next_free_mid(s);
+            if (mid == 0) {
+                /*
+                 * Every identifier is still awaiting an acknowledgement:
+                 * without a free one this message could never be tracked or
+                 * acknowledged, drop it instead of overwriting an inflight
+                 * entry (which would leak the previous packet reference)
+                 */
+                log_warning("No free packet identifier for %s, dropping PUBLISH",
+                            s->session_id);
+                continue;
+            }
             pkt->publish.pkt_id = mid;
-            INCREF(pkt, struct mqtt_packet);
             /*
              * If offline, we must enqueue messages in the inflight queue
              * of the client, they will be sent out only in case of a
@@ -220,25 +283,48 @@ int publish_message(struct mqtt_packet *pkt, const struct topic *t)
              */
             if (!sc || sc->online == false) {
                 if (s->clean_session == false) {
-                    list_push(s->outgoing_msgs, pkt);
-                    all_at_most_once = false;
+                    /*
+                     * One single reference, owned by the inflight entry: the
+                     * outgoing queue only borrows the pointer and is cleared
+                     * without releasing anything when the session flushes it
+                     */
                     INCREF(pkt, struct mqtt_packet);
+                    list_push(s->outgoing_msgs, pkt);
                     inflight_msg_init(&s->i_msgs[mid], pkt);
-                    s->i_acks[mid] = time(NULL);
+                    /*
+                     * No i_acks entry here: that table holds the PUBREL
+                     * pending state of a QoS 2 message (armed by PUBREC),
+                     * setting it for a plain PUBLISH made the
+                     * retransmission scan send a PUBREL for a QoS 1
+                     * message, a packet that has no meaning there
+                     */
+                    inflight_track_mid(s, mid);
                     ++s->inflights;
+                    all_at_most_once = false;
                 }
                 continue;
             }
+            /* Reference owned by the inflight entry, released on PUBACK */
+            INCREF(pkt, struct mqtt_packet);
 #if THREADSNR > 0
             pthread_mutex_lock(&sc->mutex);
 #endif
             /*
              * The subscriber client is marked as online, so we proceed to
              * set the inflight messages according to the QoS level required
-             * and write back the payload
+             * and write back the payload. The pending list is mutated under
+             * the client mutex, the very lock the acknowledgement handlers
+             * and the periodic retransmission check hold
              */
             inflight_msg_init(&sc->session->i_msgs[mid], pkt);
-            sc->session->i_acks[mid] = time(NULL);
+            /*
+             * The retransmission of the PUBLISH itself is driven by the
+             * inflight entry above: i_acks is reserved for the PUBREL a
+             * QoS 2 subscriber acknowledges with a PUBREC (see
+             * pubrec_handler), arming it here leaked a PUBREL into every
+             * QoS 1 flow
+             */
+            inflight_track_mid(sc->session, mid);
             ++sc->session->inflights;
 #if THREADSNR > 0
             pthread_mutex_unlock(&sc->mutex);
@@ -255,6 +341,23 @@ int publish_message(struct mqtt_packet *pkt, const struct topic *t)
 #if THREADSNR > 0
         pthread_mutex_lock(&sc->mutex);
 #endif
+        /*
+         * Never write past the end of the subscriber write buffer: it is
+         * drained asynchronously by the event loop, a fast publisher
+         * outrunning a slow subscriber would otherwise corrupt the heap.
+         * When full, a QoS > 0 message is retried by the periodic
+         * retransmission check once the buffer drained, a QoS 0 one is
+         * dropped as the spec allows
+         */
+        if (sc->towrite + len > conf->max_request_size) {
+#if THREADSNR > 0
+            pthread_mutex_unlock(&sc->mutex);
+#endif
+            log_warning("Write buffer full (%lu bytes pending) for %s, "
+                        "dropping PUBLISH",
+                        (unsigned long)sc->towrite, sc->client_id);
+            continue;
+        }
         mqtt_pack(pkt, sc->wbuf + sc->towrite);
         sc->towrite += len;
 #if THREADSNR > 0
@@ -354,6 +457,23 @@ static inline int match_subscription(const char *topic, const char *wtopic,
  * Command handlers
  */
 
+/*
+ * Drop the first `n` nodes of a list without touching their data: used to
+ * forget the queue entries just flushed into the write buffer, the packets
+ * themselves stay owned by the session's inflight table until acknowledged
+ */
+static void list_drop_prefix(List *l, unsigned long n)
+{
+    while (n-- > 0 && l->head) {
+        struct list_node *node = l->head;
+        l->head                = node->next;
+        if (!l->head)
+            l->tail = NULL;
+        l->len--;
+        free_memory(node);
+    }
+}
+
 static void set_connack(struct client *c, unsigned char rc, unsigned sp)
 {
     unsigned char connect_flags = 0 | (sp & 0x1) << 0;
@@ -361,6 +481,21 @@ static void set_connack(struct client *c, unsigned char rc, unsigned sp)
     struct mqtt_packet response = {
         .header  = {.byte = CONNACK_B},
         .connack = (struct mqtt_connack){.byte = connect_flags, .rc = rc}};
+
+    /*
+     * The write buffer is exactly max_request_size bytes big: the CONNACK
+     * must never be packed past its end (a fresh connection has an empty
+     * buffer, so this only trips on an absurdly small configuration). Drop
+     * the connection instead of leaving the client waiting forever for a
+     * CONNACK that was never written
+     */
+    if (c->towrite + MQTT_ACK_LEN > conf->max_request_size) {
+        log_error("Cannot send CONNACK to %s: write buffer too small "
+                  "(max_request_size = %zu)",
+                  c->client_id, conf->max_request_size);
+        c->close_after_write = true;
+        return;
+    }
     mqtt_pack(&response, c->wbuf + c->towrite);
     c->towrite += MQTT_ACK_LEN;
 
@@ -369,24 +504,29 @@ static void set_connack(struct client *c, unsigned char rc, unsigned sp)
      * clean session flag, we have to take care of the outgoing messages
      * pending, strictly after the CONNACK encoding
      */
-    if (c->clean_session == false && sp == 1) {
+    if (rc == MQTT_CONNECTION_ACCEPTED && c->clean_session == false &&
+        sp == 1) {
         log_info("Resuming session for %s", c->client_id);
-        /*
-         * If there's already some subscriptions and pending messages,
-         * empty the queue
-         */
-        // TODO check for write buffer size exceed
-        if (list_size(c->session->outgoing_msgs) > 0) {
-            size_t len = 0;
-            list_foreach(item, c->session->outgoing_msgs)
-            {
-                len = mqtt_size(item->data, NULL);
-                mqtt_pack(item->data, c->wbuf + c->towrite);
-                c->towrite += len;
-            }
-            // We want to clean up the queue after the payload set
-            list_clear(c->session->outgoing_msgs, 0);
+        unsigned long packed = 0;
+        list_foreach(item, c->session->outgoing_msgs)
+        {
+            size_t len = mqtt_size(item->data, NULL);
+            /*
+             * Stop at the first message that no longer fits the write
+             * buffer: it stays in the queue with its packet id still
+             * tracked, so the retransmission cron delivers it once the
+             * connection has drained. Packing unconditionally (as this
+             * used to) wrote past the end of the write buffer on a large
+             * backlog, corrupting whatever followed it
+             */
+            if (c->towrite + len > conf->max_request_size)
+                break;
+            mqtt_pack(item->data, c->wbuf + c->towrite);
+            c->towrite += len;
+            ++packed;
         }
+        // Forget just the messages flushed above
+        list_drop_prefix(c->session->outgoing_msgs, packed);
     }
 }
 
@@ -444,13 +584,36 @@ static int connect_handler(struct io_event *e)
 #if THREADSNR > 0
     pthread_mutex_lock(&mutex);
 #endif
+    /*
+     * MQTT v3.1.1 §3.1.4-2: when the id already belongs to a live
+     * connection the server must disconnect the older one. Done before the
+     * session lookup so the state below is the one left by the kick
+     */
+    server_kick_duplicate(cc->client_id, cc);
+
     // First we check if a session is present
     HASH_FIND_STR(server.sessions, cc->client_id, cc->session);
-    if (cc->session && c->bits.clean_session == true)
-        // Clean session true, we have to clean old session, if any
+    if (cc->session && c->bits.clean_session == true) {
+        /*
+         * A clean session is requested over a session left by a previous
+         * persistent connection: drop it completely — the map entry, the
+         * subscribers still attached to the topics and the session itself,
+         * the very teardown a clean disconnect performs. Clearing only the
+         * map entry (as this used to) leaked the session and left its
+         * subscribers on the topics, routing every message of the fresh
+         * session to a dead one
+         */
+        topic_store_remove_wildcard(server.store, cc->client_id);
+        list_foreach(item, cc->session->subscriptions)
+        {
+            topic_del_subscriber(item->data, cc);
+        }
         HASH_DEL(server.sessions, cc->session);
-    else if (cc->session)
+        DECREF(cc->session, struct client_session);
+        cc->session = NULL;
+    } else if (cc->session) {
         session_present = 1;
+    }
 
     cc->connected = true;
 
@@ -542,6 +705,12 @@ static int connect_handler(struct io_event *e)
 #if THREADSNR > 0
             pthread_mutex_lock(&mutex);
 #endif
+            /*
+             * A new retained message replaces the previous one (§3.3.1.3):
+             * dropping the old bytestring here leaked it on every reconnect
+             * of a client whose will carries the retain flag
+             */
+            free_memory(t->retained_msg);
             t->retained_msg = payload;
 #if THREADSNR > 0
             pthread_mutex_unlock(&mutex);
@@ -571,6 +740,12 @@ bad_auth:
     log_debug("Sending CONNACK to %s (%u, %u)", cc->client_id, session_present,
               MQTT_BAD_USERNAME_OR_PASSWORD);
     set_connack(cc, MQTT_BAD_USERNAME_OR_PASSWORD, session_present);
+    /*
+     * MQTT v3.1.1 §3.2.2.3: a CONNACK with a non-zero return code is
+     * followed by closing the network connection, otherwise the client
+     * would keep talking on a connection the broker considers refused
+     */
+    cc->close_after_write = true;
 
     return MQTT_BAD_USERNAME_OR_PASSWORD;
 
@@ -578,6 +753,8 @@ not_authorized:
     log_debug("Sending CONNACK to %s (%u, %u)", cc->client_id, session_present,
               MQTT_NOT_AUTHORIZED);
     set_connack(cc, MQTT_NOT_AUTHORIZED, session_present);
+    /* Same §3.2.2.3 rule as above: flush then close */
+    cc->close_after_write = true;
 
     return MQTT_NOT_AUTHORIZED;
 }
@@ -758,22 +935,40 @@ static int subscribe_handler(struct io_event *e)
         if (!index(topic, '+')) {
             struct subscriber *tmp;
             HASH_FIND_STR(t->subscribers, c->client_id, tmp);
-            if (c->clean_session == true || !tmp) {
-                if (!tmp) {
-                    tmp = topic_add_subscriber(t, e->client->session,
-                                               s->tuples[i].qos);
-                    // we increment reference for the subscriptions session
-                    INCREF(tmp, struct subscriber);
-                    /*
-                     * A fresh entry living on a wildcard filter's own trie
-                     * node is the record of that filter, not an exact
-                     * subscription of the node's topic
-                     */
-                    if (wildcard)
-                        tmp->origins = SUBSCRIBER_WILD;
-                }
+            if (!tmp) {
+                tmp = topic_add_subscriber(t, e->client->session,
+                                           s->tuples[i].qos);
+                // we increment reference for the subscriptions session
+                INCREF(tmp, struct subscriber);
+                /*
+                 * Push only on the first subscription of this node: a
+                 * repeated SUBSCRIBE used to append the same topic again,
+                 * growing the list (and the teardown loop) with every
+                 * duplicate. Also note a fresh entry living on a wildcard
+                 * filter's own trie node is the record of that filter, not
+                 * an exact subscription of the node's topic
+                 */
                 list_push(e->client->session->subscriptions, t);
-                if (wildcard == true) {
+            } else {
+                /*
+                 * MQTT v3.1.1 §3.8.4: a SUBSCRIBE for a filter already
+                 * subscribed replaces the subscription, only the granted
+                 * QoS may differ. The wildcard index shares this very
+                 * subscriber record, so the new QoS applies there too
+                 */
+                tmp->granted_qos = s->tuples[i].qos;
+            }
+            if (wildcard == true) {
+                /*
+                 * Register the filter even when an entry for this client
+                 * already lives on the node (e.g. the bare topic was
+                 * subscribed before: "a" and "a/#" share the very same
+                 * node): skipping it then used to silently drop the
+                 * filter, no message under the prefix would ever match it.
+                 * The WILD origin marks the registration as done, so a
+                 * repeated SUBSCRIBE does not duplicate the index record
+                 */
+                if (!(tmp->origins & SUBSCRIBER_WILD)) {
                     /*
                      * The entry covers the filter (and its own topic, as
                      * "a/#" matches "a"): remember it so that UNSUBSCRIBE
@@ -782,15 +977,15 @@ static int subscribe_handler(struct io_event *e)
                     tmp->origins |= SUBSCRIBER_WILD;
                     add_wildcard(topic, tmp, wildcard);
                     topic_store_map(server.store, topic, recursive_sub, tmp);
-                } else {
-                    /*
-                     * The entry now doubles as an explicit subscription of
-                     * this very topic: remembering the origin lets a
-                     * concurrent wildcard covering it survive its
-                     * UNSUBSCRIBE (and vice versa)
-                     */
-                    tmp->origins |= SUBSCRIBER_EXACT;
                 }
+            } else {
+                /*
+                 * The entry now doubles as an explicit subscription of
+                 * this very topic: remembering the origin lets a
+                 * concurrent wildcard covering it survive its
+                 * UNSUBSCRIBE (and vice versa)
+                 */
+                tmp->origins |= SUBSCRIBER_EXACT;
             }
         } else {
             /*
@@ -1167,6 +1362,8 @@ static int puback_handler(struct io_event *e)
     }
     c->session->i_msgs[pkt_id].packet = NULL;
     c->session->i_acks[pkt_id]        = -1;
+    /* Drop the identifier from the list the retransmission scan walks */
+    inflight_untrack_mid(c->session, pkt_id);
 #if THREADSNR > 0
     pthread_mutex_unlock(&c->mutex);
 #endif
@@ -1183,13 +1380,32 @@ static int pubrec_handler(struct io_event *e)
 #endif
     mqtt_pack_mono(c->wbuf + c->towrite, PUBREL, pkt_id);
     c->towrite += MQTT_ACK_LEN;
+    /*
+     * Update the inflight acks table while still holding the client mutex:
+     * the periodic retransmission check reads and rewrites the very same
+     * entry under this lock, writing it after the unlock would race with it
+     * and could be overwritten (or missed) by the scan
+     */
+    if (c->session) {
+        /*
+         * MQTT v3.1.1 §3.4.4-2: the PUBREC acknowledges the PUBLISH itself,
+         * from now on only the PUBREL is (re)transmitted until its PUBCOMP
+         * arrives. Keeping the packet stored made the retransmission scan
+         * send the PUBLISH again with the DUP flag on top of the PUBREL —
+         * a duplicate the spec reserves to a lost PUBREC. The inflight
+         * counter is intentionally not dropped here: it counts the
+         * identifiers still tracked (PUBACK or PUBCOMP pending), and the
+         * scan only walks clients with has_inflight() set
+         */
+        if (c->session->i_msgs[pkt_id].packet)
+            inflight_msg_clear(&c->session->i_msgs[pkt_id]);
+        c->session->i_msgs[pkt_id].packet = NULL;
+        c->session->i_acks[pkt_id]        = time(NULL);
+        inflight_track_mid(c->session, pkt_id);
+    }
 #if THREADSNR > 0
     pthread_mutex_unlock(&c->mutex);
 #endif
-    // Update inflight acks table
-    if (c->session) {
-        c->session->i_acks[pkt_id] = time(NULL);
-    }
     log_debug("Sending PUBREL to %s (m%u)", c->client_id, pkt_id);
     return REPLY;
 }
@@ -1226,12 +1442,29 @@ static int pubcomp_handler(struct io_event *e)
 #endif
         return NOREPLY;
     }
-    c->session->i_acks[pkt_id] = -1;
+    /*
+     * The stored PUBLISH was already released by pubrec_handler (the PUBREC
+     * acknowledges the message itself, from then on only the PUBREL is
+     * retransmitted), so i_msgs[pkt_id].packet is NULL by the time the
+     * PUBCOMP lands. The signal that this identifier is still counted as
+     * inflight is the PUBREL-pending timestamp armed by pubrec_handler:
+     * gating the decrement on the packet pointer leaked one inflight per
+     * QoS 2 message and left has_inflight() true forever, making the
+     * periodic scan keep walking a session with nothing left in flight
+     */
+    bool inflight = c->session->i_acks[pkt_id] > 0;
     if (c->session->i_msgs[pkt_id].packet) {
         inflight_msg_clear(&c->session->i_msgs[pkt_id]);
-        --c->session->inflights;
+        inflight = true;
     }
     c->session->i_msgs[pkt_id].packet = NULL;
+    c->session->i_acks[pkt_id]        = -1;
+    /* Release the inflight slot taken by publish_message(), guarded against
+     * a stray or duplicate PUBCOMP wrapping the unsigned counter */
+    if (inflight && c->session->inflights > 0)
+        --c->session->inflights;
+    /* Drop the identifier from the list the retransmission scan walks */
+    inflight_untrack_mid(c->session, pkt_id);
 #if THREADSNR > 0
     pthread_mutex_unlock(&c->mutex);
 #endif
@@ -1276,5 +1509,22 @@ int handle_command(unsigned type, struct io_event *event)
     /* The type is 4 bits wide, still never index the table out of bounds */
     if (type >= sizeof(handlers) / sizeof(*handlers))
         return protocol_violation_handler(event);
+
+    /*
+     * MQTT v3.1.1 §3.1: the first packet a client sends MUST be a CONNECT
+     * (and a client whose CONNECT was refused never becomes connected).
+     * Without this guard a SUBSCRIBE sent before CONNECT would reach a
+     * handler that dereferences the still missing session: a remote client
+     * could crash the broker without authenticating, and a PUBLISH sent
+     * before CONNECT would sidestep the allow_anonymous check entirely
+     */
+    if (type != CONNECT && event->client->connected == false) {
+        log_error("Protocol violation: packet type %u received from %s "
+                  "before CONNECT",
+                  type, event->client->client_id[0] ? event->client->client_id
+                                                    : "unknown");
+        return -ERRPACKETERR;
+    }
+
     return handlers[type](event);
 }

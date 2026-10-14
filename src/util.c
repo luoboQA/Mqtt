@@ -30,7 +30,7 @@
 #include "mqtt.h"
 #include <assert.h>
 #include <string.h>
-// #include <crypt.h>
+#include <crypt.h>
 #include <ctype.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -141,7 +141,28 @@ void generate_random_id(char *dest)
 
 bool check_passwd(const char *passwd, const char *salt)
 {
-    return STREQ(crypt(passwd, salt), salt, strlen(salt));
+    if (!passwd || !salt)
+        return false;
+#if defined(__APPLE__)
+    /*
+     * macOS provides no crypt_r(): crypt() writes its result in a static
+     * buffer, so the comparison below must happen before any other call
+     * overwrites it (it does, on this very thread only)
+     */
+    char *hashed = crypt(passwd, salt);
+#else
+    /*
+     * crypt() keeps its result in a static buffer shared by every thread
+     * of the process: two clients authenticating at the same time could
+     * end up comparing against each other's hash. crypt_r() takes the
+     * working state from the caller instead
+     */
+    struct crypt_data data = {0};
+    char *hashed           = crypt_r(passwd, salt, &data);
+#endif
+    if (!hashed)
+        return false;
+    return STREQ(hashed, salt, strlen(salt));
 }
 
 long get_fh_soft_limit(void)

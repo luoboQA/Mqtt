@@ -115,7 +115,14 @@ struct server server;
 
 static void client_init(struct client *);
 
-static void client_deactivate(struct client *);
+/*
+ * Deactivate a connection, releasing its pool slot: returns true when a live
+ * client was actually released. client_close() wraps it together with the
+ * connection counter, and is the entry point every close path must use
+ */
+static bool client_deactivate(struct client *);
+
+static void client_close(struct client *);
 
 // CALLBACKS for the eventloop
 static void accept_callback(struct ev_ctx *, void *);
@@ -147,26 +154,39 @@ static void inflight_msg_check(struct ev_ctx *, void *);
 
 /*
  * Utility struct for information topics. Just the name of the topic and his
- * length, to avoid computing length of const strings
+ * length, the length is computed at compile time by the SYS_T macro so that
+ * it can never drift from the actual strlen() of the topic name (a wrong
+ * length would make the broker publish a topic nobody is subscribed to)
  */
 struct sys_topic {
     const char *name;
     int len;
 };
 
+/*
+ * Note: every statistics topic must end with the hierarchical separator '/',
+ * the same normalization rule applied to the topics and filters published or
+ * subscribed by clients, otherwise a subscriber to $SOL/broker/# would never
+ * match it
+ */
+#define SYS_T(t)                                                               \
+    {                                                                          \
+        .name = t, .len = (int)(sizeof(t) - 1)                                 \
+    }
+
 /* Information topics mapping, accessed by publish_stats periodic routine */
 static const struct sys_topic sys_topics[SYS_TOPICS] = {
-    {"$SOL/broker/clients/", 20},
-    {"$SOL/broker/messages/", 21},
-    {"$SOL/broker/uptime/", 19},
-    {"$SOL/broker/uptime/sol", 22},
-    {"$SOL/broker/clients/connected/", 30},
-    {"$SOL/broker/clients/disconnected/", 34},
-    {"$SOL/broker/bytes/sent/", 23},
-    {"$SOL/broker/bytes/received/", 27},
-    {"$SOL/broker/messages/sent/", 26},
-    {"$SOL/broker/messages/received/", 30},
-    {"$SOL/broker/memory/used", 23}};
+    SYS_T("$SOL/broker/clients/"),
+    SYS_T("$SOL/broker/messages/"),
+    SYS_T("$SOL/broker/uptime/"),
+    SYS_T("$SOL/broker/uptime/sol/"),
+    SYS_T("$SOL/broker/clients/connected/"),
+    SYS_T("$SOL/broker/clients/disconnected/"),
+    SYS_T("$SOL/broker/bytes/sent/"),
+    SYS_T("$SOL/broker/bytes/received/"),
+    SYS_T("$SOL/broker/messages/sent/"),
+    SYS_T("$SOL/broker/messages/received/"),
+    SYS_T("$SOL/broker/memory/used/")};
 
 /* Simple error_code to string function, to be refined */
 static const char *solerr(int rc)
@@ -230,24 +250,52 @@ static struct topic *stats_topic(const char *name)
 static void publish_stats(struct ev_ctx *ctx, void *data)
 {
     (void)data;
+    (void)ctx;
+
+    /*
+     * Snapshot the mutable counters once: reading them twice could mix two
+     * different instants and make the "disconnected" delta inconsistent with
+     * the "connected" one published just before
+     */
+    size_t active = info.active_connections;
+    size_t total  = info.total_connections;
+    size_t msent  = info.messages_sent;
+    size_t mrecv  = info.messages_recv;
 
     char cclients[21];
-    snprintf(cclients, 21, "%lu", info.active_connections);
+    snprintf(cclients, 21, "%lu", (unsigned long)active);
+
+    /* Number of connections accepted since the broker start */
+    char ctotal[21];
+    snprintf(ctotal, 21, "%lu", (unsigned long)total);
+
+    /* Connections accepted and then dropped (clamped, snapshots race) */
+    char cdisconn[21];
+    snprintf(cdisconn, 21, "%lu",
+             (unsigned long)(total > active ? total - active : 0));
 
     char bsent[21];
-    snprintf(bsent, 21, "%lu", info.bytes_sent);
+    snprintf(bsent, 21, "%lu", (unsigned long)info.bytes_sent);
 
-    char msent[21];
-    snprintf(msent, 21, "%lu", info.messages_sent);
+    char brecv[21];
+    snprintf(brecv, 21, "%lu", (unsigned long)info.bytes_recv);
 
-    char mrecv[21];
-    snprintf(mrecv, 21, "%lu", info.messages_recv);
+    char sent[21];
+    snprintf(sent, 21, "%lu", (unsigned long)msent);
 
-    long long uptime = time(NULL) - info.start_time;
+    char recv[21];
+    snprintf(recv, 21, "%lu", (unsigned long)mrecv);
+
+    /* Total messages handled, incoming plus outgoing */
+    char mtotal[21];
+    snprintf(mtotal, 21, "%lu", (unsigned long)(msent + mrecv));
+
+    unsigned long long uptime = (unsigned long long)(time(NULL) -
+                                                     info.start_time);
     char utime[21];
     snprintf(utime, 21, "%llu", uptime);
 
-    double sol_uptime = (double)(time(NULL) - info.start_time) / SOL_SECONDS;
+    double sol_uptime = (double)uptime / SOL_SECONDS;
     char sutime[16];
     snprintf(sutime, 16, "%.4f", sol_uptime);
 
@@ -255,64 +303,43 @@ static void publish_stats(struct ev_ctx *ctx, void *data)
     char mem[21];
     snprintf(mem, 21, "%lld", memory);
 
-    // $SOL/uptime
+    /*
+     * One single packet reused for every statistics topic: the broker always
+     * publishes them at QoS 0 (header 0x30, pkt_id 0), so no subscriber ever
+     * keeps a reference to it and its contents can safely be swapped between
+     * the publishes below
+     */
     struct mqtt_packet p = {.header  = (union mqtt_header){.byte = PUBLISH_B},
-                            .publish = (struct mqtt_publish){
-                                .pkt_id   = 0,
-                                .topiclen = sys_topics[2].len,
-                                .topic    = (unsigned char *)sys_topics[2].name,
-                                .payloadlen = strlen(utime),
-                                .payload    = (unsigned char *)&utime}};
+                            .publish = (struct mqtt_publish){.pkt_id = 0}};
 
-    publish_message(&p, stats_topic(sys_topics[2].name));
+    /*
+     * Publish `val` on the statistics topic at index `i`: every topic
+     * declared in sys_topics[] must be published here, a declared but never
+     * published topic would make subscribers to $SOL/broker/# silently miss
+     * part of the advertised feed
+     */
+#define PUBLISH_STAT(i, val)                                                   \
+    do {                                                                       \
+        p.publish.topiclen   = sys_topics[i].len;                              \
+        p.publish.topic      = (unsigned char *)sys_topics[i].name;            \
+        p.publish.payloadlen = strlen(val);                                    \
+        p.publish.payload    = (unsigned char *)(val);                         \
+        publish_message(&p, stats_topic(sys_topics[i].name));                  \
+    } while (0)
 
-    // $SOL/broker/uptime/sol
-    p.publish.topiclen   = sys_topics[3].len;
-    p.publish.topic      = (unsigned char *)sys_topics[3].name;
-    p.publish.payloadlen = strlen(sutime);
-    p.publish.payload    = (unsigned char *)&sutime;
+    PUBLISH_STAT(0, ctotal);   /* $SOL/broker/clients/           */
+    PUBLISH_STAT(1, mtotal);   /* $SOL/broker/messages/          */
+    PUBLISH_STAT(2, utime);    /* $SOL/broker/uptime/            */
+    PUBLISH_STAT(3, sutime);   /* $SOL/broker/uptime/sol/        */
+    PUBLISH_STAT(4, cclients); /* $SOL/broker/clients/connected/ */
+    PUBLISH_STAT(5, cdisconn); /* $SOL/broker/clients/disconnected/ */
+    PUBLISH_STAT(6, bsent);    /* $SOL/broker/bytes/sent/        */
+    PUBLISH_STAT(7, brecv);    /* $SOL/broker/bytes/received/    */
+    PUBLISH_STAT(8, sent);     /* $SOL/broker/messages/sent/     */
+    PUBLISH_STAT(9, recv);     /* $SOL/broker/messages/received/ */
+    PUBLISH_STAT(10, mem);     /* $SOL/broker/memory/used/       */
 
-    publish_message(&p, stats_topic(sys_topics[3].name));
-
-    // $SOL/broker/clients/connected
-    p.publish.topiclen   = sys_topics[4].len;
-    p.publish.topic      = (unsigned char *)sys_topics[4].name;
-    p.publish.payloadlen = strlen(cclients);
-    p.publish.payload    = (unsigned char *)&cclients;
-
-    publish_message(&p, stats_topic(sys_topics[4].name));
-
-    // $SOL/broker/bytes/sent
-    p.publish.topiclen   = sys_topics[6].len;
-    p.publish.topic      = (unsigned char *)sys_topics[6].name;
-    p.publish.payloadlen = strlen(bsent);
-    p.publish.payload    = (unsigned char *)&bsent;
-
-    publish_message(&p, stats_topic(sys_topics[6].name));
-
-    // $SOL/broker/messages/sent
-    p.publish.topiclen   = sys_topics[8].len;
-    p.publish.topic      = (unsigned char *)sys_topics[8].name;
-    p.publish.payloadlen = strlen(msent);
-    p.publish.payload    = (unsigned char *)&msent;
-
-    publish_message(&p, stats_topic(sys_topics[8].name));
-
-    // $SOL/broker/messages/received
-    p.publish.topiclen   = sys_topics[9].len;
-    p.publish.topic      = (unsigned char *)sys_topics[9].name;
-    p.publish.payloadlen = strlen(mrecv);
-    p.publish.payload    = (unsigned char *)&mrecv;
-
-    publish_message(&p, stats_topic(sys_topics[9].name));
-
-    // $SOL/broker/memory/used
-    p.publish.topiclen   = sys_topics[10].len;
-    p.publish.topic      = (unsigned char *)sys_topics[10].name;
-    p.publish.payloadlen = strlen(mem);
-    p.publish.payload    = (unsigned char *)&mem;
-
-    publish_message(&p, stats_topic(sys_topics[10].name));
+#undef PUBLISH_STAT
 }
 
 /*
@@ -327,9 +354,8 @@ static void inflight_msg_check(struct ev_ctx *ctx, void *data)
 {
     (void)data;
     (void)ctx;
-    size_t size           = 0;
-    time_t now            = time(NULL);
-    struct mqtt_packet *p = NULL;
+    size_t size    = 0;
+    time_t now     = time(NULL);
     struct client *c, *tmp;
 #if THREADSNR > 0
     pthread_mutex_lock(&mutex);
@@ -338,44 +364,91 @@ static void inflight_msg_check(struct ev_ctx *ctx, void *data)
     {
         if (!c || !c->connected || !c->session || !has_inflight(c->session))
             continue;
+        struct client_session *s = c->session;
 #if THREADSNR > 0
         pthread_mutex_lock(&c->mutex);
 #endif
-        for (int i = 1; i < MAX_INFLIGHT_MSGS; ++i) {
-            // TODO remove 20 hardcoded value
-            // Messages
-            if (c->session->i_msgs[i].packet &&
-                (now - c->session->i_msgs[i].seen) > 20) {
-                log_debug("Re-sending message to %s", c->client_id);
-                p                  = c->session->i_msgs[i].packet;
-                p->header.bits.qos = c->session->i_msgs[i].qos;
+        /*
+         * Walk only the packet identifiers actually pending (typically a
+         * handful) instead of all 65535 slots of the tables: this loop runs
+         * once per second per client while holding both the global and the
+         * client mutex, the full scan used to dominate the periodic cost of
+         * the broker with many connections
+         */
+        bool dirty = false;
+        for (unsigned i = 0; i < s->pending_len; ++i) {
+            unsigned short mid = s->pending_mids[i];
+            // Messages: re-send with the DUP flag set
+            struct inflight_msg *imsg = &s->i_msgs[mid];
+            if (imsg->packet &&
+                (now - imsg->seen) > (time_t)conf->retransmit_interval) {
+                struct mqtt_packet *p = imsg->packet;
+                p->header.bits.qos    = imsg->qos;
+                /*
+                 * The packet is shared by every subscriber of the original
+                 * publish, each with its own identifier: restore the one of
+                 * this session or the client would acknowledge an identifier
+                 * it never received
+                 */
+                p->publish.pkt_id = mid;
                 // Set DUP flag to 1
                 mqtt_set_dup(p);
-                size = mqtt_size(c->session->i_msgs[i].packet, NULL);
+                size = mqtt_size(p, NULL);
+                if (c->towrite + size > conf->max_request_size) {
+                    /*
+                     * The subscriber is not draining its buffer yet, keep
+                     * the original timestamp so the message is retried on
+                     * the next tick instead of piling up more bytes
+                     */
+                    continue;
+                }
+                log_debug("Re-sending message to %s", c->client_id);
                 // Serialize the packet and send it out again
                 mqtt_pack(p, c->wbuf + c->towrite);
                 c->towrite += size;
-                enqueue_event_write(c);
+                dirty = true;
                 // Update information stats
                 info.messages_sent++;
+                /*
+                 * Refresh the timestamp: without it the message would be
+                 * re-sent on every tick (once per second) instead of every
+                 * retransmission interval, flooding the client
+                 */
+                imsg->seen = now;
             }
-            // ACKs
-            if (c->session->i_acks[i] > 0 &&
-                (now - c->session->i_acks[i]) > 20) {
-                log_debug("Re-sending ack to %s", c->client_id);
-                struct mqtt_packet ack;
-                mqtt_ack(&ack, i);
-                // Set DUP flag to 1
-                mqtt_set_dup(&ack);
+            // Acks: re-send the PUBREL still awaiting a PUBCOMP
+            if (s->i_acks[mid] > 0 &&
+                (now - s->i_acks[mid]) > (time_t)conf->retransmit_interval) {
+                /*
+                 * A well formed PUBREL: the fixed header byte must be set
+                 * explicitly (mqtt_ack() only fills the packet identifier)
+                 * and the packet must be packed from its own structure,
+                 * packing `p` here used to dereference a NULL pointer on
+                 * every retransmission
+                 */
+                struct mqtt_packet ack = {
+                    .header = (union mqtt_header){.byte = PUBREL_B}};
+                mqtt_ack(&ack, mid);
                 size = mqtt_size(&ack, NULL);
+                if (c->towrite + size > conf->max_request_size)
+                    continue;
+                log_debug("Re-sending ack to %s", c->client_id);
                 // Serialize the packet and send it out again
-                mqtt_pack(p, c->wbuf + c->towrite);
+                mqtt_pack(&ack, c->wbuf + c->towrite);
                 c->towrite += size;
-                enqueue_event_write(c);
+                dirty = true;
                 // Update information stats
                 info.messages_sent++;
+                /* Same as above: wait another interval before re-sending */
+                s->i_acks[mid] = now;
             }
         }
+        /*
+         * One single write event for everything enqueued above, the event
+         * loop coalesces the descriptor in any case
+         */
+        if (dirty)
+            enqueue_event_write(c);
 #if THREADSNR > 0
         pthread_mutex_unlock(&c->mutex);
 #endif
@@ -417,6 +490,8 @@ static void client_init(struct client *client)
             try_calloc(conf->max_request_size, sizeof(unsigned char));
     client->last_seen = time(NULL);
     client->has_lwt   = false;
+    client->close_after_write = false;
+    client->kick_pending      = false;
     client->session   = NULL;
     pthread_mutex_init(&client->mutex, NULL);
 }
@@ -425,9 +500,10 @@ static void client_init(struct client *client)
  * As we really don't want to completely de-allocate a client in favor of
  * making it reusable by another connection we simply deactivate it according
  * to its state (e.g. if it's a clean_session connected client or not) and we
- * allow the clients memory pool to reclaim it
+ * allow the clients memory pool to reclaim it. The caller must already hold
+ * the global server mutex (see client_deactivate below)
  */
-static void client_deactivate(struct client *client)
+static bool client_deactivate_locked(struct client *client)
 {
 
     /*
@@ -438,15 +514,13 @@ static void client_deactivate(struct client *client)
      * broker when a SUBSCRIBE or a disconnect races with a PUBLISH
      */
 #if THREADSNR > 0
-    pthread_mutex_lock(&mutex);
     pthread_mutex_lock(&client->mutex);
 #endif
     if (client->online == false) {
 #if THREADSNR > 0
         pthread_mutex_unlock(&client->mutex);
-        pthread_mutex_unlock(&mutex);
 #endif
-        return;
+        return false;
     }
 
     client->rpos = client->toread = client->read = 0;
@@ -454,6 +528,18 @@ static void client_deactivate(struct client *client)
     close_connection(&client->conn);
 
     client->online = false;
+
+    /*
+     * The clients map indexes live connections only: drop the entry no
+     * matter the session type. Leaving it behind for a persistent session
+     * (as this used to) meant the next CONNECT with the same id inserted a
+     * second entry with the same key, and every later lookup (a publish
+     * towards that session) could keep hitting the deactivated one:
+     * messages then went to the offline queue or were dropped while the
+     * reconnected client was sitting right there
+     */
+    if (client->connected == true)
+        HASH_DEL(server.clients_map, client);
 
     if (client->clean_session == true) {
         if (client->session) {
@@ -465,8 +551,6 @@ static void client_deactivate(struct client *client)
             HASH_DEL(server.sessions, client->session);
             DECREF(client->session, struct client_session);
         }
-        if (client->connected == true)
-            HASH_DEL(server.clients_map, client);
     }
     /*
      * All accesses to the client must happen before the pool can recycle
@@ -484,11 +568,127 @@ static void client_deactivate(struct client *client)
      */
     pthread_mutex_destroy(&client->mutex);
 #endif
-    if (client->clean_session == true)
-        memorypool_free(server.pool, client);
+    /*
+     * Return the slot unconditionally: with the clients map entry gone
+     * nothing references the struct anymore (a persistent session only
+     * points at its own data). The old condition on clean_session leaked
+     * one pool slot per persistent client disconnect, and the slot kept
+     * its rbuf/wbuf alive with it forever
+     */
+    memorypool_free(server.pool, client);
+    return true;
+}
+
+/*
+ * Deactivate a connection taking the global mutex first (canonical order),
+ * true when a live client was actually released
+ */
+static bool client_deactivate(struct client *client)
+{
+    bool released;
+#if THREADSNR > 0
+    pthread_mutex_lock(&mutex);
+#endif
+    released = client_deactivate_locked(client);
 #if THREADSNR > 0
     pthread_mutex_unlock(&mutex);
 #endif
+    return released;
+}
+
+/*
+ * The one entry point of the close paths (read, write and protocol errors):
+ * drops the connection and updates the statistics, unless the client was
+ * already released by a racing close. A victim of a duplicate id is only
+ * released by its own loop (kick_callback): clearing the flag here is safe
+ * because the takeover fired its event on this very loop, and an event
+ * cannot survive this descriptor being removed from the loop a moment
+ * before, so this side owns the release
+ */
+static void client_close(struct client *client)
+{
+    client->kick_pending = false;
+    if (client_deactivate(client) == false)
+        return;
+    // Update stats
+    info.active_connections--;
+}
+
+/*
+ * Runs on the event loop that owns the connection being dropped: removing
+ * another thread's descriptor (and freeing its client) could race with the
+ * callback that thread is about to run, so a takeover schedules this on the
+ * victim's own loop instead, the same cross-thread primitive the publish
+ * delivery already uses
+ */
+static void kick_callback(struct ev_ctx *ctx, void *arg)
+{
+    struct client *client = arg;
+    /* The connection may have dropped on its own before this ran */
+    if (client->online == false)
+        return;
+    log_info("Dropping connection with %s (%s): the client id was taken "
+             "over by a newer connection (MQTT v3.1.1 §3.1.4)",
+             client->client_id, client->conn.ip);
+    ev_del_fd(ctx, client->conn.fd);
+    client->kick_pending = false;
+    if (client_deactivate(client) == false)
+        return; // Already released, the stats were updated there
+    // Update stats: the kicked connection was counted on accept
+    info.active_connections--;
+}
+
+void server_kick_duplicate(const char *client_id, const struct client *keep)
+{
+    struct client *old = NULL;
+    HASH_FIND_STR(server.clients_map, client_id, old);
+    /*
+     * The map holds one entry per live connection: a duplicate key can only
+     * be a client that is still connected while a new CONNECT arrives with
+     * the same id. The caller must hold the global mutex, the lookup and
+     * the detach below rely on it
+     */
+    if (!old || old == keep)
+        return;
+    log_info("Kicking out already connected client %s (%s): the id just "
+             "reconnected (MQTT v3.1.1 §3.1.4)",
+             client_id, old->conn.ip);
+    /*
+     * Detach the victim from everything shared right here, before the
+     * takeover below takes over (or destroys) the session: the global mutex
+     * excludes every handler that takes it first, the victim's own one
+     * excludes the ACK handlers that touch the session with it alone, so no
+     * handler of the old connection can be inside a critical section on the
+     * session while it is handed over. Afterwards the old connection holds
+     * no session, no will and no map entry: whichever close path runs next
+     * finds nothing to dereference, and the struct is released by its own
+     * loop (kick_callback)
+     */
+#if THREADSNR > 0
+    pthread_mutex_lock(&old->mutex);
+#endif
+    HASH_DEL(server.clients_map, old);
+    old->connected = false;
+    /* A kicked connection publishes no will message */
+    old->has_lwt   = false;
+    old->session   = NULL;
+    /*
+     * Claim the release: the close paths of the old connection (and only
+     * its own loop thread runs them) must leave the struct alone from now
+     * on, this callback owns it
+     */
+    old->kick_pending = true;
+#if THREADSNR > 0
+    pthread_mutex_unlock(&old->mutex);
+#endif
+    /*
+     * The descriptor is closed on the loop that owns the connection (the
+     * same cross-thread primitive the publish delivery uses): removing it
+     * from here could race with the callback that loop is already about to
+     * run
+     */
+    ev_fire_event(old->ctx, old->conn.fd, EV_WRITE, kick_callback,
+                  (void *)old);
 }
 
 /*
@@ -511,7 +711,7 @@ static ssize_t recv_packet(struct client *c)
 
     ssize_t nread   = 0;
     unsigned opcode = 0, pos = 0;
-    unsigned int pktlen = 0LL;
+    usize pktlen    = 0;
 
     // Base status, we have read 0 to 2 bytes
     if (c->status == WAITING_HEADER) {
@@ -563,31 +763,53 @@ static ssize_t recv_packet(struct client *c)
         }
 
         /*
-         * Read 2 extra bytes, because the first 4 bytes could countain the
-         * total size in bytes of the entire packet
+         * Fill up to the 4 bytes the Remaining Length field may occupy on
+         * top of the header byte, how many are really needed is only known
+         * once the continuation bits are decoded
          */
-        nread = recv_data(&c->conn, c->rbuf + c->read, 4 - c->read);
+        if (c->read < 4) {
+            nread = recv_data(&c->conn, c->rbuf + c->read, 4 - c->read);
 
-        if (errno != EAGAIN && errno != EWOULDBLOCK && nread <= 0)
-            return nread == -1 ? -ERRSOCKETERR : -ERRCLIENTDC;
+            if (errno != EAGAIN && errno != EWOULDBLOCK && nread <= 0)
+                return nread == -1 ? -ERRSOCKETERR : -ERRCLIENTDC;
 
-        c->read += nread;
+            c->read += nread;
 
-        if (errno == EAGAIN && c->read < 4)
-            return -ERREAGAIN;
+            if (errno == EAGAIN && c->read < 4)
+                return -ERREAGAIN;
+        }
 
         /*
-         * Read remaining length bytes which starts at byte 2 and can be long to
-         * 4 bytes based on the size stored, so byte 2-5 is dedicated to the
-         * packet length.
+         * Decode the Remaining Length from the bytes actually received so
+         * far: decoding past them would take stale buffer contents for a
+         * length. When the field continues beyond them (and is still within
+         * the 4 bytes allowed by MQTT v3.1.1 §2.2.3) fetch the missing
+         * bytes before decoding again, a 5th byte means malformed
          */
-        pktlen = mqtt_decode_length(c->rbuf + 1, &pos);
+        for (;;) {
+            pktlen = mqtt_decode_length(c->rbuf + 1, &pos,
+                                        (unsigned)(c->read - 1));
+            if (pktlen != (usize)-1)
+                break;
+            if (pos >= MQTT_MAX_LEN_BYTES)
+                return -ERRPACKETERR;
+            nread = recv_data(&c->conn, c->rbuf + c->read, 5 - c->read);
+            if (nread <= 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                    return -ERREAGAIN;
+                return nread == -1 ? -ERRSOCKETERR : -ERRCLIENTDC;
+            }
+            c->read += nread;
+        }
 
         /*
          * Set return code to -ERRMAXREQSIZE in case the total packet len
-         * exceeds the configuration limit `max_request_size`
+         * exceeds the configuration limit `max_request_size`: the check is
+         * made on the whole packet (fixed header included) because the read
+         * buffer is allocated exactly that big and `toread` below would
+         * push the read a few bytes past its end otherwise
          */
-        if (pktlen > conf->max_request_size)
+        if (pktlen + pos + 1 > conf->max_request_size)
             return -ERRMAXREQSIZE;
 
         /*
@@ -730,6 +952,18 @@ static void write_callback(struct ev_ctx *ctx, void *arg)
     switch (err) {
     case SOL_OK:
         /*
+         * A refused connection (CONNACK with a non-zero return code) is
+         * flushed as soon as it is written: the read side is never rearmed
+         * for it
+         */
+        if (client->close_after_write) {
+            log_info("Closing connection with %s (%s): refused (%i)",
+                     client->client_id, client->conn.ip, client->rc);
+            ev_del_fd(ctx, client->conn.fd);
+            client_close(client);
+            break;
+        }
+        /*
          * Rearm descriptor making it ready to receive input,
          * read_callback will be the callback to be used; also reset the
          * read buffer status for the client.
@@ -750,10 +984,7 @@ static void write_callback(struct ev_ctx *ctx, void *arg)
         log_info("Closing connection with %s (%s): %s %i", client->client_id,
                  client->conn.ip, solerr(client->rc), err);
         ev_del_fd(ctx, client->conn.fd);
-        client_deactivate(client);
-        // Update stats
-        info.active_connections--;
-        info.total_connections--;
+        client_close(client);
         break;
     }
 }
@@ -861,26 +1092,16 @@ static void read_callback(struct ev_ctx *ctx, void *data)
          */
         if (c->has_lwt == true && c->session)
             publish_lwt(&c->session->lwt_msg);
-#if THREADSNR > 0
-        pthread_mutex_lock(&mutex);
-#endif
         // Clean resources
         ev_del_fd(ctx, c->conn.fd);
-        // Remove from subscriptions for now
-        if (c->session && list_size(c->session->subscriptions) > 0) {
-            list_foreach(item, c->session->subscriptions)
-            {
-                log_debug("Deleting %s from topic %s", c->client_id,
-                          ((struct topic *)item->data)->name);
-                topic_del_subscriber(item->data, c);
-            }
-        }
-#if THREADSNR > 0
-        pthread_mutex_unlock(&mutex);
-#endif
-        client_deactivate(c);
-        info.active_connections--;
-        info.total_connections--;
+        /*
+         * No subscription cleanup here: client_deactivate() already drops
+         * the topic subscriptions of a clean session, while the ones of a
+         * persistent session (clean_session = false) must survive this
+         * abrupt disconnect or the reconnected client would have a session
+         * with no subscription left on the broker side
+         */
+        client_close(c);
         break;
     case -ERREAGAIN:
         /*
@@ -913,6 +1134,38 @@ static void process_message(struct ev_ctx *ctx, struct client *c)
     int rc = mqtt_unpack(c->rbuf + c->rpos, &io.data, *c->rbuf,
                          c->read - c->rpos);
     c->toread = c->read = c->rpos = 0;
+    if (rc == MQTT_UNACCEPTABLE_PROTOCOL_VERSION ||
+        rc == MQTT_IDENTIFIER_REJECTED) {
+        /*
+         * MQTT v3.1.1 §3.1.2.1 and §3.1.3.1: a CONNECT with a wrong protocol
+         * name/level or an unacceptable client id must be answered with a
+         * CONNACK carrying the return code, and §3.2.2.3 mandates closing
+         * the network connection right after: the flag makes write_callback
+         * drop the connection as soon as the CONNACK below has been flushed
+         */
+        log_error("Rejecting CONNECT from %s: return code %i",
+                  c->client_id[0] ? c->client_id : "unknown", rc);
+        struct mqtt_packet connack = {
+            .header = (union mqtt_header){.byte = CONNACK_B}};
+        mqtt_connack(&connack, 0, (u8)rc);
+#if THREADSNR > 0
+        pthread_mutex_lock(&c->mutex);
+#endif
+        /* Never let a refusal overflow the write buffer */
+        if (c->towrite + MQTT_ACK_LEN <= conf->max_request_size) {
+            mqtt_pack(&connack, c->wbuf + c->towrite);
+            c->towrite += MQTT_ACK_LEN;
+        }
+        c->close_after_write = true;
+        c->rc                = rc;
+#if THREADSNR > 0
+        pthread_mutex_unlock(&c->mutex);
+#endif
+        enqueue_event_write(c);
+        if (io.data.header.bits.type != PUBLISH)
+            mqtt_packet_destroy(&io.data);
+        return;
+    }
     if (rc != MQTT_OK) {
         /*
          * The packet is malformed or it's a type a client must never send
@@ -949,10 +1202,7 @@ static void process_message(struct ev_ctx *ctx, struct client *c)
          * deliberately not destroyed here, just drop the connection.
          */
         ev_del_fd(ctx, c->conn.fd);
-        client_deactivate(io.client);
-        // Update stats
-        info.active_connections--;
-        info.total_connections--;
+        client_close(io.client);
         break;
     case -ERRNOMEM:
         log_error(solerr(c->rc));

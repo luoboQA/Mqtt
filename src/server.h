@@ -142,6 +142,15 @@ int start_server(const char *, const char *);
 void enqueue_event_write(const struct client *);
 
 /*
+ * Disconnect any live connection registered under the given client id: MQTT
+ * v3.1.1 §3.1.4 requires the server to drop the older connection when a new
+ * CONNECT carries an id already in use. The caller must hold the global
+ * server mutex, `keep` is the connection taking the id over (skipped if it
+ * somehow matches the registered one)
+ */
+void server_kick_duplicate(const char *, const struct client *);
+
+/*
  * Make the entire process a daemon running in background
  */
 void daemonize(void);

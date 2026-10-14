@@ -28,109 +28,127 @@
 
 #include "memorypool.h"
 #include "memory.h"
-#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
 
-static void memorypool_resize(struct memorypool *);
+/*
+ * A chunk is one contiguous allocation holding its own link plus a run of
+ * blocks. The union keeps the payload aligned to the strictest fundamental
+ * type, so the blocks that follow the header keep the alignment malloc gave
+ * to the chunk itself
+ */
+struct memorypool_chunk {
+    union {
+        struct memorypool_chunk *next;
+        max_align_t align;
+    } header;
+    /* The blocks of the chunk follow the header */
+};
+
+/* The free list is stored inside the free blocks themselves */
+static inline void *block_next(const void *block)
+{
+    void *next;
+    memcpy(&next, block, sizeof(next));
+    return next;
+}
+
+static inline void block_set_next(void *block, void *next)
+{
+    memcpy(block, &next, sizeof(next));
+}
+
+/*
+ * Allocate a new chunk of blocks_nr blocks and push all of them on the free
+ * list. Chunks are only ever appended, never reallocated: a pointer handed
+ * out by memorypool_alloc() can therefore never dangle, which the previous
+ * single-arena-with-realloc design could do (and did, on every pool growth)
+ */
+static void memorypool_grow(struct memorypool *pool)
+{
+    size_t payload = pool->blocks_nr * pool->blocksize;
+    struct memorypool_chunk *chunk = try_alloc(sizeof(*chunk) + payload);
+
+    chunk->header.next = pool->chunks;
+    pool->chunks        = chunk;
+
+    unsigned char *blocks = (unsigned char *)(chunk + 1);
+    /*
+     * Zero the run of blocks: the client_init() of a never used block
+     * relies on the buffer pointers being NULL to allocate the read and
+     * write buffers (the old grow path used realloc, whose fresh region
+     * was left uninitialized)
+     */
+    memset(blocks, 0, payload);
+    for (size_t i = 0; i < pool->blocks_nr; ++i) {
+        void *block = blocks + i * pool->blocksize;
+        block_set_next(block, pool->free);
+        pool->free = block;
+    }
+}
 
 struct memorypool *memorypool_new(size_t blocks_nr, size_t blocksize)
 {
     struct memorypool *pool = try_alloc(sizeof(*pool));
-    blocksize    = blocksize >= sizeof(intptr_t) ? blocksize : sizeof(intptr_t);
-    pool->memory = try_calloc(blocks_nr, blocksize);
-    pool->free   = pool->memory;
-    pool->blocks_nr = blocks_nr;
-    pool->blocksize = blocksize;
-    if (!pool->free) {
-        free_memory(pool);
-        return NULL;
-    }
+
     /*
-     * We pre-assign the position of each free block in the free pointer, this
-     * way we know every block position before allocating new memory, we'll
-     * call it the header of each block, where we store the offset in memory
-     * to reach the next free slot:
-     *
-     *       ____________
-     *     _| 0x1ad45f02 | (0+blocksize)
-     *    | |------------|
-     *    | |     .      |
-     *    | |     .      |
-     *    |_|------------|
-     *     _| 0x2ff43da1 | (1+blocksize)
-     *    | |------------|
-     *    | |     .      |
-     *    | |     .      |
-     *    |_|------------|
-     *      | 0x98fff34a | (n+blocksize)
-     *      |------------|
-     *      |     .      |
-     *
-     * Just before assigning a free block of memory, we update the free pointer,
-     * pointing it to the memory address previously stored as r-value in it.
-     * This way everytime we allocate a new block we can refresh the next free
-     * block in the list.
+     * The intrusive free list stores a pointer in the first bytes of every
+     * free block, so a block can never be smaller than one
      */
-    intptr_t *ptr = pool->free;
-    for (size_t i = 1; i != blocks_nr; ++i) {
-        *ptr = (intptr_t)i;
-        ptr  = (intptr_t *)((char *)ptr + blocksize);
-    }
-    pool->block_used = 0;
+    pool->free      = NULL;
+    pool->chunks    = NULL;
+    pool->blocks_nr = blocks_nr ? blocks_nr : 1;
+    pool->blocksize =
+        blocksize >= sizeof(void *) ? blocksize : sizeof(void *);
+    pool->allocated = 0;
+
+    memorypool_grow(pool);
+
     return pool;
 }
 
 void memorypool_destroy(struct memorypool *pool)
 {
-    free_memory(pool->memory);
+    struct memorypool_chunk *chunk = pool->chunks;
+    while (chunk) {
+        struct memorypool_chunk *next = chunk->header.next;
+        free_memory(chunk);
+        chunk = next;
+    }
     free_memory(pool);
 }
 
 void *memorypool_alloc(struct memorypool *pool)
 {
-    if (pool->block_used == pool->blocks_nr - 2)
-        memorypool_resize(pool);
-    void *ptr  = pool->free;
     /*
-     * After pointing the return pointer to the next free block, we need to
-     * update the next free block address on the free pointer. The address is
-     * already stored in the "header" of the block.
+     * The free list is complete: every block ever allocated and released is
+     * threaded on it, so an empty list simply means peak usage grew and a
+     * new chunk is needed (the old code tried to detect this with a
+     * "two blocks left" comparison that fired at the wrong moment and then
+     * wrote past the end of the arena)
      */
-    pool->free = (intptr_t *)((char *)pool->memory +
-                              (*((intptr_t *)pool->free)) * pool->blocksize);
-    pool->block_used++;
-    return ptr;
+    if (!pool->free)
+        memorypool_grow(pool);
+
+    void *block = pool->free;
+    pool->free  = block_next(block);
+    pool->allocated++;
+    return block;
 }
 
 void memorypool_free(struct memorypool *pool, void *ptr)
 {
+    if (!ptr)
+        return;
     /*
-     * Here we just need to point the header of the pointer to the next free
-     * location and udpate the current free location by pointing it to the
-     * free'd pointer
+     * Push the block at the head of the free list. The old implementation
+     * stored the *next* of the current head instead of the head itself,
+     * dropping one node from the list on every free: after enough release
+     * cycles the list ran dry while blocks were still in use and two
+     * different clients ended up sharing the very same struct client
      */
-    *((intptr_t *)ptr) = *((intptr_t *)pool->free);
-    if (pool->block_used == pool->blocks_nr - 2)
-        memorypool_resize(pool);
+    block_set_next(ptr, pool->free);
     pool->free = ptr;
-    pool->block_used--;
-}
-
-static void memorypool_resize(struct memorypool *pool)
-{
-    pool->blocks_nr *= 2;
-    size_t newsize  = pool->blocks_nr * pool->blocksize;
-    /* We extract next memory block offset position */
-    intptr_t offset = *((intptr_t *)pool->free);
-    pool->memory    = try_realloc(pool->memory, newsize);
-    pool->free =
-        (void *)((char *)pool->memory + ((offset - 1) * pool->blocksize));
-    /*
-     * Apply the same logic of the init, but starting from the updated offset,
-     * the ald size of the pool
-     */
-    intptr_t *ptr = (intptr_t *)pool->free;
-    for (size_t i = offset; i <= pool->blocks_nr; ++i) {
-        *ptr = (intptr_t)i;
-        ptr  = (intptr_t *)((char *)ptr + pool->blocksize);
-    }
+    if (pool->allocated > 0)
+        pool->allocated--;
 }

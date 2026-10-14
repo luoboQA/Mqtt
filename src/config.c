@@ -204,6 +204,26 @@ static int parse_config_tls_protocols(char *token)
 
 /* Set configuration values based on what is read from the persistent
    configuration on disk */
+
+/*
+ * Copy a configuration value into a fixed size field, rejecting (with a
+ * warning naming the key) a value that would not fit: a silent truncation
+ * would leave a hostname or a port that was never asked for, and a blind
+ * strcpy could overflow the field with a long conf line
+ */
+static void set_config_str(const char *key, char *dest, size_t destsz,
+                           const char *value)
+{
+    size_t len = strlen(value);
+    if (len >= destsz) {
+        log_warning("Ignoring configuration %s: value of %zu bytes does not "
+                    "fit in %zu",
+                    key, len, destsz);
+        return;
+    }
+    memcpy(dest, value, len + 1);
+}
+
 static void add_config_value(const char *key, const char *value)
 {
 
@@ -211,20 +231,22 @@ static void add_config_value(const char *key, const char *value)
     size_t vlen = strlen(value);
 
     if (STREQ("log_level", key, klen) == true) {
-        for (int i = 0; i < 3; i++) {
+        /* lmap holds 5 levels: stopping at 3 silently dropped INFO and
+         * INFORMATION, which the parser used to ignore without warning */
+        for (size_t i = 0; i < sizeof(lmap) / sizeof(*lmap); i++) {
             if (STREQ(lmap[i].lname, value, vlen) == true)
                 config.loglevel = lmap[i].loglevel;
         }
     } else if (STREQ("log_path", key, klen) == true) {
-        strcpy(config.logpath, value);
+        set_config_str(key, config.logpath, sizeof(config.logpath), value);
     } else if (STREQ("unix_socket", key, klen) == true) {
         config.socket_family = UNIX;
-        strcpy(config.hostname, value);
+        set_config_str(key, config.hostname, sizeof(config.hostname), value);
     } else if (STREQ("ip_address", key, klen) == true) {
         config.socket_family = INET;
-        strcpy(config.hostname, value);
+        set_config_str(key, config.hostname, sizeof(config.hostname), value);
     } else if (STREQ("ip_port", key, klen) == true) {
-        strcpy(config.port, value);
+        set_config_str(key, config.port, sizeof(config.port), value);
     } else if (STREQ("max_memory", key, klen) == true) {
         config.max_memory = read_memory_with_mul(value);
     } else if (STREQ("max_request_size", key, klen) == true) {
@@ -236,13 +258,15 @@ static void add_config_value(const char *key, const char *value)
         config.stats_pub_interval = read_time_with_mul(value);
     } else if (STREQ("keepalive", key, klen) == true) {
         config.keepalive = read_time_with_mul(value);
+    } else if (STREQ("retransmit_interval", key, klen) == true) {
+        config.retransmit_interval = read_time_with_mul(value);
     } else if (STREQ("cafile", key, klen) == true) {
         config.tls = true;
-        strcpy(config.cafile, value);
+        set_config_str(key, config.cafile, sizeof(config.cafile), value);
     } else if (STREQ("certfile", key, klen) == true) {
-        strcpy(config.certfile, value);
+        set_config_str(key, config.certfile, sizeof(config.certfile), value);
     } else if (STREQ("keyfile", key, klen) == true) {
-        strcpy(config.keyfile, value);
+        set_config_str(key, config.keyfile, sizeof(config.keyfile), value);
     } else if (STREQ("allow_anonymous", key, klen) == true) {
         // TODO add strict checks
         if (STREQ(value, "false", 5) == true)
@@ -250,7 +274,8 @@ static void add_config_value(const char *key, const char *value)
         else
             config.allow_anonymous = true;
     } else if (STREQ("password_file", key, klen) == true) {
-        strcpy(config.password_file, value);
+        set_config_str(key, config.password_file, sizeof(config.password_file),
+                       value);
     } else if (STREQ("tls_protocols", key, klen) == true) {
         if (vlen == 0)
             return;
@@ -268,14 +293,26 @@ static void add_config_value(const char *key, const char *value)
     }
 }
 
-static inline void unpack_bytes(char **str, char *dest)
+/*
+ * Copy the next whitespace delimited token into dest, never writing more
+ * than destsz bytes (including the terminator): the destination used to be
+ * written until the token ended, so a single overlong line of the conf file
+ * overflowed the small key buffer on the stack. Whatever is left of an
+ * overlong token is skipped so the parser stays in sync with the line
+ */
+static inline void unpack_bytes(char **str, char *dest, size_t destsz)
 {
 
-    if (!str || !dest)
+    if (!str || !dest || destsz == 0)
         return;
 
-    while (!isspace(**str) && **str)
-        *dest++ = *(*str)++;
+    size_t i = 0;
+    while (!isspace(**str) && **str) {
+        if (i + 1 < destsz)
+            dest[i++] = **str;
+        (*str)++;
+    }
+    dest[i] = '\0';
 }
 
 int config_load(const char *configpath)
@@ -315,13 +352,13 @@ int config_load(const char *configpath)
 
         // Read key
         pkey = key;
-        unpack_bytes(&pline, pkey);
+        unpack_bytes(&pline, pkey, sizeof(key));
 
         // Remove whitespaces if any after the key and before the value
         strip_spaces(&pline);
 
         // Ignore eventually incomplete configuration, but notify it
-        if (line[0] == '\0') {
+        if (*pline == '\0') {
             log_warning("WARNING: Incomplete configuration '%s' at line %d. "
                         "Fallback to default.",
                         key, linenr);
@@ -330,13 +367,14 @@ int config_load(const char *configpath)
 
         // Read value
         pval = value;
-        unpack_bytes(&pline, pval);
+        unpack_bytes(&pline, pval, sizeof(value));
 
         // At this point we have key -> value ready to be ingested on the
         // global configuration object
         add_config_value(key, value);
     }
 
+    fclose(fh);
     return true;
 }
 
@@ -363,6 +401,7 @@ void config_set_default(void)
     config.tcp_backlog        = SOMAXCONN;
     config.stats_pub_interval = read_time_with_mul(DEFAULT_STATS_INTERVAL);
     config.keepalive          = read_time_with_mul(DEFAULT_KEEPALIVE);
+    config.retransmit_interval = read_time_with_mul(DEFAULT_RETRANSMIT);
     config.tls                = false;
     config.tls_protocols      = DEFAULT_TLS_PROTOCOLS;
     config.allow_anonymous    = true;
@@ -388,7 +427,13 @@ void config_print_tls_versions(void)
         strncpy(protocols + pos, "TLSv1_3, ", 64 - pos);
         pos += 9;
     }
-    protocols[pos - 2] = '\0';
+    /*
+     * The trailing ", " is trimmed by overwriting the last two characters:
+     * with no protocol bit set pos is still 0 and that write would land
+     * two bytes before the array
+     */
+    if (pos >= 2)
+        protocols[pos - 2] = '\0';
     log_info("\tTLS: %s", protocols);
 }
 
@@ -410,7 +455,8 @@ void config_print(void)
             log_info("\tAddress: %s", config.hostname);
             log_info("\tPort: %s", config.port);
             log_info("\tTcp backlog: %d", config.tcp_backlog);
-            log_info("\tKeepalive: %d", config.keepalive);
+            log_info("\tKeepalive: %zu", config.keepalive);
+            log_info("\tRetransmit interval: %zu", config.retransmit_interval);
             if (config.tls == true)
                 config_print_tls_versions();
             log_info("\tFile handles soft limit: %li", get_fh_soft_limit());
@@ -452,13 +498,24 @@ bool config_read_passwd_file(const char *path, struct authentication **auth_map)
         if (*pline == '\0')
             continue;
 
-        int i  = 0;
+        /*
+         * Bounded on both ends: the loops below used to stop only at ':'
+         * and '\n', so a line with no colon, one longer than the fixed
+         * username/password buffers, or (most commonly) a final line
+         * without a trailing newline walked and wrote past the buffers and
+         * past the end of `line`, corrupting the stack. The '\0' check
+         * also stops a truncated line, and a line with no ':' is skipped
+         * instead of feeding an empty pair to the map
+         */
         puname = line;
-        while (*puname != ':')
+        int i  = 0;
+        while (*puname != ':' && *puname != '\0' && i < 0xFF - 1)
             username[i++] = *puname++;
+        if (*puname != ':')
+            continue;
         puname++;
         i = 0;
-        while (*puname != '\n')
+        while (*puname != '\n' && *puname != '\0' && i < 0xFFF - 1)
             password[i++] = *puname++;
 
         struct authentication *auth = try_alloc(sizeof(*auth));
@@ -467,5 +524,6 @@ bool config_read_passwd_file(const char *path, struct authentication **auth_map)
         HASH_ADD_STR(*auth_map, username, auth);
     }
 
+    fclose(fh);
     return true;
 }
