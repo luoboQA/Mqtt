@@ -45,6 +45,9 @@
 /* Auxiliary function to check wether a string is an integer */
 bool is_integer(const char *string)
 {
+    /* An empty string holds no digit at all */
+    if (!string || !*string)
+        return false;
     for (; *string; ++string)
         if (!isdigit(*string))
             return false;
@@ -89,10 +92,10 @@ char *update_integer_string(char *str, int num)
      * previous
      */
     /*
-     * number_len() returns the digit count (plus one), so tmp holds digits+2
-     * bytes while the sprintf below writes at most digits+1: there is always
-     * room, and a negative n widens to a huge size_t in number_len(), only
-     * growing the buffer. The formatting is bounded, not unsafe
+     * number_len() returns the exact digit count, so tmp holds digits+1
+     * bytes: room for the digits and the NUL terminator written by sprintf.
+     * A negative n widens to a huge size_t in number_len(), only growing the
+     * buffer. The formatting is bounded, not unsafe
      */
     char tmp[number_len(n) + 1];
     sprintf(tmp, "%d", n);
@@ -119,19 +122,22 @@ char *append_string(const char *src, char *dst, size_t chunklen)
 }
 
 /*
- * Return the 'length' of a positive number, as the number of chars it would
- * take in a string
+ * Return the number of decimal digits of a positive number, i.e. the number
+ * of chars it would take in a string, counting the single digit of 0
  */
 int number_len(size_t number)
 {
     int len = 1;
-    while (number) {
+    while (number /= 10)
         len++;
-        number /= 10;
-    }
     return len;
 }
 
+/*
+ * Return the current time expressed in microseconds since the Epoch; despite
+ * the historic name mentioning "ns", the resolution of gettimeofday() is
+ * microseconds and the value is only used to generate unique client ids
+ */
 unsigned long unix_time_ns(void)
 {
     struct timeval time;

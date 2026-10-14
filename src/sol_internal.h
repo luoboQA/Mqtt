@@ -49,6 +49,7 @@
  * - error EAGAIN from a non-blocking read/write function
  * - error sending/receiving data on a connected socket
  * - error OUT OF MEMORY
+ * - keepalive expired with no Control Packet received
  */
 #define ERRCLIENTDC       1
 #define ERRPACKETERR      2
@@ -56,6 +57,7 @@
 #define ERREAGAIN         4
 #define ERRSOCKETERR      5
 #define ERRNOMEM          6
+#define ERRKEEPALIVE      7
 
 /*
  * Return code of handler functions, signaling if there's data payload to be
@@ -78,7 +80,16 @@
  */
 struct topic {
     const char *name;
-    unsigned char *retained_msg;
+    /*
+     * The retained message of this topic, NULL when there is none, owning one
+     * reference to the packet. It is stored unpacked (topic name, payload and
+     * QoS) rather than as the pre-packed bytes that arrived on the wire: each
+     * delivery is packed when a subscriber asks for it, with the QoS that
+     * subscription was granted and a packet identifier of its own, so the
+     * message goes out at the right level instead of replaying the bytes (and
+     * the identifier) of the publisher that stored it
+     */
+    struct mqtt_packet *retained;
     struct subscriber *subscribers; /* UTHASH handle pointer, must be NULL */
 };
 
@@ -214,6 +225,9 @@ struct client {
                              */
     struct client_session *session; /* The session associated to the client */
     time_t last_seen; /* The timestamp of the last action performed */
+    unsigned short keepalive; /* Keep Alive seconds taken from the CONNECT
+                               * (MQTT v3.1.1 §3.1.2.10), 0 disables the
+                               * check entirely */
     bool online;      /* Just an online flag */
     bool connected;   /* States if the client has already processed a connection
                          packet */

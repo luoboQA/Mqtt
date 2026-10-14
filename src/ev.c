@@ -241,11 +241,23 @@ static int ev_api_get_event_type(struct ev_ctx *ctx, int idx)
     // We want to remember the previous events only if they're not of type
     // CLOSE or TIMER
     int mask               = ev_mask & (EV_CLOSEFD | EV_TIMERFD) ? ev_mask : 0;
-    if (p_api->fds[idx].revents & (POLLHUP | POLLERR))
+
+    /*
+     * revents is what poll() actually reported for this slot. The CLOSEFD
+     * and TIMERFD slots above are carried over verbatim, so without this
+     * guard every unrelated event would re-fire the stop handler (shutting
+     * the loop down at the first connection) and the periodic crons (stats
+     * and retransmissions) on each unrelated wakeup
+     */
+    short revents = p_api->fds[idx].revents;
+    if (!(revents & (POLLIN | POLLOUT | POLLERR | POLLHUP | POLLNVAL)))
+        return EV_NONE;
+
+    if (revents & (POLLHUP | POLLERR | POLLNVAL))
         mask |= EV_DISCONNECT;
-    if (p_api->fds[idx].revents & POLLIN)
+    if (revents & POLLIN)
         mask |= EV_READ;
-    if (p_api->fds[idx].revents & POLLOUT)
+    if (revents & POLLOUT)
         mask |= EV_WRITE;
     return mask;
 }
@@ -256,6 +268,13 @@ static int ev_api_poll(struct ev_ctx *ctx, time_t timeout)
     int err                = poll(p_api->fds, p_api->nfds, timeout);
     if (err < 0)
         return -EV_ERR;
+    /*
+     * Unlike epoll, poll() reports the ready descriptors by setting revents
+     * on their own slots rather than compacting them at the front, so the
+     * caller must walk every watched slot and let get_event_type() skip the
+     * idle ones: returning the ready count here would only visit the first
+     * `err` slots and miss the events reported further down the array
+     */
     return p_api->nfds;
 }
 
@@ -267,15 +286,18 @@ static int ev_api_poll(struct ev_ctx *ctx, time_t timeout)
  */
 static int ev_api_watch_fd(struct ev_ctx *ctx, int fd)
 {
-    struct poll_api *p_api         = ctx->api;
-    p_api->fds[p_api->nfds].fd     = fd;
-    p_api->fds[p_api->nfds].events = POLLIN;
-    p_api->nfds++;
+    struct poll_api *p_api = ctx->api;
+
+    /* Grow *before* writing, the slot is at index nfds */
     if (p_api->nfds >= p_api->events_monitored) {
         p_api->events_monitored *= 2;
         p_api->fds = try_realloc(p_api->fds, p_api->events_monitored *
                                                  sizeof(struct pollfd));
     }
+    p_api->fds[p_api->nfds].fd     = fd;
+    p_api->fds[p_api->nfds].events = POLLIN;
+    p_api->fds[p_api->nfds].revents = 0;
+    p_api->nfds++;
     return EV_OK;
 }
 
@@ -284,12 +306,19 @@ static int ev_api_del_fd(struct ev_ctx *ctx, int fd)
     struct poll_api *p_api = ctx->api;
     for (int i = 0; i < p_api->nfds; ++i) {
         if (p_api->fds[i].fd == fd) {
-            p_api->fds[i].fd     = -1;
-            p_api->fds[i].events = 0;
-            // Resize fds array
+            /*
+             * Shift the whole slot, not just the descriptor: leaving the old
+             * events/revents on the compacted position mismatched the
+             * watched interest with the fd and could make a descriptor
+             * report POLLOUT for a neighbour's registration
+             */
             for (int j = i; j < p_api->nfds - 1; ++j)
-                p_api->fds[j].fd = p_api->fds[j + 1].fd;
+                p_api->fds[j] = p_api->fds[j + 1];
             p_api->nfds--;
+            /* Forget the vacated tail slot */
+            p_api->fds[p_api->nfds].fd      = -1;
+            p_api->fds[p_api->nfds].events  = 0;
+            p_api->fds[p_api->nfds].revents = 0;
             break;
         }
     }
@@ -301,18 +330,22 @@ static int ev_api_del_fd(struct ev_ctx *ctx, int fd)
  */
 static int ev_api_register_event(struct ev_ctx *ctx, int fd, int mask)
 {
-    struct poll_api *p_api     = ctx->api;
-    p_api->fds[p_api->nfds].fd = fd;
-    if (mask & EV_READ)
-        p_api->fds[p_api->nfds].events |= POLLIN;
-    if (mask & EV_WRITE)
-        p_api->fds[p_api->nfds].events |= POLLOUT;
-    p_api->nfds++;
+    struct poll_api *p_api = ctx->api;
+
+    /* Grow *before* writing, the slot is at index nfds */
     if (p_api->nfds >= p_api->events_monitored) {
         p_api->events_monitored *= 2;
         p_api->fds = try_realloc(p_api->fds, p_api->events_monitored *
                                                  sizeof(struct pollfd));
     }
+    p_api->fds[p_api->nfds].fd      = fd;
+    p_api->fds[p_api->nfds].events  = 0;
+    if (mask & EV_READ)
+        p_api->fds[p_api->nfds].events |= POLLIN;
+    if (mask & EV_WRITE)
+        p_api->fds[p_api->nfds].events |= POLLOUT;
+    p_api->fds[p_api->nfds].revents = 0;
+    p_api->nfds++;
     return EV_OK;
 }
 
@@ -367,10 +400,12 @@ static int ev_api_init(struct ev_ctx *ctx, int events_nr)
      * fd_set is an array of 32 i32 and each FD is represented by a bit so
      * 32 x 32 = 1024 as hard limit
      */
-    assert(events_nr <= 1024);
+    assert(events_nr <= FD_SETSIZE);
     struct select_api *s_api = try_alloc(sizeof(*s_api));
     FD_ZERO(&s_api->rfds);
     FD_ZERO(&s_api->wfds);
+    FD_ZERO(&s_api->_rfds);
+    FD_ZERO(&s_api->_wfds);
     ctx->api   = s_api;
     ctx->maxfd = 0;
     return EV_OK;
@@ -407,13 +442,24 @@ static int ev_api_get_event_type(struct ev_ctx *ctx, int idx)
 
 static int ev_api_poll(struct ev_ctx *ctx, time_t timeout)
 {
-    struct timeval *tv =
-        timeout > 0 ? &(struct timeval){0, timeout * 1000} : NULL;
+    /*
+     * The timeout is expressed in milliseconds, like epoll_wait(): timeval
+     * splits it into seconds and microseconds, the old code stuffed the whole
+     * value into tv_usec which is out of range past 999999 (1 second) and
+     * made select() fail with EINVAL
+     */
+    struct timeval tv;
+    struct timeval *tvp = NULL;
+    if (timeout > 0) {
+        tv.tv_sec         = timeout / 1000;
+        tv.tv_usec        = (timeout % 1000) * 1000;
+        tvp               = &tv;
+    }
     struct select_api *s_api = ctx->api;
     // Re-initialize fdset arrays cause select call side-effect the originals
     memcpy(&s_api->_rfds, &s_api->rfds, sizeof(fd_set));
     memcpy(&s_api->_wfds, &s_api->wfds, sizeof(fd_set));
-    int err = select(ctx->maxfd + 1, &s_api->_rfds, &s_api->_wfds, NULL, tv);
+    int err = select(ctx->maxfd + 1, &s_api->_rfds, &s_api->_wfds, NULL, tvp);
     if (err < 0)
         return -EV_ERR;
     return ctx->maxfd + 1;
@@ -422,6 +468,15 @@ static int ev_api_poll(struct ev_ctx *ctx, time_t timeout)
 static int ev_api_watch_fd(struct ev_ctx *ctx, int fd)
 {
     struct select_api *s_api = ctx->api;
+    /*
+     * FD_SET() on a descriptor at or beyond FD_SETSIZE writes past the end of
+     * the fd_set (128 bytes on Linux), silently corrupting the stack: refuse
+     * the descriptor instead
+     */
+    if (fd >= FD_SETSIZE) {
+        errno = EINVAL;
+        return -EV_ERR;
+    }
     FD_SET(fd, &s_api->rfds);
     // Check for a possible new max fd, we don't want to miss events on FDs
     if (fd > ctx->maxfd)
@@ -432,6 +487,8 @@ static int ev_api_watch_fd(struct ev_ctx *ctx, int fd)
 static int ev_api_del_fd(struct ev_ctx *ctx, int fd)
 {
     struct select_api *s_api = ctx->api;
+    if (fd < 0 || fd >= FD_SETSIZE)
+        return EV_OK;
     if (FD_ISSET(fd, &s_api->rfds))
         FD_CLR(fd, &s_api->rfds);
     if (FD_ISSET(fd, &s_api->wfds))
@@ -439,9 +496,11 @@ static int ev_api_del_fd(struct ev_ctx *ctx, int fd)
     /*
      * To remove  FD from select we must determine the new maximum descriptor
      * value based on the bits that are still turned on in the rfds set.
+     * Stop at -1 (empty set): without the bound the loop walked below zero
+     * and indexed the fd_set with a negative value
      */
     if (fd == ctx->maxfd) {
-        while (!FD_ISSET(ctx->maxfd, &s_api->rfds) &&
+        while (ctx->maxfd >= 0 && !FD_ISSET(ctx->maxfd, &s_api->rfds) &&
                !FD_ISSET(ctx->maxfd, &s_api->wfds))
             ctx->maxfd -= 1;
     }
@@ -451,6 +510,10 @@ static int ev_api_del_fd(struct ev_ctx *ctx, int fd)
 static int ev_api_register_event(struct ev_ctx *ctx, int fd, int mask)
 {
     struct select_api *s_api = ctx->api;
+    if (fd >= FD_SETSIZE) {
+        errno = EINVAL;
+        return -EV_ERR;
+    }
     if (mask & EV_READ)
         FD_SET(fd, &s_api->rfds);
     if (mask & EV_WRITE)
@@ -523,16 +586,23 @@ static void ev_api_destroy(struct ev_ctx *ctx)
 static int ev_api_get_event_type(struct ev_ctx *ctx, int idx)
 {
     struct kqueue_api *k_api = ctx->api;
-    int events               = k_api->events[idx].flags;
+    /*
+     * The filter that fired lives in .filter, while .flags carries EV_EOF,
+     * EV_ERROR and friends. The old code tested `flags & EVFILT_READ`, but
+     * EVFILT_READ is -1, so any non-zero flags read as "readable" and a zero
+     * value suppressed both directions: the dispatch was effectively random
+     */
+    int16_t filter           = k_api->events[idx].filter;
+    uint16_t keflags         = k_api->events[idx].flags;
     int ev_mask = ctx->events_monitored[k_api->events[idx].ident].mask;
     // We want to remember the previous events only if they're not of type
     // CLOSE or TIMER
     int mask    = ev_mask & (EV_CLOSEFD | EV_TIMERFD) ? ev_mask : EV_NONE;
-    if (events & (EV_EOF | EV_ERROR))
+    if (keflags & (EV_EOF | EV_ERROR))
         mask |= EV_DISCONNECT;
-    if (events & EVFILT_READ)
+    if (filter == EVFILT_READ)
         mask |= EV_READ;
-    if (events & EVFILT_WRITE)
+    if (filter == EVFILT_WRITE)
         mask |= EV_WRITE;
     return mask;
 }
@@ -541,10 +611,19 @@ static int ev_api_poll(struct ev_ctx *ctx, time_t timeout)
 {
     struct kqueue_api *k_api = ctx->api;
     struct timespec ts_timeout;
-    ts_timeout.tv_sec  = timeout;
-    ts_timeout.tv_nsec = 0;
-    int err =
-        kevent(k_api->fd, NULL, 0, k_api->events, ctx->maxevents, &ts_timeout);
+    struct timespec *tsp = NULL;
+    /*
+     * ev_run() passes -1 for "block forever", which produced a negative
+     * timespec and made kevent() fail with EINVAL, exiting the loop right
+     * after the first cycle on BSD/macOS. A NULL timeout is the documented
+     * way to wait indefinitely
+     */
+    if (timeout >= 0) {
+        ts_timeout.tv_sec  = timeout;
+        ts_timeout.tv_nsec = 0;
+        tsp                = &ts_timeout;
+    }
+    int err = kevent(k_api->fd, NULL, 0, k_api->events, ctx->events_nr, tsp);
     if (err < 0)
         return -EV_ERR;
     return err;
@@ -553,17 +632,24 @@ static int ev_api_poll(struct ev_ctx *ctx, time_t timeout)
 static int ev_api_del_fd(struct ev_ctx *ctx, int fd)
 {
     struct kqueue_api *k_api = ctx->api;
-    struct kevent ke;
-    int ev_mask = ctx->events_monitored[fd].mask;
-    int mask    = 0;
+    int ev_mask              = ctx->events_monitored[fd].mask;
+    /*
+     * A kevent is per filter: EVFILT_READ, EVFILT_WRITE and EVFILT_TIMER are
+     * distinct (negative) constants and must never be OR-ed together, the
+     * result of the old `mask |=` was a filter value no registration ever
+     * used, so the delete silently failed and left the filter armed
+     */
+    struct kevent ke[3];
+    int n = 0;
     if (ev_mask & EV_READ)
-        mask |= EVFILT_READ;
+        EV_SET(&ke[n++], fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
     if (ev_mask & EV_WRITE)
-        mask |= EVFILT_WRITE;
+        EV_SET(&ke[n++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
     if (ev_mask & EV_TIMERFD)
-        mask |= EVFILT_TIMER;
-    EV_SET(&ke, fd, mask, EV_DELETE, 0, 0, NULL);
-    if (kevent(k_api->fd, &ke, 1, NULL, 0, NULL) == -1)
+        EV_SET(&ke[n++], fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+    if (n == 0)
+        return EV_OK;
+    if (kevent(k_api->fd, ke, n, NULL, 0, NULL) == -1)
         return -EV_ERR;
     return EV_OK;
 }
@@ -571,14 +657,21 @@ static int ev_api_del_fd(struct ev_ctx *ctx, int fd)
 static int ev_api_register_event(struct ev_ctx *ctx, int fd, int mask)
 {
     struct kqueue_api *k_api = ctx->api;
-    struct kevent ke;
-    int op = 0;
+    /*
+     * One kevent per filter, see ev_api_del_fd(): OR-ing the filter
+     * constants together registered only EVFILT_READ (EVFILT_READ is -1, so
+     * `-1 | EVFILT_WRITE` is still -1) and a descriptor watched for writing
+     * never became writable
+     */
+    struct kevent ke[2];
+    int n = 0;
     if (mask & EV_READ)
-        op |= EVFILT_READ;
+        EV_SET(&ke[n++], fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
     if (mask & EV_WRITE)
-        op |= EVFILT_WRITE;
-    EV_SET(&ke, fd, op, EV_ADD, 0, 0, NULL);
-    if (kevent(k_api->fd, &ke, 1, NULL, 0, NULL) == -1)
+        EV_SET(&ke[n++], fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, NULL);
+    if (n == 0)
+        return EV_OK;
+    if (kevent(k_api->fd, ke, n, NULL, 0, NULL) == -1)
         return -EV_ERR;
     return EV_OK;
 }
@@ -591,14 +684,16 @@ static int ev_api_watch_fd(struct ev_ctx *ctx, int fd)
 static int ev_api_fire_event(struct ev_ctx *ctx, int fd, int mask)
 {
     struct kqueue_api *k_api = ctx->api;
-    struct kevent ke;
-    int op = 0;
+    /* One kevent per filter, same reasoning as ev_api_register_event() */
+    struct kevent ke[2];
+    int n = 0;
     if (mask & (EV_READ | EV_EVENTFD))
-        op |= EVFILT_READ;
+        EV_SET(&ke[n++], fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
     if (mask & EV_WRITE)
-        op |= EVFILT_WRITE;
-    EV_SET(&ke, fd, op, EV_ADD | EV_ENABLE, 0, 0, NULL);
-    if (kevent(k_api->fd, &ke, 1, NULL, 0, NULL) == -1)
+        EV_SET(&ke[n++], fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, NULL);
+    if (n == 0)
+        return EV_OK;
+    if (kevent(k_api->fd, ke, n, NULL, 0, NULL) == -1)
         return -EV_ERR;
     return EV_OK;
 }
@@ -662,6 +757,26 @@ static int ev_process_event(struct ev_ctx *ctx, int idx, int mask)
         }
         if (err < 0)
             return EV_OK;
+        /*
+         * EPOLLERR/EPOLLHUP can arrive with no EPOLLIN interest armed (the
+         * descriptor is only watched for writing and the peer reset the
+         * connection), leaving mask as EV_DISCONNECT alone. Nothing below
+         * would run, and since epoll is level triggered it would report the
+         * very same descriptor at every cycle: a 100% CPU spin that also
+         * never frees the connection. Hand it to the read callback, which
+         * observes the error and runs the regular teardown; without a read
+         * callback there is nothing to salvage, so the write one gets it
+         */
+        if (mask & EV_DISCONNECT && !(mask & (EV_READ | EV_WRITE))) {
+            if (e->rcallback) {
+                e->rcallback(ctx, e->rdata);
+                ++fired;
+            } else if (e->wcallback) {
+                e->wcallback(ctx, e->wdata);
+                ++fired;
+            }
+            return fired;
+        }
         if (mask & EV_READ && e->rcallback) {
             /*
              * A descriptor removed from the loop while this batch of events
@@ -691,20 +806,34 @@ static void ev_add_monitored(struct ev_ctx *ctx, int fd, int mask,
                              void *ptr)
 {
     /*
-     * TODO check for fd <= 1024 if using SELECT
-     * That is because FD_SETSIZE is fixed to 1024, fd_set is an array of 32
-     * i32 and each FD is represented by a bit so 32 x 32 = 1024 as hard limit
+     * Grow the monitored array when the descriptor does not fit. The check
+     * has to be `>=`: the array holds monitored_nr slots, indexed 0 ..
+     * monitored_nr - 1, so an fd *equal* to the capacity is already past its
+     * end. The old `>` comparison wrote a whole struct ev beyond the block
+     * as soon as a descriptor reached the initial size (1024), corrupting
+     * the heap on any machine allowing that many open files.
+     *
+     * Every slot of the grown range is initialized, the one at `fd`
+     * included: realloc does not zero the new memory and the `mask |=` below
+     * would OR our bit with whatever garbage is there. A leftover EV_EVENTFD
+     * bit makes the dispatch close() a perfectly live client descriptor, a
+     * leftover EV_TIMERFD bit read()s bytes off it and desynchronizes the
+     * whole MQTT stream, a leftover EV_CLOSEFD stops the loop.
      */
-    if (fd > ctx->maxevents) {
-        int i          = ctx->maxevents;
-        ctx->maxevents = fd;
-        if (fd > ctx->events_nr) {
-            ctx->events_monitored = try_realloc(ctx->events_monitored,
-                                                (fd + 1) * sizeof(struct ev));
-            for (; i < ctx->maxevents; ++i)
-                ctx->events_monitored[i].mask = EV_NONE;
-        }
+    if (fd >= ctx->monitored_nr) {
+        int old_nr   = ctx->monitored_nr;
+        int new_nr   = fd + 1;
+        ctx->events_monitored = try_realloc(ctx->events_monitored,
+                                            new_nr * sizeof(struct ev));
+        for (int i = old_nr; i < new_nr; ++i)
+            ctx->events_monitored[i] = (struct ev){.fd = -1, .mask = EV_NONE};
+        ctx->monitored_nr = new_nr;
     }
+
+    /* Track the highest descriptor registered, for the backends that need it */
+    if (fd > ctx->maxevents)
+        ctx->maxevents = fd;
+
     ctx->events_monitored[fd].fd = fd;
     ctx->events_monitored[fd].mask |= mask;
     if (mask & EV_READ) {
@@ -731,18 +860,25 @@ int ev_init(struct ev_ctx *ctx, int events_nr)
     ctx->fired_events     = 0;
     ctx->maxevents        = events_nr;
     ctx->events_nr        = events_nr;
+    ctx->monitored_nr     = events_nr;
     ctx->events_monitored = try_calloc(events_nr, sizeof(struct ev));
     return EV_OK;
 }
 
 void ev_destroy(struct ev_ctx *ctx)
 {
-    for (int i = 0; i < ctx->maxevents; ++i) {
+    /*
+     * Walk the whole capacity of the array: maxevents only tracks the highest
+     * descriptor ever registered and would leave the last slot unvisited
+     */
+    for (int i = 0; i < ctx->monitored_nr; ++i) {
         if (!(ctx->events_monitored[i].mask & EV_CLOSEFD) &&
             ctx->events_monitored[i].mask != EV_NONE)
             ev_del_fd(ctx, ctx->events_monitored[i].fd);
     }
     free_memory(ctx->events_monitored);
+    ctx->events_monitored = NULL;
+    ctx->monitored_nr     = 0;
     ev_api_destroy(ctx);
 }
 
@@ -789,7 +925,11 @@ int ev_watch_fd(struct ev_ctx *ctx, int fd, int mask)
 
 int ev_del_fd(struct ev_ctx *ctx, int fd)
 {
+    /* A descriptor beyond the array was never registered: nothing to clear */
+    if (fd < 0 || fd >= ctx->monitored_nr)
+        return ev_api_del_fd(ctx, fd);
     memset(ctx->events_monitored + fd, 0x00, sizeof(struct ev));
+    ctx->events_monitored[fd].fd = -1;
     return ev_api_del_fd(ctx, fd);
 }
 
@@ -840,25 +980,50 @@ int ev_register_cron(struct ev_ctx *ctx,
     timer.it_interval.tv_nsec = ns;
 
     int timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-
-    if (timerfd_settime(timerfd, 0, &timer, NULL) < 0)
+    if (timerfd < 0) {
+        perror("timerfd_create");
         return -EV_ERR;
+    }
+
+    if (timerfd_settime(timerfd, 0, &timer, NULL) < 0) {
+        /* Release the descriptor or every failed attempt leaks one */
+        perror("timerfd_settime");
+        (void)close(timerfd);
+        return -EV_ERR;
+    }
 
     // Add the timer to the event loop
     ev_add_monitored(ctx, timerfd, EV_TIMERFD | EV_READ, callback, data);
     return ev_api_watch_fd(ctx, timerfd);
 #else
     struct kqueue_api *k_api = ctx->api;
-    // milliseconds
-    unsigned period          = (s * 1000) + (ns / 100);
-    int fd                   = socket(AF_INET, SOCK_STREAM, 0);
+    /*
+     * EVFILT_TIMER counts in milliseconds: the old conversion divided the
+     * nanoseconds by 100 (giving tenths of a millisecond) so every period was
+     * 10000x shorter than requested
+     */
+    unsigned period          = (s * 1000) + (ns / 1000000);
+    /*
+     * The timer is identified by its own descriptor, created for the purpose
+     * and closed when the loop is destroyed (the old code reused a socket()
+     * descriptor, never closed, which could collide with an accepted client
+     * fd and made kevent watch the wrong object)
+     */
+    int fd                   = kqueue();
+    if (fd < 0) {
+        perror("kqueue");
+        return -EV_ERR;
+    }
     ev_add_monitored(ctx, fd, EV_TIMERFD | EV_READ, callback, data);
     struct kevent ke;
     EV_SET(&ke, fd, EVFILT_TIMER, EV_ADD | EV_ENABLE, 0, period, 0);
-    if (kevent(k_api->fd, &ke, 1, NULL, 0, NULL) == -1)
+    if (kevent(k_api->fd, &ke, 1, NULL, 0, NULL) == -1) {
+        perror("kevent");
+        (void)close(fd);
         return -EV_ERR;
+    }
     return EV_OK;
-#endif // __linux__
+#endif /* __linux__ */
 }
 
 /*

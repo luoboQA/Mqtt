@@ -78,10 +78,19 @@ struct ev {
  */
 struct ev_ctx {
     int events_nr;
-    int maxfd; // the maximum FD monitored by the event context,
-               // events_monitored must be at least maxfd long
+    int maxfd; // the highest descriptor monitored by this context on the
+               // select backend, so events_monitored needs maxfd + 1 slots
+               // to be addressable by fd (the epoll/kqueue backends address
+               // through their own kernel object instead)
     int stop;
     int maxevents;
+    /*
+     * Capacity of the events_monitored array, i.e. the number of slots it
+     * holds. It is tracked separately from events_nr/maxevents because those
+     * two are also handed to the backend (epoll_wait/kevent) as the size of
+     * *its* events array, which is allocated once at init and never grown
+     */
+    int monitored_nr;
     unsigned long long fired_events;
     struct ev *events_monitored;
     void *api; // opaque pointer to platform defined backends

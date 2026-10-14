@@ -55,6 +55,13 @@
 #define MQTT_NOT_AUTHORIZED                0x05
 
 /*
+ * Return code carried by a SUBACK/UNSUBACK entry when the broker refuses a
+ * single tuple of the packet (MQTT v3.1.1 §3.8.4 and §3.10.4): the packet is
+ * still acknowledged, only that one filter is rejected
+ */
+#define MQTT_SUBACK_FAILURE                0x80
+
+/*
  * Stub bytes, useful for generic replies, these represent the first byte in
  * the fixed header
  */
@@ -188,8 +195,16 @@ struct mqtt_connect {
         u8 client_id[MQTT_CLIENT_ID_LEN];
         u8 *username;
         u8 *password;
+        /*
+         * The Will Topic and Will Message are binary strings: the payload in
+         * particular can hold any byte, NUL included (it is an application
+         * message like any other), so their length must travel with them or
+         * every consumer would have to trust strlen() and silently truncate
+         */
         u8 *will_topic;
+        u16 will_topic_len;
         u8 *will_message;
+        u16 will_message_len;
     } payload;
 };
 
@@ -288,14 +303,14 @@ usize mqtt_decode_length(u8 *, unsigned *, unsigned);
  * Pack to binary an MQTT packet, internally it uses a dispatch table to call
  * the right pack function based on the packet opcode.
  */
-int mqtt_unpack(u8 *, struct mqtt_packet *, u8, usize);
+usize mqtt_pack(const struct mqtt_packet *, u8 *);
 
 /*
  * Unpack from binary to an mqtt_packet structure. Internally it uses a
  * dispatch table to call the right unpack function based on the opcode
  * expected to read.
  */
-usize mqtt_pack(const struct mqtt_packet *, u8 *);
+int mqtt_unpack(u8 *, struct mqtt_packet *, u8, usize);
 
 /*
  * MQTT Build helpers

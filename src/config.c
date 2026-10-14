@@ -97,7 +97,24 @@ static size_t read_time_with_mul(const char *time_string)
     /* Set multiplier */
     switch (*time_string) {
     case 'm':
-        mul = 60;
+        /*
+         * A bare 'm' means minutes; a trailing 's' after it ("500ms") would
+         * be silently read as minutes otherwise. Every interval of the
+         * configuration is expressed in seconds, so a sub-second period is
+         * rounded up to one second: rounding it down to 0 would silently
+         * turn a periodic task off
+         */
+        if (time_string[1] == 's') {
+            num = (num + 999) / 1000;
+            if (num == 0)
+                num = 1;
+            mul = 1;
+        } else {
+            mul = 60;
+        }
+        break;
+    case 'h':
+        mul = 60 * 60;
         break;
     case 'd':
         mul = 60 * 60 * 24;
@@ -124,26 +141,26 @@ char *memory_to_string(size_t memory)
         translated_memory = memory;
         numlen            = number_len(translated_memory);
         // +1 for 'b' +1 for nul terminating
-        mstring           = try_alloc(numlen + 1);
-        snprintf(mstring, numlen + 1, "%db", translated_memory);
+        mstring           = try_alloc(numlen + 2);
+        snprintf(mstring, numlen + 2, "%db", translated_memory);
     } else if (memory < 1048576) {
         translated_memory = memory / 1024;
         numlen            = number_len(translated_memory);
         // +2 for 'Kb' +1 for nul terminating
-        mstring           = try_alloc(numlen + 2);
-        snprintf(mstring, numlen + 2, "%dKb", translated_memory);
+        mstring           = try_alloc(numlen + 3);
+        snprintf(mstring, numlen + 3, "%dKb", translated_memory);
     } else if (memory < 1073741824) {
         translated_memory = memory / (1024 * 1024);
         numlen            = number_len(translated_memory);
         // +2 for 'Mb' +1 for nul terminating
-        mstring           = try_alloc(numlen + 2);
-        snprintf(mstring, numlen + 2, "%dMb", translated_memory);
+        mstring           = try_alloc(numlen + 3);
+        snprintf(mstring, numlen + 3, "%dMb", translated_memory);
     } else {
         translated_memory = memory / (1024 * 1024 * 1024);
         numlen            = number_len(translated_memory);
         // +2 for 'Gb' +1 for nul terminating
-        mstring           = try_alloc(numlen + 2);
-        snprintf(mstring, numlen + 2, "%dGb", translated_memory);
+        mstring           = try_alloc(numlen + 3);
+        snprintf(mstring, numlen + 3, "%dGb", translated_memory);
     }
 
     return mstring;
@@ -163,26 +180,26 @@ char *time_to_string(size_t time)
         translated_time = time;
         numlen          = number_len(translated_time);
         // +1 for 's' +1 for nul terminating
-        tstring         = try_alloc(numlen + 1);
-        snprintf(tstring, numlen + 1, "%ds", translated_time);
+        tstring         = try_alloc(numlen + 2);
+        snprintf(tstring, numlen + 2, "%ds", translated_time);
     } else if (time < 60 * 60) {
         translated_time = time / 60;
         numlen          = number_len(translated_time);
         // +1 for 'm' +1 for nul terminating
-        tstring         = try_alloc(numlen + 1);
-        snprintf(tstring, numlen + 1, "%dm", translated_time);
+        tstring         = try_alloc(numlen + 2);
+        snprintf(tstring, numlen + 2, "%dm", translated_time);
     } else if (time < 60 * 60 * 24) {
         translated_time = time / (60 * 60);
         numlen          = number_len(translated_time);
         // +1 for 'h' +1 for nul terminating
-        tstring         = try_alloc(numlen + 1);
-        snprintf(tstring, numlen + 1, "%dh", translated_time);
+        tstring         = try_alloc(numlen + 2);
+        snprintf(tstring, numlen + 2, "%dh", translated_time);
     } else {
         translated_time = time / (60 * 60 * 24);
         numlen          = number_len(translated_time);
         // +1 for 'd' +1 for nul terminating
-        tstring         = try_alloc(numlen + 1);
-        snprintf(tstring, numlen + 1, "%dd", translated_time);
+        tstring         = try_alloc(numlen + 2);
+        snprintf(tstring, numlen + 2, "%dd", translated_time);
     }
 
     return tstring;
@@ -515,8 +532,33 @@ bool config_read_passwd_file(const char *path, struct authentication **auth_map)
             continue;
         puname++;
         i = 0;
-        while (*puname != '\n' && *puname != '\0' && i < 0xFFF - 1)
+        while (*puname != '\n' && *puname != '\r' && *puname != '\0' &&
+               i < 0xFFF - 1)
             password[i++] = *puname++;
+
+        /*
+         * An empty username (a line such as ":secret" or a stray ":") has no
+         * meaning and would shadow nothing but make HASH_FIND return an
+         * entry no client can ever match
+         */
+        if (username[0] == '\0')
+            continue;
+
+        /*
+         * uthash keys must stay unique: HASH_ADD_STR happily chains a second
+         * entry under the same key and HASH_FIND then always returns the
+         * first one, so a repeated line would silently pin the original
+         * password while the duplicate sat in the map forever. The first
+         * occurrence wins, which is what a reader expects from a passwd file
+         */
+        struct authentication *dup = NULL;
+        HASH_FIND_STR(*auth_map, username, dup);
+        if (dup) {
+            log_warning("WARNING: Duplicate user '%s' in passwd file %s, "
+                        "keeping the first entry",
+                        username, path);
+            continue;
+        }
 
         struct authentication *auth = try_alloc(sizeof(*auth));
         auth->username              = try_strdup(username);

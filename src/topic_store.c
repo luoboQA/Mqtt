@@ -324,15 +324,24 @@ static void wild_index_match(const struct wild_index *index, const char *topic,
         size_t len;
         const char *level;
 
-        /* '#' subscriptions of this node match the rest of the topic */
-        wild_node_emit(node, true, fn, arg);
-
+        /*
+         * When the topic still has levels left, the '#' subscriptions of this
+         * node match the remainder and are emitted now, before descending
+         */
         level = wild_next_level(&p, &len);
         if (!level) {
-            /* The topic is exhausted, filters ending here match it */
+            /*
+             * The topic is exhausted, filters ending here match it: emit
+             * *all* the subscriptions of this node in one pass, since
+             * emitting once with `prefix = true` and once with `prefix =
+             * false` would invoke the callback twice on every multilevel
+             * subscription held here
+             */
             wild_node_emit(node, false, fn, arg);
             continue;
         }
+
+        wild_node_emit(node, true, fn, arg);
 
         struct wild_node *literal = wild_child(node, level, len, false);
         struct wild_node *single  = wild_child(node, "+", 1, false);

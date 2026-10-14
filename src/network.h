@@ -57,7 +57,13 @@ struct connection {
     int fd;
     SSL *ssl;
     SSL_CTX *ctx;
-    char ip[INET_ADDRSTRLEN + 6];
+    /*
+     * Big enough for the worst case "IPv6 literal in brackets + port", i.e.
+     * [ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535 plus the NUL: the old
+     * INET_ADDRSTRLEN + 6 (22 bytes) fit an IPv4 only and an IPv6 peer
+     * address would have overflowed it
+     */
+    char ip[INET6_ADDRSTRLEN + 8];
     int (*accept)(struct connection *, int);
     ssize_t (*send)(struct connection *, const unsigned char *, size_t);
     ssize_t (*recv)(struct connection *, unsigned char *, size_t);

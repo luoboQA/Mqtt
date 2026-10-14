@@ -29,8 +29,8 @@
 #include "sol_internal.h"
 
 /*
- * Initialize a struct topic pointer by setting its name, subscribers and
- * retained_msg are set to NULL.
+ * Initialize a struct topic pointer by setting its name and clearing its
+ * subscribers and retained message.
  * The function expects a non-null pointer and can't fail, if a null topic
  * is passed, the function return prematurely.
  */
@@ -38,9 +38,9 @@ void topic_init(struct topic *t, const char *name)
 {
     if (!t)
         return;
-    t->name         = name;
-    t->subscribers  = NULL;
-    t->retained_msg = NULL;
+    t->name        = name;
+    t->subscribers = NULL;
+    t->retained    = NULL;
 }
 
 /*
@@ -56,14 +56,15 @@ struct topic *topic_new(const char *name)
 }
 
 /*
- * Deallocate the topic name, retained_msg and all its subscribers
+ * Deallocate the topic name, the retained message and all its subscribers
  */
 void topic_destroy(struct topic *t)
 {
     if (!t)
         return;
     free_memory((void *)t->name);
-    free_memory(t->retained_msg);
+    if (t->retained)
+        DECREF(t->retained, struct mqtt_packet);
     if (!t->subscribers) {
         free_memory(t);
         return;
@@ -89,11 +90,20 @@ struct subscriber *topic_add_subscriber(struct topic *t,
                                         struct client_session *s,
                                         unsigned char qos)
 {
-    struct subscriber *sub = subscriber_new(s, qos), *tmp;
-    HASH_FIND_STR(t->subscribers, sub->id, tmp);
-    if (!tmp)
-        HASH_ADD_STR(t->subscribers, id, sub);
-    return sub;
+    struct subscriber *sub = NULL, *tmp;
+    HASH_FIND_STR(t->subscribers, s->session_id, sub);
+    if (sub) {
+        /*
+         * The client is already subscribed to this topic: reuse the existing
+         * entry instead of allocating a new one that would never be added to
+         * the hash table (and never freed either), just refresh the QoS
+         */
+        sub->granted_qos = qos;
+        return sub;
+    }
+    tmp       = subscriber_new(s, qos);
+    HASH_ADD_STR(t->subscribers, id, tmp);
+    return tmp;
 }
 
 /*

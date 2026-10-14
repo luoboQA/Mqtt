@@ -64,7 +64,12 @@ unsigned long list_size(const List *);
 /* Clear out the list without de-allocating it */
 void list_clear(List *, int);
 
-/* Attach a list to another one on tail */
+/*
+ * Adopt a chain of nodes (its head and the number of nodes it links, as
+ * returned by a list_pop_head style operation) as the tail of `l`. This does
+ * NOT take another List: the caller hands over the nodes themselves, the
+ * source list object is not consumed here
+ */
 List *list_attach(List *, struct list_node *, unsigned long);
 
 /* Insert data into a node and push it to the front of the list */
@@ -86,16 +91,15 @@ void list_iter_next(struct iterator *);
          (ptr)                    = (ptr)->next)
 
 /*
- * Remove a node from the list based on a compare function that must be
- * previously defined and passed in as a function pointer, accept two void
- * *args, which generally means a node and his subsequent
- */
-/*
  * Remove every node satisfying compare_func criteria from the list, calling
  * the list destructor on each removed node. The iteration advances `prev`
  * only on non matching nodes so that the head is rewritten exclusively when
  * the head node itself is removed, and the next pointer is cached before the
- * destructor runs because the destructor frees the current node
+ * destructor runs because the destructor frees the current node.
+ *
+ * The comparator receives the *node wrapper* (not the payload) as its first
+ * argument and the caller supplied `ptr` as the second: a comparator that
+ * unwraps `((struct list_node *)ptr_s1)->data` matches this contract
  */
 #define list_remove(list, ptr, cmp)                                            \
     do {                                                                       \
@@ -117,6 +121,6 @@ void list_iter_next(struct iterator *);
             }                                                                  \
             curr = next;                                                       \
         }                                                                      \
-    } while (0);
+    } while (0)
 
 #endif

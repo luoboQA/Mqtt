@@ -118,6 +118,17 @@ List *list_attach(List *l, struct list_node *head, unsigned long len)
     // set default values to the List structure fields
     l->head = head;
     l->len  = len;
+
+    /*
+     * Walk to the last node to restore the tail as well: leaving it NULL
+     * would make the next list_push_back() dereference a NULL pointer, since
+     * it only assigns the tail through the non-empty branch
+     */
+    l->tail = head;
+    if (head)
+        while (l->tail->next)
+            l->tail = l->tail->next;
+
     return l;
 }
 

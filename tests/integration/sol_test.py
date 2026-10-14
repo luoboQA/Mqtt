@@ -105,7 +105,9 @@ def create_connect(client_id=None, clean_session=True, keepalive=60,
 
 
 def create_disconnect(rc=0):
-    return struct.pack('!BBB', 0xE0, 1, rc)
+    """§3.14.1: DISCONNECT is the fixed header alone, no Remaining Length
+    byte with a payload behind it"""
+    return struct.pack('!BB', 0xE0, 0)
 
 
 def read_connack(packet):
@@ -122,19 +124,21 @@ def read_ack(packet):
 
 
 def create_subscribe(mid, topics):
-    packet = struct.pack("!B", 0x80)
+    """§2.2.2 fixes the flags of a SUBSCRIBE to 0b0010 (0x82) and §3.8.1 puts
+    the packet identifier once, followed by every (topic, qos) tuple, with a
+    single Remaining Length covering them all"""
+    payload = struct.pack("!H", mid)
     for topic, qos in topics.items():
         topic = topic.encode("utf-8")
-        packet += mqtt_encode_len(2 + 2 + len(topic) + 1)
-        pack_format = "!HH" + str(len(topic)) + "sB"
-        packet += struct.pack(pack_format, mid, len(topic), topic, qos)
-    return packet
+        payload += struct.pack("!H", len(topic)) + topic + struct.pack("!B", qos)
+    return struct.pack("!B", 0x82) + mqtt_encode_len(len(payload)) + payload
 
 
 def create_unsubscribe(mid, topic):
+    """Same fixed header rules as the SUBSCRIBE, 0xA2 for the flags (§2.2.2)"""
     topic = topic.encode("utf-8")
-    pack_format = "!BBHH" + str(len(topic)) + "s"
-    return struct.pack(pack_format, 0xA0, 2 + 2 + len(topic), mid, len(topic), topic)
+    payload = struct.pack("!HH", mid, len(topic)) + topic
+    return struct.pack("!B", 0xA2) + mqtt_encode_len(len(payload)) + payload
 
 
 def read_suback(packet):

@@ -27,33 +27,48 @@
 
 #include "memory.h"
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
 static atomic_size_t memory = ATOMIC_VAR_INIT(0);
 
 /*
- * Custom malloc function, allocate a defined size of bytes plus
- * sizeof(size_t), the size of an unsigned long long, and append the length
- * choosen at the beginning of the memory chunk as an unsigned long long,
- * returning the memory chunk allocated just sizeof(size_t) bytes after the
- * start; this way it is possible to track the memory usage at every
- * allocation.
+ * The header prepended to every allocation stores the size of the block and
+ * forces its alignment: pairing it with max_align_t in a union makes it as
+ * wide as the strictest fundamental type, so the pointer handed to the caller
+ * (one header past the start of the block) is aligned for any type, exactly
+ * like a pointer returned by malloc. A bare size_t header only guaranteed 8
+ * bytes, which is a misaligned access for anything asking for 16 (SSE
+ * vectors, long double, the memorypool chunk union)
+ */
+typedef union {
+    size_t size;
+    max_align_t align;
+} alloc_header;
+
+#define ALLOC_HEADER_SIZE (sizeof(alloc_header))
+
+/*
+ * Custom malloc function, allocate a defined size of bytes plus the header
+ * described above, storing the chosen length at the beginning of the memory
+ * chunk and returning the memory that follows it; this way it is possible to
+ * track the memory usage at every allocation.
  *
  * This function can fail if not memory is available, interrupting the
  * execution of the program and exiting, hence the prefix "try".
  */
 void *try_alloc(size_t size)
 {
-    void *ptr = malloc(size + sizeof(size_t));
-    if (!ptr && size != 0) {
-        fprintf(stderr, "[%s:%ul] Out of memory (%lu bytes)\n", __FILE__,
-                __LINE__, size);
+    void *ptr = malloc(size + ALLOC_HEADER_SIZE);
+    if (!ptr) {
+        fprintf(stderr, "[%s:%d] Out of memory (%lu bytes)\n", __FILE__,
+                __LINE__, (unsigned long)size);
         exit(EXIT_FAILURE);
     }
-    memory += size + sizeof(size_t);
-    *((size_t *)ptr) = size;
-    return (char *)ptr + sizeof(size_t);
+    memory += size + ALLOC_HEADER_SIZE;
+    ((alloc_header *)ptr)->size = size;
+    return (char *)ptr + ALLOC_HEADER_SIZE;
 }
 
 /*
@@ -82,40 +97,45 @@ void *try_realloc(void *ptr, size_t size)
     if (!ptr)
         return try_alloc(size);
 
-    void *realptr    = (char *)ptr - sizeof(size_t);
-    size_t curr_size = *((size_t *)realptr);
+    void *realptr    = (char *)ptr - ALLOC_HEADER_SIZE;
+    size_t curr_size = ((alloc_header *)realptr)->size;
     if (size == curr_size)
         return ptr;
 
-    void *newptr = realloc(realptr, size + sizeof(size_t));
-    if (!newptr && size != 0) {
-        fprintf(stderr, "[%s:%ul] Out of memory (%lu bytes)\n", __FILE__,
-                __LINE__, size);
+    void *newptr = realloc(realptr, size + ALLOC_HEADER_SIZE);
+    if (!newptr) {
+        fprintf(stderr, "[%s:%d] Out of memory (%lu bytes)\n", __FILE__,
+                __LINE__, (unsigned long)size);
         exit(EXIT_FAILURE);
     }
 
-    *((size_t *)newptr) = size;
-    memory += (-curr_size) + size + sizeof(size_t);
-    return (char *)newptr + sizeof(size_t);
+    ((alloc_header *)newptr)->size = size;
+    /*
+     * Account only for the *delta*: the header is present both before and
+     * after the realloc, so adding its size here would make the global memory
+     * counter drift upward on every reallocation
+     */
+    memory += size - curr_size;
+    return (char *)newptr + ALLOC_HEADER_SIZE;
 }
 
 /*
  * Custom free function, must be used on memory chunks allocated with t*
- * functions, it move the pointer 8 position backward by the starting address
- * of memory pointed by `ptr`, this way it knows how many bytes will be
- * free'ed by the call
+ * functions, it moves the pointer back by the size of the header to reach the
+ * start of the allocation, this way it knows how many bytes will be free'ed
+ * by the call
  */
 void free_memory(void *ptr)
 {
     if (!ptr)
         return;
 
-    void *realptr = (char *)ptr - sizeof(size_t);
+    void *realptr = (char *)ptr - ALLOC_HEADER_SIZE;
     if (!realptr)
         return;
 
-    size_t ptr_size = *((size_t *)realptr);
-    memory -= ptr_size + sizeof(size_t);
+    size_t ptr_size = ((alloc_header *)realptr)->size;
+    memory -= ptr_size + ALLOC_HEADER_SIZE;
     free(realptr);
 }
 
@@ -129,12 +149,11 @@ size_t alloc_size(void *ptr)
     if (!ptr)
         return 0L;
 
-    void *realptr = (char *)ptr - sizeof(size_t);
+    void *realptr = (char *)ptr - ALLOC_HEADER_SIZE;
     if (!realptr)
         return 0L;
 
-    size_t ptr_size = *((size_t *)realptr);
-    return ptr_size;
+    return ((alloc_header *)realptr)->size;
 }
 
 /*

@@ -37,9 +37,12 @@
 typedef struct Trie Trie;
 
 /*
- * Trie node, it contains a fixed size array (every node can have at max the
- * alphabet length size of children), a flag defining if the node represent
- * the end of a word and then if it contains a value defined by data.
+ * Trie node: a single character, the payload bound to this key (NULL when
+ * the node only exists as part of a longer key) and a pointer to a BST of
+ * children keyed by the next character. The children are NOT a fixed size
+ * array indexed by alphabet position: a BST keeps the node at O(log k) for k
+ * distinct next characters and costs no memory for the alphabet slots that
+ * are never used, which matters when the trie only ever holds topic names
  */
 struct trie_node {
     char chr;

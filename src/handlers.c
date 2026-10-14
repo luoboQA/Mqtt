@@ -67,6 +67,62 @@ static unsigned short next_free_mid(struct client_session *);
 static void inflight_msg_init(struct inflight_msg *, struct mqtt_packet *);
 
 /*
+ * Reserve `len` bytes at the end of the client's write buffer, returns true
+ * when the packet fits. Every reply is packed straight into that buffer, of
+ * exactly conf->max_request_size bytes: the periodic retransmission scan can
+ * fill it close to the brim while the client keeps sending commands, and an
+ * unguarded pack would then write past the end of the heap block. Callers
+ * must skip the reply when this returns false (a dropped reply is recovered
+ * by the sender retransmitting, an overflow is not)
+ */
+static bool outgoing_reserve(struct client *c, size_t len)
+{
+    if (c->towrite + len <= conf->max_request_size)
+        return true;
+    log_error("Cannot send reply to %s: write buffer full (towrite = %zu, "
+              "packet = %zu bytes)",
+              c->client_id, c->towrite, len);
+    return false;
+}
+
+/*
+ * Duplicate `len` bytes into a fresh NUL terminated buffer. The MQTT strings
+ * this is used on (the will topic and message) are binary: an application
+ * message may carry any byte, NUL included, so the copy is driven by the
+ * decoded length and never by strlen(), which would truncate it
+ */
+static unsigned char *dup_bytes(const unsigned char *src, size_t len)
+{
+    unsigned char *dst = try_alloc(len + 1);
+    if (src && len > 0)
+        memcpy(dst, src, len);
+    dst[len] = '\0';
+    return dst;
+}
+
+/*
+ * Deep copy of a PUBLISH packet: the copy owns its own topic and payload
+ * buffers and comes with a single reference held by the caller (DECREF
+ * releases it). The retained message of a topic needs exactly this, a packet
+ * that outlives the one travelling to the current subscribers, so that every
+ * later subscription can be served from it
+ */
+static struct mqtt_packet *mqtt_publish_copy(const struct mqtt_packet *src)
+{
+    struct mqtt_packet *copy = mqtt_packet_alloc(src->header.byte);
+
+    copy->publish = (struct mqtt_publish){
+        .pkt_id     = 0,
+        .topiclen   = src->publish.topiclen,
+        .topic      = dup_bytes(src->publish.topic, src->publish.topiclen),
+        .payloadlen = src->publish.payloadlen,
+        .payload    = dup_bytes(src->publish.payload, src->publish.payloadlen)};
+    /* The caller owns the copy from here on */
+    INCREF(copy, struct mqtt_packet);
+    return copy;
+}
+
+/*
  * Command handler mapped usign their position paired with their type, one
  * slot for each of the 16 possible values of the 4 bits packet type, so that
  * an unexpected type can never index past the end of the table. Slots that
@@ -181,8 +237,16 @@ void inflight_untrack_mid(struct client_session *session, unsigned short mid)
 {
     for (unsigned i = 0; i < session->pending_len; ++i) {
         if (session->pending_mids[i] == mid) {
-            /* Swap with the last element: the order is not significant */
-            session->pending_mids[i] = session->pending_mids[--session->pending_len];
+            /*
+             * Shift the tail down instead of swapping the last element in:
+             * the array is walked in order by the retransmission scan, so
+             * reusing an hole in the middle would scramble the order in which
+             * unacknowledged messages are sent again (they must leave in
+             * publication order, §4.6)
+             */
+            for (unsigned j = i; j + 1 < session->pending_len; ++j)
+                session->pending_mids[j] = session->pending_mids[j + 1];
+            session->pending_len--;
             return;
         }
     }
@@ -258,6 +322,73 @@ static inline void inflight_msg_init(struct inflight_msg *imsg,
 }
 
 /*
+ * Deliver the retained message of `t` to the client that has just subscribed,
+ * at the QoS granted to that subscription and never above the one the message
+ * was retained with, as §4.4 requires. Unlike a normal publish this targets a
+ * single subscriber, so the packet is packed here for it: a QoS > 0 delivery
+ * takes an identifier of its own and is tracked in the session inflight
+ * tables the same way publish_message() does, which also puts it under the
+ * periodic retransmission. The caller holds the global mutex and the client
+ * mutex, so nothing is locked here
+ */
+static void deliver_retained(struct client *c, struct topic *t,
+                             unsigned char granted_qos)
+{
+    struct mqtt_packet *stored = t->retained;
+    struct client_session *s   = c->session;
+
+    if (!stored || !s)
+        return;
+
+    unsigned char qos = stored->header.bits.qos < granted_qos
+                            ? stored->header.bits.qos
+                            : granted_qos;
+
+    struct mqtt_packet *out = mqtt_publish_copy(stored);
+    out->header             = (union mqtt_header){.byte = PUBLISH_B};
+    out->header.bits.qos    = qos;
+    /* §3.3.1.2: a message delivered because of a new subscription keeps the
+     * RETAIN flag, it is the one case where the receiver may rely on it */
+    out->header.bits.retain = 1;
+
+    if (qos > AT_MOST_ONCE) {
+        unsigned short mid = next_free_mid(s);
+        if (mid == 0) {
+            /* Every identifier is taken, drop it like the publish path does */
+            log_warning("No free packet identifier for %s, dropping retained "
+                        "message on %s",
+                        s->session_id, t->name);
+            DECREF(out, struct mqtt_packet);
+            return;
+        }
+        out->publish.pkt_id = mid;
+        /* One more reference, owned by the inflight entry until it is acked */
+        INCREF(out, struct mqtt_packet);
+        inflight_msg_init(&s->i_msgs[mid], out);
+        inflight_track_mid(s, mid);
+        ++s->inflights;
+    }
+
+    size_t len = mqtt_size(out, NULL);
+    if (c->towrite + len > conf->max_request_size) {
+        /* A QoS 0 delivery is lost, a QoS > 0 one is retried by the scan */
+        log_warning("Write buffer full (%lu bytes pending) for %s, dropping "
+                    "retained message",
+                    (unsigned long)c->towrite, c->client_id);
+        DECREF(out, struct mqtt_packet);
+        return;
+    }
+    mqtt_pack(out, c->wbuf + c->towrite);
+    c->towrite += len;
+    info.messages_sent++;
+    log_debug("Sending retained PUBLISH to %s (q%u, m%u, %s, ... (%u bytes))",
+              c->client_id, qos, out->publish.pkt_id, out->publish.topic,
+              out->publish.payloadlen);
+    /* Released either here or when the last acknowledgement lands */
+    DECREF(out, struct mqtt_packet);
+}
+
+/*
  * One of the two exposed functions of the module, it's also needed on server
  * module to publish periodic messages (e.g. $SOL stats). It's responsible
  * of the normal publish but also taking care of disconnected clients, enqueuing
@@ -275,6 +406,22 @@ int publish_message(struct mqtt_packet *pkt, const struct topic *t)
 #if THREADSNR > 0
     pthread_mutex_lock(&mutex);
 #endif
+    /*
+     * MQTT v3.1.1 §3.3.1-3: the RETAIN flag is cleared for every delivery
+     * that goes out to an *established* subscription, whatever the publisher
+     * set on the incoming packet. It only stays set on the path that feeds a
+     * brand new subscription, i.e. the retained flush in subscribe_handler(),
+     * which copies the stored packet straight into the write buffer and never
+     * comes through here (§3.3.1-2).
+     *
+     * Clearing it for the whole call rather than per subscriber also covers
+     * the QoS > 0 inflight copies: those are handed to i_msgs[] and it is
+     * their bytes the retransmission cron sends later, and a retransmission
+     * is by definition a delivery to an established subscription. The caller
+     * stores any retained copy *before* calling this, so the will, the
+     * $SOL stats and the retained message in the store are unaffected
+     */
+    pkt->header.bits.retain = 0;
     int count = HASH_COUNT(t->subscribers);
 
     if (count == 0) {
@@ -333,10 +480,13 @@ int publish_message(struct mqtt_packet *pkt, const struct topic *t)
                     /*
                      * One single reference, owned by the inflight entry: the
                      * outgoing queue only borrows the pointer and is cleared
-                     * without releasing anything when the session flushes it
+                     * without releasing anything when the session flushes it.
+                     * Appended at the back, not pushed on the head: the queue
+                     * is drained in list order on reconnect, so pushing would
+                     * hand the messages of a session back in reverse order
                      */
                     INCREF(pkt, struct mqtt_packet);
-                    list_push(s->outgoing_msgs, pkt);
+                    list_push_back(s->outgoing_msgs, pkt);
                     inflight_msg_init(&s->i_msgs[mid], pkt);
                     /*
                      * No i_acks entry here: that table holds the PUBREL
@@ -461,6 +611,14 @@ static inline int match_subscription(const char *topic, const char *wtopic,
     const char *w = wtopic;
     const char *t = topic;
 
+    /*
+     * MQTT v3.1.1 §4.7.2: a filter starting with a wildcard must never match
+     * a topic name beginning with '$' (the broker's own $SOL statistics live
+     * there), only a filter spelling the '$' explicitly is allowed to
+     */
+    if (topic[0] == '$' && (w[0] == '#' || w[0] == '+'))
+        return -SOL_ERR;
+
     /* A bare '#' subscription matches every topic */
     if (w[0] == '#' && (w[1] == '\0' || w[1] == '/'))
         return SOL_OK;
@@ -530,6 +688,17 @@ static void set_connack(struct client *c, unsigned char rc, unsigned sp)
         .connack = (struct mqtt_connack){.byte = connect_flags, .rc = rc}};
 
     /*
+     * The client is already published in the clients map by the time the
+     * CONNACK is built, so another thread's publish_message() may be packing
+     * into this very write buffer under the client mutex: taking it here is
+     * the same protocol every other writer of wbuf/towrite follows, and the
+     * global mutex is not held at this point so the canonical order is kept
+     */
+#if THREADSNR > 0
+    pthread_mutex_lock(&c->mutex);
+#endif
+
+    /*
      * The write buffer is exactly max_request_size bytes big: the CONNACK
      * must never be packed past its end (a fresh connection has an empty
      * buffer, so this only trips on an absurdly small configuration). Drop
@@ -541,6 +710,9 @@ static void set_connack(struct client *c, unsigned char rc, unsigned sp)
                   "(max_request_size = %zu)",
                   c->client_id, conf->max_request_size);
         c->close_after_write = true;
+#if THREADSNR > 0
+        pthread_mutex_unlock(&c->mutex);
+#endif
         return;
     }
     mqtt_pack(&response, c->wbuf + c->towrite);
@@ -575,6 +747,9 @@ static void set_connack(struct client *c, unsigned char rc, unsigned sp)
         // Forget just the messages flushed above
         list_drop_prefix(c->session->outgoing_msgs, packed);
     }
+#if THREADSNR > 0
+    pthread_mutex_unlock(&c->mutex);
+#endif
 }
 
 static int connect_handler(struct io_event *e)
@@ -586,12 +761,15 @@ static int connect_handler(struct io_event *e)
 
     if (cc->connected == true) {
         /*
-         * Already connected client, 2 CONNECT packet should be interpreted as
-         * a violation of the protocol, causing disconnection of the client
+         * Already connected client, a second CONNECT packet is a violation of
+         * the protocol (§3.1.4). Reported as a protocol error and not as a
+         * plain disconnection: the connection is closed without a DISCONNECT
+         * packet, so the will carried by the first CONNECT has to be
+         * delivered (§3.1.2.5)
          */
         log_info("Received double CONNECT from %s, disconnecting client",
                  c->payload.client_id);
-        goto clientdc;
+        return -ERRPACKETERR;
     }
 
     /*
@@ -610,11 +788,14 @@ static int connect_handler(struct io_event *e)
     }
 
     /*
-     * No client ID and clean_session == false? you're not authorized, we don't
-     * know who you are
+     * MQTT v3.1.1 §3.1.3.1: a zero-length client id is only acceptable when
+     * the client asks for a clean session (the server then assigns an id).
+     * With clean_session == false the server has no way to name the session
+     * and must answer with the Identifier rejected return code (0x02), not
+     * with Not authorized (0x05)
      */
     if (!c->payload.client_id[0] && c->bits.clean_session == false)
-        goto not_authorized;
+        goto id_rejected;
 
     /*
      * Check for client ID, if not present generate a random ID, otherwise add
@@ -663,6 +844,22 @@ static int connect_handler(struct io_event *e)
     }
 
     cc->connected = true;
+    /*
+     * Remember the Keep Alive the client asked for: the periodic scan below
+     * is what enforces it, the value lives on the connection and not on the
+     * session because it is negotiated on every CONNECT (§3.1.2.10)
+     */
+    cc->keepalive = c->payload.keepalive;
+    /*
+     * The configured keepalive is a maximum: a client asking for a longer
+     * period, or for none at all (Keep Alive 0), is still held to the broker
+     * policy, otherwise a single client could opt out of the check entirely
+     * and leave a dead connection around forever. 0 in the configuration
+     * disables the cap and lets the client decide
+     */
+    if (conf->keepalive > 0 &&
+        (cc->keepalive == 0 || cc->keepalive > conf->keepalive))
+        cc->keepalive = conf->keepalive;
 
     log_info("New client connected as %s (c%i, k%u)", c->payload.client_id,
              c->bits.clean_session, c->payload.keepalive);
@@ -687,17 +884,18 @@ static int connect_handler(struct io_event *e)
 
     // Add LWT topic and message if present
     if (c->bits.will) {
-        cc->has_lwt              = true;
-        const char *will_topic   = (const char *)c->payload.will_topic;
-        const char *will_message = (const char *)c->payload.will_message;
+        cc->has_lwt = true;
+        unsigned char *will_topic   = c->payload.will_topic;
+        unsigned char *will_message = c->payload.will_message;
         /*
-         * Both are guaranteed non-NULL here: unpack_mqtt_connect() returns an
-         * error when the will bit is set and either string fails to decode,
-         * so a CONNECT that reached this handler always carries both, NUL
-         * terminated by the unpacker
+         * Both are guaranteed non-NULL, non-empty and wildcard free here:
+         * unpack_mqtt_connect() refuses a CONNECT whose will topic fails
+         * those checks. The lengths come from the wire, an application
+         * message being binary, the will payload included, so strlen() would
+         * silently truncate it at the first NUL byte it carries
          */
-        size_t msg_len = strlen(will_message);
-        size_t tpc_len = strlen(will_topic);
+        size_t tpc_len = c->payload.will_topic_len;
+        size_t msg_len = c->payload.will_message_len;
 
         /*
          * The will topic is indexed under its normalized name (trailing '/',
@@ -707,7 +905,7 @@ static int connect_handler(struct io_event *e)
          * mutates the very same trie from its own critical section
          */
         char will_store_name[tpc_len + 2];
-        if (tpc_len > 0 && will_topic[tpc_len - 1] != '/')
+        if (will_topic[tpc_len - 1] != '/')
             snprintf(will_store_name, tpc_len + 2, "%s/", will_topic);
         else
             snprintf(will_store_name, tpc_len + 1, "%s", will_topic);
@@ -722,50 +920,68 @@ static int connect_handler(struct io_event *e)
         /*
          * A session kept across a reconnect still holds the strings of the
          * previous will: release them before installing the new one (a
-         * fresh session is all zeros, destroy is a no-op on it). While an
-         * inflight message still points at the embedded packet its strings
-         * must stay alive, that rare case is left to session_free()
+         * fresh session is all zeros, destroy is a no-op on it).
+         *
+         * While an inflight message still points at the embedded packet its
+         * strings must stay alive and, more importantly, the packet itself
+         * must not be overwritten: the retransmission scan would otherwise
+         * send the *new* will in place of the one the QoS flow is still
+         * delivering, and the old strings would be leaked on every
+         * reconnect. Keeping the previous will for that rare case is the
+         * lesser evil and is what session_free() eventually releases
          */
-        if (!has_inflight(cc->session))
+        if (has_inflight(cc->session)) {
+            log_warning("Reconnecting %s with inflight messages: keeping the "
+                        "previous LWT, the new one takes effect once the "
+                        "session drains",
+                        cc->client_id);
+        } else {
             mqtt_packet_destroy(&cc->session->lwt_msg);
 
-        cc->session->lwt_msg = (struct mqtt_packet){
-            .header  = (union mqtt_header){.byte = PUBLISH_B},
-            .publish = (struct mqtt_publish){
-                .pkt_id     = 0, // placeholder
-                .topiclen   = tpc_len,
-                .topic      = (unsigned char *)try_strdup(will_topic),
-                .payloadlen = msg_len,
-                .payload    = (unsigned char *)try_strdup(will_message)}};
+            cc->session->lwt_msg = (struct mqtt_packet){
+                .header  = (union mqtt_header){.byte = PUBLISH_B},
+                .publish = (struct mqtt_publish){
+                    .pkt_id     = 0, // placeholder
+                    .topiclen   = tpc_len,
+                    .topic      = dup_bytes(will_topic, tpc_len),
+                    .payloadlen = msg_len,
+                    .payload    = dup_bytes(will_message, msg_len)}};
 
-        cc->session->lwt_msg.header.bits.qos = c->bits.will_qos;
-        /*
-         * The packet is embedded in the session: park its reference count at
-         * 1 so that the bookkeeping INCREFs publish_message() makes for
-         * QoS > 0 inflight tracking can never bring it back to 0, which
-         * would call a free function on the middle of the session struct
-         */
-        cc->session->lwt_msg.refcount.count = 1;
-        // We must store the retained message in the topic
-        if (c->bits.will_retain == 1) {
-            size_t publen          = mqtt_size(&cc->session->lwt_msg, NULL);
-            unsigned char *payload = try_alloc(publen);
-            mqtt_pack(&cc->session->lwt_msg, payload);
-            // We got a ready-to-be-sent bytestring in the retained message
-            // field
-#if THREADSNR > 0
-            pthread_mutex_lock(&mutex);
-#endif
+            cc->session->lwt_msg.header.bits.qos = c->bits.will_qos;
             /*
-             * A new retained message replaces the previous one (§3.3.1.3):
-             * dropping the old bytestring here leaked it on every reconnect
-             * of a client whose will carries the retain flag
+             * The packet is embedded in the session: park its reference
+             * count at 1 so that the bookkeeping INCREFs publish_message()
+             * makes for QoS > 0 inflight tracking can never bring it back
+             * to 0, which would call a free function on the middle of the
+             * session struct
              */
-            free_memory(t->retained_msg);
-            t->retained_msg = payload;
+            cc->session->lwt_msg.refcount.count = 1;
+
+            /*
+             * §3.3.1.3: a will carrying the retain flag is stored as the
+             * retained message of its topic, replacing whatever was there
+             * (the previous packet is released here). Stored unpacked, like
+             * the one a PUBLISH leaves behind, so every later subscriber is
+             * served at the QoS its own subscription was granted. Note this
+             * only runs when the will was really replaced above: with
+             * messages still in flight the session keeps the previous one
+             */
+            if (c->bits.will_retain == 1) {
 #if THREADSNR > 0
-            pthread_mutex_unlock(&mutex);
+                pthread_mutex_lock(&mutex);
 #endif
+                if (t->retained) {
+                    DECREF(t->retained, struct mqtt_packet);
+                    t->retained = NULL;
+                }
+                /* A zero length payload clears the retained message instead
+                 * of storing an empty one (§3.3.1.3) */
+                if (msg_len > 0)
+                    t->retained = mqtt_publish_copy(&cc->session->lwt_msg);
+#if THREADSNR > 0
+                pthread_mutex_unlock(&mutex);
+#endif
+            }
         }
         log_info("Will message specified (%lu bytes)",
                  cc->session->lwt_msg.publish.payloadlen);
@@ -786,10 +1002,6 @@ static int connect_handler(struct io_event *e)
 
     return REPLY;
 
-clientdc:
-
-    return -ERRCLIENTDC;
-
 bad_auth:
     log_debug("Sending CONNACK to %s (%u, %u)", cc->client_id, session_present,
               MQTT_BAD_USERNAME_OR_PASSWORD);
@@ -803,14 +1015,15 @@ bad_auth:
 
     return MQTT_BAD_USERNAME_OR_PASSWORD;
 
-not_authorized:
-    log_debug("Sending CONNACK to %s (%u, %u)", cc->client_id, session_present,
-              MQTT_NOT_AUTHORIZED);
-    set_connack(cc, MQTT_NOT_AUTHORIZED, session_present);
+id_rejected:
+    log_debug("Sending CONNACK to %s (%u, %u)",
+              cc->client_id[0] ? cc->client_id : "unknown", session_present,
+              MQTT_IDENTIFIER_REJECTED);
+    set_connack(cc, MQTT_IDENTIFIER_REJECTED, session_present);
     /* Same §3.2.2.3 rule as above: flush then close */
     cc->close_after_write = true;
 
-    return MQTT_NOT_AUTHORIZED;
+    return MQTT_IDENTIFIER_REJECTED;
 }
 
 static int disconnect_handler(struct io_event *e)
@@ -869,6 +1082,7 @@ static void recursive_sub(struct trie_node *node, void *arg)
 struct retained_delivery {
     const char *filter;
     bool multilevel;
+    unsigned char qos; /* QoS granted to this filter, caps the delivery */
 };
 
 /*
@@ -901,6 +1115,52 @@ static bool normalize_filter(char *dst, const char *src)
 }
 
 /*
+ * MQTT v3.1.1 §4.7.1: a topic filter must be well formed before it is
+ * indexed in the store, otherwise the trie ends up holding patterns that can
+ * never match, and the wildcard matching rules would be silently violated.
+ *
+ *  - §4.7.1.1: a filter carries at least one character (so "" is refused)
+ *  - §4.7.1.2: '#' is only ever the *entire* last level, so it must be the
+ *    final character and be preceded by '/' (or be the whole filter). The
+ *    old code accepted "a#", "a/#/b" and "#/x" and happily stored them, and
+ *    normalize_filter() then either kept a pattern that matched nothing or
+ *    stripped the '#' from the middle of the filter
+ *  - §4.7.1.3: '+' is only ever an *entire* level, so it must be surrounded
+ *    by '/' (or sit at either end of the filter): "a+b" and "+x" were stored
+ *    as literal keys that no publish to "a/b" would ever reach
+ *
+ * Returns true when the filter is well formed
+ */
+static bool valid_topic_filter(const char *f, size_t len)
+{
+    if (len == 0)
+        return false;
+
+    for (size_t i = 0; i < len; i++) {
+        /*
+         * §1.5.3: U+0000 is forbidden in every UTF-8 string of the protocol.
+         * An embedded NUL is also what makes the filter and its normalized
+         * copy disagree in length (every helper here is strlen driven), so a
+         * filter like "a\0b" would be stored as if it read "a"
+         */
+        if (f[i] == '\0')
+            return false;
+        if (f[i] == '#') {
+            if (i + 1 != len) // must be the last character
+                return false;
+            if (i > 0 && f[i - 1] != '/') // must be its own level
+                return false;
+        } else if (f[i] == '+') {
+            if (i > 0 && f[i - 1] != '/')
+                return false;
+            if (i + 1 < len && f[i + 1] != '/')
+                return false;
+        }
+    }
+    return true;
+}
+
+/*
  * Argument passed to retained_collect while scanning the whole topic store
  */
 struct retained_collection {
@@ -920,7 +1180,7 @@ static void retained_collect(struct trie_node *node, void *arg)
     if (!node || !node->data)
         return;
     struct topic *t = node->data;
-    if (!t->retained_msg)
+    if (!t->retained)
         return;
     struct retained_collection *rc = arg;
     if (rc->len == rc->cap) {
@@ -952,6 +1212,22 @@ static int subscribe_handler(struct io_event *e)
     for (unsigned i = 0; i < s->tuples_len; i++) {
 
         log_debug("Received SUBSCRIBE from %s", c->client_id);
+
+        /*
+         * MQTT v3.1.1 §3.8.4: a malformed filter is not an error for the
+         * whole packet, it is answered with the failure code 0x80 in the
+         * SUBACK slot reserved for this very tuple, leaving the other filters
+         * of the same SUBSCRIBE untouched. Indexing it instead (as this used
+         * to) installed patterns like "a/#/b" or "a+b" in the store that no
+         * PUBLISH could ever match
+         */
+        if (!valid_topic_filter((const char *)s->tuples[i].topic,
+                                s->tuples[i].topic_len)) {
+            log_warning("Rejecting malformed topic filter from %s",
+                        c->client_id);
+            rcs[i] = MQTT_SUBACK_FAILURE;
+            continue;
+        }
 
         /*
          * Check if the topic exists already or in case create it and store in
@@ -1075,6 +1351,7 @@ static int subscribe_handler(struct io_event *e)
          */
         rd[rd_len].filter     = try_strdup(topic);
         rd[rd_len].multilevel = wildcard;
+        rd[rd_len].qos        = s->tuples[i].qos;
         rd_len++;
 #if THREADSNR > 0
         pthread_mutex_unlock(&mutex);
@@ -1091,8 +1368,10 @@ static int subscribe_handler(struct io_event *e)
     pthread_mutex_lock(&c->mutex);
 #endif
     size_t len = mqtt_size(&pkt, NULL);
-    mqtt_pack(&pkt, c->wbuf + c->towrite);
-    c->towrite += len;
+    if (outgoing_reserve(c, len)) {
+        mqtt_pack(&pkt, c->wbuf + c->towrite);
+        c->towrite += len;
+    }
 
     /*
      * Retained messages matching the subscriptions are published right after
@@ -1103,20 +1382,26 @@ static int subscribe_handler(struct io_event *e)
      */
     struct retained_collection rc = {NULL, 0, 0};
     topic_store_map(server.store, NULL, retained_collect, &rc);
+    /*
+     * A filter set covering the same topic twice ("a/b" and "a/+") must still
+     * deliver its retained message once, exactly like the live path does,
+     * where a session holds a single subscriber entry per topic
+     */
+    bool *sent = try_calloc(rc.len ? rc.len : 1, sizeof(*sent));
     for (unsigned i = 0; i < rd_len; i++) {
         for (size_t j = 0; j < rc.len; j++) {
+            if (sent[j])
+                continue;
             struct topic *t = rc.topics[j];
             if (match_subscription(t->name, rd[i].filter,
                                    rd[i].multilevel) != SOL_OK)
                 continue;
-            size_t rlen = alloc_size(t->retained_msg);
-            if (c->towrite + rlen > conf->max_request_size)
-                continue;
-            memcpy(c->wbuf + c->towrite, t->retained_msg, rlen);
-            c->towrite += rlen;
+            deliver_retained(c, t, rd[i].qos);
+            sent[j] = true;
         }
         free_memory((char *)rd[i].filter);
     }
+    free_memory(sent);
     free_memory(rc.topics);
 #if THREADSNR > 0
     pthread_mutex_unlock(&mutex);
@@ -1191,6 +1476,20 @@ static int unsubscribe_handler(struct io_event *e)
 #endif
     for (int i = 0; i < e->data.unsubscribe.tuples_len; ++i) {
         const char *raw = (const char *)e->data.unsubscribe.tuples[i].topic;
+        size_t rawlen   = e->data.unsubscribe.tuples[i].topic_len;
+
+        /*
+         * MQTT v3.1.1 §4.7.1: UNSUBACK carries no per-tuple return code, so a
+         * malformed filter is simply skipped. Normalizing it anyway would map
+         * an empty string to the bare "/" key and detach the whole root of
+         * the tree, taking every other subscription of this client with it
+         */
+        if (!valid_topic_filter(raw, rawlen)) {
+            log_warning("Ignoring malformed topic filter in UNSUBSCRIBE "
+                        "from %s",
+                        c->client_id);
+            continue;
+        }
 
         /*
          * The filter is normalized exactly like SUBSCRIBE does, both must
@@ -1218,8 +1517,11 @@ static int unsubscribe_handler(struct io_event *e)
     pthread_mutex_unlock(&mutex);
 #endif
 
-    mqtt_pack_mono(c->wbuf + c->towrite, UNSUBACK, e->data.unsubscribe.pkt_id);
-    c->towrite += MQTT_ACK_LEN;
+    if (outgoing_reserve(c, MQTT_ACK_LEN)) {
+        mqtt_pack_mono(c->wbuf + c->towrite, UNSUBACK,
+                       e->data.unsubscribe.pkt_id);
+        c->towrite += MQTT_ACK_LEN;
+    }
 #if THREADSNR > 0
     pthread_mutex_unlock(&c->mutex);
 #endif
@@ -1247,6 +1549,15 @@ static void wildcard_match(struct subscription *s, void *arg)
     struct topic *t                  = arg;
     struct client_session *session   = s->subscriber->session;
     struct subscriber *ex            = NULL;
+
+    /*
+     * MQTT v3.1.1 §4.7.2: a wildcard filter must not match topics starting
+     * with '$'. The wildcard index drives this callback for every filter
+     * compatible with the published topic, so the rule is enforced here as
+     * well or a subscriber of '#' would receive the $SOL statistics
+     */
+    if (t->name[0] == '$' && (s->topic[0] == '#' || s->topic[0] == '+'))
+        return;
 
     HASH_FIND_STR(t->subscribers, session->session_id, ex);
     if (ex) {
@@ -1338,7 +1649,7 @@ static int publish_handler(struct io_event *e)
         pthread_mutex_lock(&c->mutex);
 #endif
         bool dup = inbound_q2_find(c->session, orig_mid);
-        if (dup) {
+        if (dup && outgoing_reserve(c, MQTT_ACK_LEN)) {
             mqtt_pack_mono(c->wbuf + c->towrite, PUBREC, orig_mid);
             c->towrite += MQTT_ACK_LEN;
         }
@@ -1406,16 +1717,20 @@ static int publish_handler(struct io_event *e)
      * mutex still held (released just after) and with the client mutex
      * already dropped, delivery below re-acquires the global one itself.
      * A new retained message replaces the previous one (a zero length
-     * payload clears it, as MQTT requires): the old bytes are released
-     * first or they would be silently lost on every overwrite
+     * payload clears it, as MQTT requires): the old packet is released
+     * first or it would be silently lost on every overwrite. The copy is
+     * what makes it survive: `pkt` keeps travelling the delivery path below
+     * and is mutated by it (QoS per subscriber, packet identifier on
+     * retransmissions), while the store needs the message exactly as the
+     * publisher left it
      */
     if (hdr->bits.retain == 1) {
-        free_memory(t->retained_msg);
-        t->retained_msg = NULL;
-        if (p->payloadlen > 0) {
-            t->retained_msg = try_alloc(mqtt_size(&e->data, NULL));
-            mqtt_pack(&e->data, t->retained_msg);
+        if (t->retained) {
+            DECREF(t->retained, struct mqtt_packet);
+            t->retained = NULL;
         }
+        if (p->payloadlen > 0)
+            t->retained = mqtt_publish_copy(pkt);
     }
 #if THREADSNR > 0
     pthread_mutex_unlock(&mutex);
@@ -1433,9 +1748,15 @@ static int publish_handler(struct io_event *e)
 #if THREADSNR > 0
     pthread_mutex_lock(&c->mutex);
 #endif
-    mqtt_ack(&e->data, ptype == PUBACK ? PUBACK_B : PUBREC_B);
-    mqtt_pack_mono(c->wbuf + c->towrite, ptype, orig_mid);
-    c->towrite += MQTT_ACK_LEN;
+    /*
+     * The reply is built by mqtt_pack_mono() straight from `ptype` and the
+     * identifier of the incoming packet: the io_event union is not touched
+     * here, its publish member is still the one the delivery above owns
+     */
+    if (outgoing_reserve(c, MQTT_ACK_LEN)) {
+        mqtt_pack_mono(c->wbuf + c->towrite, ptype, orig_mid);
+        c->towrite += MQTT_ACK_LEN;
+    }
     /*
      * Open the exactly-once flow: while this identifier sits in the set, a
      * retransmitted PUBLISH naming it is a duplicate to be answered with the
@@ -1502,8 +1823,10 @@ static int pubrec_handler(struct io_event *e)
 #if THREADSNR > 0
     pthread_mutex_lock(&c->mutex);
 #endif
-    mqtt_pack_mono(c->wbuf + c->towrite, PUBREL, pkt_id);
-    c->towrite += MQTT_ACK_LEN;
+    if (outgoing_reserve(c, MQTT_ACK_LEN)) {
+        mqtt_pack_mono(c->wbuf + c->towrite, PUBREL, pkt_id);
+        c->towrite += MQTT_ACK_LEN;
+    }
     /*
      * Update the inflight acks table while still holding the client mutex:
      * the periodic retransmission check reads and rewrites the very same
@@ -1551,8 +1874,10 @@ static int pubrel_handler(struct io_event *e)
      */
     if (c->session)
         inbound_q2_untrack(c->session, (unsigned short) pkt_id);
-    mqtt_pack_mono(c->wbuf + c->towrite, PUBCOMP, pkt_id);
-    c->towrite += MQTT_ACK_LEN;
+    if (outgoing_reserve(c, MQTT_ACK_LEN)) {
+        mqtt_pack_mono(c->wbuf + c->towrite, PUBCOMP, pkt_id);
+        c->towrite += MQTT_ACK_LEN;
+    }
 #if THREADSNR > 0
     pthread_mutex_unlock(&c->mutex);
 #endif
@@ -1611,8 +1936,10 @@ static int pingreq_handler(struct io_event *e)
 #if THREADSNR > 0
     pthread_mutex_lock(&e->client->mutex);
 #endif
-    mqtt_pack(&e->data, e->client->wbuf + e->client->towrite);
-    e->client->towrite += MQTT_HEADER_LEN;
+    if (outgoing_reserve(e->client, MQTT_HEADER_LEN)) {
+        mqtt_pack(&e->data, e->client->wbuf + e->client->towrite);
+        e->client->towrite += MQTT_HEADER_LEN;
+    }
 #if THREADSNR > 0
     pthread_mutex_unlock(&e->client->mutex);
 #endif

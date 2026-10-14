@@ -51,11 +51,13 @@
 #define BASE_CLIENTS_NUM     1024 * 128
 
 /*
- * IO event strucuture, it's the main information that will be communicated
- * between threads, every request packet will be wrapped into an IO event and
- * passed to the work EPOLL, in order to be handled by the worker thread pool.
- * Then finally, after the execution of the command, it will be updated and
- * passed back to the IO epoll loop to be written back to the requesting client
+ * IO event structure, the argument handed to the command handlers. It pairs
+ * the client the bytes arrived on with the decoded packet: process_message()
+ * builds one on the stack, mqtt_unpack() fills `data`, handle_command()
+ * dispatches on the type, and the handler writes its reply straight into that
+ * client's write buffer. There is no separate worker thread pool nor a second
+ * epoll to hand the request to: the handler runs on the very loop thread that
+ * read the packet
  */
 struct io_event {
     struct client *client;
@@ -77,9 +79,9 @@ struct sol_info {
     /* Seconds passed since the start */
     atomic_size_t uptime;
     /* Total number of bytes received */
-    atomic_size_t bytes_sent;
-    /* Total number of bytes sent out */
     atomic_size_t bytes_recv;
+    /* Total number of bytes sent out */
+    atomic_size_t bytes_sent;
 };
 
 #define INIT_INFO                                                              \

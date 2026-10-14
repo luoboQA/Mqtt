@@ -46,6 +46,8 @@ there's probably some corner cases, not deeply investigated yet.
 - Support for QoS messages 0, 1 and 2
 - Retained messages per topic
 - Session present check and handling
+- Last Will & Testament, delivered on any disconnection that is not a clean
+  DISCONNECT (network error, protocol error, keepalive expiry)
 - Periodic stats publishing
 - Support multiple topics subscriptions through wildcard (#) and (+) for single
   level wildcard e.g. foo/+/bar/#
@@ -59,7 +61,6 @@ there's probably some corner cases, not deeply investigated yet.
 
 ### To be implemented
 
-- Last will & Testament, already started
 - Persistence on disk for inflight messages on disconnected clients
 - Check on max memory used
 
@@ -68,6 +69,21 @@ there's probably some corner cases, not deeply investigated yet.
 - MQTT 5.0 support
 - Porting for BSD/MAC osx
 - Scaling (feeling brave?)
+
+### 教学简化 / Known simplifications
+
+为了代码好读，broker 有意做了几处简化。做实验时不要把下面这些当成 MQTT 规范：
+
+- **主题名统一补末尾的 `/`**：内部所有主题都归一化成 `foo/bar/`，所以 `a` 和 `a/`
+  会被当成同一个主题；按规范它们是两个不同的主题名（后者多一个空层级）。
+- **`$` 开头的主题可以发布**：`$SOL/...` 只是命名约定，broker 不拦客户端发布。订阅侧
+  已按 §4.7.2 处理：`#`/`+` 开头的过滤器不匹配 `$` 开头的主题，必须显式订阅
+  `$SOL/#`（见 `examples/stats_demo.py`）。
+- **`max_memory` 配置目前不生效**：解析了但没有回收逻辑（见 "To be implemented"）。
+  同理，空主题（无订阅者、无保留消息）不会从主题树里清理。
+- **每个会话固定预分配 65536 项的在途表**（`i_msgs`/`i_acks`，约 2MB/会话），
+  会话数量很大时内存增长很快。
+- **没有磁盘持久化**：`clean_session=false` 的离线消息只存在于内存里，进程重启即丢。
 
 ## Build
 
@@ -79,7 +95,11 @@ $ make
 ## Quickstart play
 
 The broker can be tested using `mosquitto_sub` and `mosquitto_pub` or with
-`paho-mqtt` python driver.
+`paho-mqtt` python driver. There is a set of guided scripts under `examples/`
+(connect/subscribe/publish, QoS 0-2, retained messages, wildcards, will
+messages, `$SOL` statistics), each one printing what it expects to observe:
+start the broker with `./sol -c etc/conf/sol.conf -v` and run them with
+`python3 examples/<script>.py` — see `examples/README.md`.
 
 To run the broker with DEBUG logging on:
 
@@ -128,6 +148,15 @@ tcp_backlog 128
 
 # Interval of time between one stats publish on $SOL topics and the subsequent
 stats_publish_interval 10s
+
+# Seconds after which an unacknowledged QoS 1/2 message (or a PUBREL still
+# waiting for its PUBCOMP) is retransmitted with the DUP flag
+# retransmit_interval 20s
+
+# Upper bound of the Keep Alive clients negotiate: a client asking for a
+# longer period, or for none at all (Keep Alive 0), is still held to it, and
+# dropped after one and a half times this value of silence. 0 disables the cap
+# keepalive 60s
 
 # TLS certs paths, cafile act as a flag as well to set TLS/SSL ON
 # cafile /etc/sol/certs/ca.crt

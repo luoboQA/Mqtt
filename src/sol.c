@@ -35,18 +35,28 @@
 #include "util.h"
 #include <unistd.h>
 
-// Stops epoll_wait loops by sending an event
+/*
+ * Stops the epoll_wait loops of every worker by making the shared run
+ * descriptor readable. Only async-signal-safe calls belong here: usleep() is
+ * not one (and it re-entered the handler on a second signal), it is gone.
+ * The eventfd is level triggered and deliberately never read back, so a
+ * single write already wakes every loop parked on it and keeps them awake
+ * until the shutdown completes
+ */
 static void sigint_handler(int signum)
 {
     (void)signum;
-    for (int i = 0; i < THREADSNR + 1; ++i) {
 #ifdef __linux__
-        eventfd_write(conf->run, 1);
+    (void)eventfd_write(conf->run, 1);
 #else
-        (void)write(conf->run[0], &(unsigned long){1}, sizeof(unsigned long));
+    /*
+     * Write to the pipe's write end (index 1), the read end (index 0) is
+     * what the loops register: writing to the read end failed with EBADF
+     * and left the loops hanging, so SIGTERM could never stop the broker
+     * without a kill -9
+     */
+    (void)write(conf->run[1], &(unsigned long){1}, sizeof(unsigned long));
 #endif
-        usleep(1500);
-    }
 }
 
 static const char *flag_description[] = {
@@ -70,9 +80,6 @@ void print_help(char *me)
 int main(int argc, char **argv)
 {
 
-    signal(SIGINT, sigint_handler);
-    signal(SIGTERM, sigint_handler);
-
     /* NULL means "not given on the command line" */
     char *addr     = NULL;
     char *port     = NULL;
@@ -82,6 +89,27 @@ int main(int argc, char **argv)
 
     // Set default configuration
     config_set_default();
+
+    /*
+     * The handlers read conf->run, so they must be installed only after
+     * config_set_default() has created it: a signal arriving in between used
+     * to dereference a NULL conf from inside the handler itself
+     */
+    struct sigaction sa = {0};
+    sa.sa_handler       = sigint_handler;
+    sa.sa_flags         = SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    /*
+     * A write on a socket whose peer already closed raises SIGPIPE, which by
+     * default kills the whole broker: every other client on that loop is
+     * dropped with it. send() already passes MSG_NOSIGNAL on the plain path,
+     * but SSL_write() has no such flag, so the only safe option is to ignore
+     * the signal process wide
+     */
+    signal(SIGPIPE, SIG_IGN);
 
     while ((opt = getopt(argc, argv, "a:c:p:vhd")) != -1) {
         switch (opt) {
@@ -104,7 +132,8 @@ int main(int argc, char **argv)
             print_help(argv[0]);
             exit(EXIT_SUCCESS);
         default:
-            fprintf(stderr, "Usage: %s [-a addr] [-p port] [-c conf] [-v]\n",
+            fprintf(stderr,
+                    "Usage: %s [-a addr] [-p port] [-c conf] [-v|-d|-h]\n",
                     argv[0]);
             exit(EXIT_FAILURE);
         }

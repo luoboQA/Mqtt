@@ -43,7 +43,7 @@ bool check_passwd(const char *, const char *);
 
 long get_fh_soft_limit(void);
 
-#define STREQ(s1, s2, len) strncasecmp(s1, s2, len) == 0 ? true : false
+#define STREQ(s1, s2, len) (strncasecmp((s1), (s2), (len)) == 0)
 
 #define container_of(ptr, type, field)                                         \
     ((type *)((char *)(ptr) - offsetof(type, field)))

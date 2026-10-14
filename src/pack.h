@@ -51,9 +51,6 @@ i64 unpacki64(u8 *);
 u64 unpacku64(u8 *);
 
 /* Write data on const u8 pointer */
-// append a u8 -> bytes into the bytestring
-void pack_u8(u8 **, u8);
-
 // append a uint16_t -> bytes into the bytestring
 void packi16(u8 *, u16);
 

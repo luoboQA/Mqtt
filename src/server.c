@@ -124,12 +124,80 @@ static bool client_deactivate(struct client *);
 
 static void client_close(struct client *);
 
+/* Human readable form of the internal error codes, defined below */
+static const char *solerr(int rc);
+
 // CALLBACKS for the eventloop
 static void accept_callback(struct ev_ctx *, void *);
 
 static void read_callback(struct ev_ctx *, void *);
 
 static void write_callback(struct ev_ctx *, void *);
+
+/*
+ * Deliver the will (if the CONNECT carried one) and drop the connection.
+ * Shared by the read error path and the keepalive timeout below: both close
+ * a connection for the same protocol reason, "the client is gone and never
+ * sent a DISCONNECT", and MQTT v3.1.1 §3.1.4 requires the Will Message to
+ * be published in exactly those cases. The caller must already run on the
+ * loop that owns `c` and must not hold any lock: publish_lwt() takes the
+ * global one itself
+ */
+static void client_shutdown(struct ev_ctx *ctx, struct client *c, int rc)
+{
+    log_error("Closing connection with %s (%s): %s", c->client_id,
+              c->conn.ip, solerr(rc));
+    /*
+     * Deliver the LWT, if any: publish_lwt() runs the same normalized
+     * path a normal PUBLISH takes (trailing '/' topic key, wildcard
+     * subscriber attach) and takes the locks it needs itself. Doing the
+     * lookup while holding the global mutex and then calling
+     * publish_message(), which acquires that same non-recursive mutex
+     * on entry, would deadlock this very thread and freeze the broker
+     * (and make a later SIGTERM hang on the thread join).
+     *
+     * The session pointer is read exactly once, under the client mutex:
+     * server_kick_duplicate() runs on the loop that accepted the
+     * duplicate id, clears has_lwt and NULLs session under this very
+     * lock, and reading c->session twice (once in the condition, once in
+     * the argument) opened a window where the takeover landed in between
+     * and the dereference below crashed. Claiming a reference while still
+     * locked also keeps the session alive for the whole publish even when
+     * the duplicate CONNECT tears the old one down on its own thread a
+     * moment later
+     */
+    struct client_session *lwt_session = NULL;
+#if THREADSNR > 0
+    pthread_mutex_lock(&c->mutex);
+#endif
+    if (c->has_lwt && c->session) {
+        lwt_session = c->session;
+        INCREF(lwt_session, struct client_session);
+    }
+#if THREADSNR > 0
+    pthread_mutex_unlock(&c->mutex);
+#endif
+    if (lwt_session) {
+        publish_lwt(&lwt_session->lwt_msg);
+        DECREF(lwt_session, struct client_session);
+    }
+    // Clean resources
+    ev_del_fd(ctx, c->conn.fd);
+    /*
+     * No subscription cleanup here: client_deactivate() already drops
+     * the topic subscriptions of a clean session, while the ones of a
+     * persistent session (clean_session = false) must survive this
+     * abrupt disconnect or the reconnected client would have a session
+     * with no subscription left on the broker side
+     */
+    client_close(c);
+}
+
+/*
+ * Periodic routine to check for incomplete transactions on QoS > 0 to be
+ * concluded
+ */
+static void inflight_msg_check(struct ev_ctx *, void *);
 
 /*
  * Processing message function, will be applied on fully formed mqtt packet
@@ -139,12 +207,6 @@ static void process_message(struct ev_ctx *, struct client *);
 
 /* Periodic routine to publish general stats about the broker on $SOL topics */
 static void publish_stats(struct ev_ctx *, void *);
-
-/*
- * Periodic routine to check for incomplete transactions on QoS > 0 to be
- * concluded
- */
-static void inflight_msg_check(struct ev_ctx *, void *);
 
 /*
  * Statistics topics, published every N seconds defined by configuration
@@ -204,6 +266,8 @@ static const char *solerr(int rc)
         return "Socket FD EAGAIN";
     case -ERRNOMEM:
         return "Out of memory";
+    case -ERRKEEPALIVE:
+        return "Keepalive timeout";
     case MQTT_UNACCEPTABLE_PROTOCOL_VERSION:
         return "[MQTT] Unknown protocol version";
     case MQTT_IDENTIFIER_REJECTED:
@@ -459,6 +523,70 @@ static void inflight_msg_check(struct ev_ctx *ctx, void *data)
 }
 
 /*
+ * Runs on the loop that owns the connection: ev_fire_event() only replaces
+ * the write callback of the slot, so the actual teardown has to be scheduled
+ * here rather than done straight from the cron's loop, the same cross-thread
+ * primitive a duplicate-id takeover (kick_callback) uses
+ */
+static void keepalive_timeout_callback(struct ev_ctx *ctx, void *arg)
+{
+    struct client *c = arg;
+    /* The connection may have dropped on its own before this ran */
+    if (c->online == false)
+        return;
+    client_shutdown(ctx, c, -ERRKEEPALIVE);
+}
+
+/*
+ * MQTT v3.1.1 §3.1.2.10: when the Keep Alive is not zero and no Control
+ * Packet arrives within one and a half times that period the Server MUST
+ * close the connection. Keep Alive 0 means "no keepalive processing" and is
+ * skipped.
+ *
+ * last_seen is written by the loop that owns the connection (read_callback,
+ * on every complete packet) and read here: time_t is a single aligned word
+ * on every supported target, so a stale or torn value can only delay the
+ * disconnect by one tick, never misplace it. Note that partial reads do not
+ * refresh it on purpose, only a *complete* Control Packet does, exactly as
+ * the spec words it
+ */
+static void keepalive_check(struct ev_ctx *ctx, void *data)
+{
+    (void)data;
+    time_t now      = time(NULL);
+    struct client *c, *tmp;
+#if THREADSNR > 0
+    pthread_mutex_lock(&mutex);
+#endif
+    HASH_ITER(hh, server.clients_map, c, tmp)
+    {
+        if (!c || !c->connected || c->keepalive == 0)
+            continue;
+        /*
+         * One and a half times the negotiated period, as the spec requires.
+         * The margin keeps a client that sends a PINGREQ right on the edge
+         * from being dropped by a cron that happens to fire a hair early
+         */
+        time_t limit = (time_t)c->keepalive + (time_t)c->keepalive / 2;
+        if (now - c->last_seen <= limit)
+            continue;
+        log_info("Keepalive expired for %s (last packet %lds ago, limit "
+                 "%lds): dropping the connection (MQTT v3.1.1 §3.1.2.10)",
+                 c->client_id, (long)(now - c->last_seen), (long)limit);
+        /*
+         * Hand the teardown to the loop that owns this descriptor: closing a
+         * fd (and freeing the client) from here would race with the callback
+         * that thread is about to run on it
+         */
+        ev_fire_event(c->ctx, c->conn.fd, EV_WRITE, keepalive_timeout_callback,
+                      (void *)c);
+    }
+#if THREADSNR > 0
+    pthread_mutex_unlock(&mutex);
+#endif
+}
+
+/*
  * ======================================================
  *  Private functions and callbacks for server behaviour
  * ======================================================
@@ -489,6 +617,7 @@ static void client_init(struct client *client)
         client->wbuf =
             try_calloc(conf->max_request_size, sizeof(unsigned char));
     client->last_seen = time(NULL);
+    client->keepalive = 0;
     client->has_lwt   = false;
     client->close_after_write = false;
     client->kick_pending      = false;
@@ -765,6 +894,16 @@ static ssize_t recv_packet(struct client *c)
              * here
              */
             if (opcode > UNSUBSCRIBE) {
+                /*
+                 * MQTT v3.1.1 §3.12.1, §3.13.1 and §3.14.1: those packets are
+                 * the fixed header alone, their Remaining Length is 0 by
+                 * definition. A byte there used to be ignored while the
+                 * payload it declared stayed in the stream, so the connection
+                 * desynchronized and those bytes were parsed as the header of
+                 * the next packet. Refuse the packet instead
+                 */
+                if (c->rbuf[1] != 0x00)
+                    return -ERRPACKETERR;
                 c->rpos   = 2;
                 c->toread = c->read;
                 goto exit;
@@ -1019,10 +1158,26 @@ static void accept_callback(struct ev_ctx *ctx, void *data)
         struct connection conn;
         connection_init(&conn, conf->tls ? server.ssl_ctx : NULL);
         int fd = accept_connection(&conn, serverfd);
-        if (fd == 0)
-            continue;
+        /*
+         * A negative descriptor is a failed accept (the TLS handshake could
+         * have been rejected): leave it to close_connection() above, wait
+         * for the next EPOLLIN. Note that 0 is a perfectly valid descriptor,
+         * it is only seen when stdin has been closed, and must not be
+         * mistaken for a failure
+         */
         if (fd < 0) {
             close_connection(&conn);
+            /*
+             * The listening socket is level triggered: when the descriptor
+             * table is exhausted (EMFILE/ENFILE) every accept fails and
+             * epoll reports the socket ready at once, over and over, spinning
+             * the loop at full CPU until the backlog drains. Yield here so a
+             * transient fd shortage cannot monopolize the thread; a plain
+             * EAGAIN just ends the loop as usual
+             */
+            if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS ||
+                errno == ENOMEM)
+                usleep(1000);
             break;
         }
 
@@ -1037,16 +1192,42 @@ static void accept_callback(struct ev_ctx *ctx, void *data)
 #if THREADSNR > 0
         pthread_mutex_unlock(&mutex);
 #endif
+        /*
+         * No free slot left in the pool: refuse the connection rather than
+         * dereference a NULL client
+         */
+        if (!c) {
+            log_error("No free client slot for %s, connection refused",
+                      conn.ip);
+            close_connection(&conn);
+            break;
+        }
         c->conn = conn;
         client_init(c);
         c->ctx = ctx;
 
-        /* Add it to the epoll loop */
-        ev_register_event(ctx, fd, EV_READ, read_callback, c);
-
-        /* Record the new client connected */
+        /*
+         * Count the connection before arming it: client_close() below (and
+         * the error paths it serves) always decrements active_connections,
+         * so a failure to register the descriptor has to find the counter
+         * already incremented or the statistics underflow instead
+         */
         info.active_connections++;
         info.total_connections++;
+
+        /* Add it to the epoll loop */
+        if (ev_register_event(ctx, fd, EV_READ, read_callback, c) < 0) {
+            /*
+             * The descriptor could not be armed (an epoll_ctl failure, or a
+             * select build rejecting a fd beyond FD_SETSIZE): close both the
+             * client and the socket, or the connection would hang forever
+             * with no event registered against it
+             */
+            log_error("Cannot register fd %d with the event loop", fd);
+            ev_del_fd(ctx, fd);
+            client_close(c);
+            break;
+        }
 
         log_info("[%p] Connection from %s", (void *)pthread_self(), conn.ip);
     }
@@ -1087,33 +1268,10 @@ static void read_callback(struct ev_ctx *ctx, void *data)
         // TODO move to default branch
         /*
          * We got an unexpected error or a disconnection from the
-         * client side, remove client from the global map and
-         * free resources allocated such as io_event structure and
-         * paired payload
+         * client side: deliver the will and release the connection,
+         * the LWT/close sequence is shared with the keepalive timeout
          */
-        log_error("Closing connection with %s (%s): %s", c->client_id,
-                  c->conn.ip, solerr(rc));
-        /*
-         * Deliver the LWT, if any: publish_lwt() runs the same normalized
-         * path a normal PUBLISH takes (trailing '/' topic key, wildcard
-         * subscriber attach) and takes the locks it needs itself. Doing the
-         * lookup while holding the global mutex and then calling
-         * publish_message(), which acquires that same non-recursive mutex
-         * on entry, would deadlock this very thread and freeze the broker
-         * (and make a later SIGTERM hang on the thread join)
-         */
-        if (c->has_lwt == true && c->session)
-            publish_lwt(&c->session->lwt_msg);
-        // Clean resources
-        ev_del_fd(ctx, c->conn.fd);
-        /*
-         * No subscription cleanup here: client_deactivate() already drops
-         * the topic subscriptions of a clean session, while the ones of a
-         * persistent session (clean_session = false) must survive this
-         * abrupt disconnect or the reconnected client would have a session
-         * with no subscription left on the broker side
-         */
-        client_close(c);
+        client_shutdown(ctx, c, rc);
         break;
     case -ERREAGAIN:
         /*
@@ -1196,6 +1354,7 @@ static void process_message(struct ev_ctx *ctx, struct client *c)
     case REPLY:
     case MQTT_NOT_AUTHORIZED:
     case MQTT_BAD_USERNAME_OR_PASSWORD:
+    case MQTT_IDENTIFIER_REJECTED:
         /*
          * Write out to client, after a request has been processed in
          * worker thread routine. Just send out all bytes stored in the
@@ -1207,17 +1366,39 @@ static void process_message(struct ev_ctx *ctx, struct client *c)
             mqtt_packet_destroy(&io.data);
         break;
     case -ERRCLIENTDC:
-    case -ERRPACKETERR:
         /*
-         * The client sent a DISCONNECT or broke the protocol: the packet is
-         * either partially decoded or holds no allocation we own, so it is
-         * deliberately not destroyed here, just drop the connection.
+         * The client sent a DISCONNECT: the decoded packet is deliberately
+         * released here, a handler that bails out early (a refused CONNECT)
+         * leaves behind the credentials or tuples that mqtt_unpack()
+         * allocated, and dropping the connection without this call leaked
+         * all of it on every refused packet. A PUBLISH that failed to
+         * decode already released its own buffers, so destroying it here is
+         * a no-op. No will is delivered: §3.14.4 makes a DISCONNECT a clean
+         * close
          */
+        mqtt_packet_destroy(&io.data);
         ev_del_fd(ctx, c->conn.fd);
         client_close(io.client);
         break;
+    case -ERRPACKETERR:
+        /*
+         * The client broke the protocol (a second CONNECT, a packet sent
+         * before CONNECT, a type only the server may send). Same release as
+         * above, but the connection goes through client_shutdown(): §3.1.2.5
+         * wants the will published whenever the network connection is closed
+         * without a DISCONNECT, and this is such a close
+         */
+        mqtt_packet_destroy(&io.data);
+        client_shutdown(ctx, c, c->rc);
+        break;
     case -ERRNOMEM:
-        log_error(solerr(c->rc));
+        log_error("%s", solerr(c->rc));
+        /*
+         * The client state is left as it was: reset it to the reading state
+         * and keep the connection alive, otherwise the client would hang
+         * forever in SENDING_DATA with the EPOLLIN interest still armed
+         */
+        c->status = WAITING_HEADER;
         break;
     default:
         c->status = WAITING_HEADER;
@@ -1249,12 +1430,18 @@ static void eventloop_start(void *args)
     struct ev_ctx ctx;
     int sfd = loop_data->fd;
     ev_init(&ctx, EVENTLOOP_MAX_EVENTS);
-    // Register stop event
+    /*
+     * Register the shared run descriptor: on Linux it is the eventfd, on
+     * other platforms the *read* end of the pipe (index 0). The write end
+     * (index 1) is what the signal handler writes to, and registering it
+     * here meant the loops waited for a write end to become readable, so
+     * the shutdown event never arrived and the broker had to be killed
+     */
 #ifdef __linux__
     ev_register_event(&ctx, conf->run, EV_CLOSEFD | EV_READ, stop_handler,
                       NULL);
 #else
-    ev_register_event(&ctx, conf->run[1], EV_CLOSEFD | EV_READ, stop_handler,
+    ev_register_event(&ctx, conf->run[0], EV_CLOSEFD | EV_READ, stop_handler,
                       NULL);
 #endif
     // Register listening FD with accept callback
@@ -1264,6 +1451,7 @@ static void eventloop_start(void *args)
         ev_register_cron(&ctx, publish_stats, NULL, conf->stats_pub_interval,
                          0);
         ev_register_cron(&ctx, inflight_msg_check, NULL, 1, 0);
+        ev_register_cron(&ctx, keepalive_check, NULL, 1, 0);
     }
     // Start the loop, blocking call
     ev_run(&ctx);

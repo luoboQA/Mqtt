@@ -239,8 +239,20 @@ usize pack(u8 *buf, char *format, ...)
         case 's': // string
             s   = va_arg(ap, char *);
             len = strlen(s);
+            /*
+             * The 16-bit length prefix is written automatically (as the
+             * format table above promises) and it is part of the returned
+             * size: the old branch copied the bytes alone and never touched
+             * `size`, so anyone sizing a buffer from the return value came
+             * out short by strlen(s) + 2 bytes and wrote past its end, while
+             * unpack() could not find the length that was never there
+             */
+            packi16(buf, (u16)len);
+            buf += 2;
+            size += 2;
             memcpy(buf, s, len);
             buf += len;
+            size += len;
             break;
         }
     }
@@ -347,10 +359,27 @@ usize unpack(u8 *buf, char *format, ...)
 
         case 's': // string
             s = va_arg(ap, char *);
-            memcpy(s, buf, maxstrlen);
-            s[maxstrlen] = '\0';
-            buf += maxstrlen;
-            size += maxstrlen;
+            /*
+             * A digit prefix (e.g. "64s") fixes the length to copy, without
+             * one the length is the 16-bit prefix pack() prepended. The old
+             * code copied maxstrlen bytes unconditionally, so a bare "s"
+             * format silently produced an empty string instead of reading
+             * the stored length
+             */
+            if (maxstrlen == 0) {
+                usize slen = unpacku16(buf);
+                buf += 2;
+                size += 2;
+                memcpy(s, buf, slen);
+                s[slen] = '\0';
+                buf += slen;
+                size += slen;
+            } else {
+                memcpy(s, buf, maxstrlen);
+                s[maxstrlen] = '\0';
+                buf += maxstrlen;
+                size += maxstrlen;
+            }
             break;
 
         default:

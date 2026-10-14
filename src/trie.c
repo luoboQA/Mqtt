@@ -34,7 +34,7 @@
 // Private functions declaration
 static void children_destroy(struct bst_node *, size_t *, trie_destructor *);
 static int trie_node_count(const struct trie_node *);
-static void trie_node_prefix_find(const struct trie_node *, char *, int,
+static void trie_node_prefix_find(const struct trie_node *, char **, int,
                                   List *);
 
 /*
@@ -199,6 +199,12 @@ bool trie_delete(Trie *trie, const char *key)
                 free_memory(retnode->data);
                 retnode->data = NULL;
                 trie->size--;
+            } else {
+                /*
+                 * The node exists but holds no data: nothing has been
+                 * deleted, report the failure instead of claiming success
+                 */
+                return false;
             }
         }
         return true;
@@ -279,7 +285,7 @@ int trie_prefix_count(const Trie *trie, const char *prefix)
     return count;
 }
 
-static void children_prefix_find(const struct bst_node *node, char str[],
+static void children_prefix_find(const struct bst_node *node, char **str,
                                  int level, List *keys)
 {
     trie_node_prefix_find(node->data, str, level, keys);
@@ -289,29 +295,47 @@ static void children_prefix_find(const struct bst_node *node, char str[],
         children_prefix_find(node->right, str, level, keys);
 }
 
-static void trie_node_prefix_find(const struct trie_node *node, char str[],
+/*
+ * Grow the string buffer, through a pointer to the pointer, so that a moved
+ * allocation is visible to every caller in the recursion; passing the buffer
+ * by value would make the recursive calls keep using the old, freed block
+ * after a successful realloc (use-after-free) and free it twice at the end
+ */
+static void trie_str_reserve(char **str, size_t needed)
+{
+    size_t cap = alloc_size(*str);
+    if (needed <= cap)
+        return;
+    while (cap < needed)
+        cap *= 2;
+    *str = try_realloc(*str, cap);
+}
+
+static void trie_node_prefix_find(const struct trie_node *node, char **str,
                                   int level, List *keys)
 {
     if (!node)
         return;
 
     /*
-     * If NON NULL child is found add parent key to str and call the function
-     * recursively for child node, caring for the size of the current string,
-     * if exceed bounds, double the size of the string host
+     * Room for the node character plus the terminating NUL; note that `level`
+     * can legitimately be -1 when the search starts from an empty prefix (the
+     * root node), hence the addition is done on int before the cast to size_t
      */
-    if ((size_t)level == alloc_size(str))
-        str = try_realloc(str, level * 2);
-    str[level] = node->chr;
+    trie_str_reserve(str, (size_t)(level + 2));
+
+    /* The root of the trie carries no character of its own */
+    if (level >= 0)
+        (*str)[level] = node->chr;
 
     /*
      * If node is leaf node, it indicates end of string, so a null charcter is
      * added and string is added to the keys list
      */
     if (node->data) {
-        str[level + 1]    = '\0';
+        (*str)[level + 1] = '\0';
         struct kv_obj *kv = try_alloc(sizeof(*kv));
-        kv->key           = try_strdup(str);
+        kv->key           = try_strdup(*str);
         kv->data          = node->data;
         keys              = list_push(keys, kv);
     }
@@ -335,15 +359,17 @@ List *trie_prefix_find(const Trie *trie, const char *prefix)
     List *keys  = list_new(NULL);
 
     // Check all possible sub-paths and add the resulting key to the result
-    char *str   = try_alloc(32);
     size_t plen = strlen(prefix);
-    strncpy(str, prefix, 32);
+    char *str   = try_alloc(plen + 32);
+    memcpy(str, prefix, plen);
+    str[plen]   = '\0';
 
     /*
-     * Recursive function call, starting from index - 1, starting saving nodes
-     * from the last character explored
+     * Recursive function call, starting from the last character of the
+     * prefix, already copied into `str`; an empty prefix starts one level
+     * above the root, at -1
      */
-    trie_node_prefix_find(node, str, plen - 1, keys);
+    trie_node_prefix_find(node, &str, (int)plen - 1, keys);
 
     free_memory(str);
 
@@ -377,7 +403,16 @@ void trie_node_destroy(struct trie_node *node, size_t *size,
     node->children = NULL;
 
     if (destructor) {
+        /*
+         * The destructor releases the payload, but the accounting of the
+         * removed key is still this function's duty, otherwise every key
+         * wiped out through a prefix delete (which passes a destructor) would
+         * be left counted in trie->size
+         */
+        bool has_data = node->data != NULL;
         destructor(node, false);
+        if (has_data && *size > 0)
+            (*size)--;
     } else if (node->data) {
         // Release memory on data stored on the node
         free_memory(node->data);

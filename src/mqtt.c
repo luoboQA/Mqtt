@@ -60,8 +60,9 @@ static const int MAX_LEN_BYTES                  = MQTT_MAX_LEN_BYTES;
 
 /*
  * MQTT v3.1.1 starts every connect packet with 7 bytes for storing the
- * protocol name 'M' 'Q' 'T' 'T' and mqtt properties, for now we just wanna
- * ignore those fields and skip them during packet decoding
+ * protocol name 'M' 'Q' 'T' 'T', its level and the connect flags: the name
+ * and the level are validated against "MQTT" and 4 in unpack_mqtt_connect(),
+ * which answers with a proper CONNACK return code when they don't match
  */
 static const int SKIP_PROTOCOL_NAME             = 7;
 
@@ -106,6 +107,14 @@ int mqtt_encode_length(u8 *buf, usize len)
 
     int bytes   = 0;
     u16 encoded = 0;
+
+    /*
+     * §2.2.3 caps the Remaining Length at 268435455 (0x0FFFFFFF), a larger
+     * value cannot be encoded in the four permitted bytes and would produce
+     * a truncated length with a dangling continuation bit
+     */
+    if (len > 0x0FFFFFFF)
+        return 0;
 
     do {
 
@@ -167,6 +176,25 @@ usize mqtt_decode_length(u8 *buf, unsigned *pos, unsigned avail)
  *
  * Meant to be called through a dispatch table, with command opcode as index
  */
+
+/*
+ * MQTT v3.1.1 §3.1.3.2: the Will Topic is a Topic Name, so it obeys §4.7: it
+ * carries at least one character and holds no wildcard. A '#' or '+' accepted
+ * here would later be published verbatim on an abrupt disconnect, handing the
+ * subscribers a topic nobody could have subscribed to (and a topic name with
+ * a wildcard in it is malformed for them, §4.7.2). U+0000 is forbidden in
+ * every UTF-8 string of the protocol (§1.5.3) and would silently truncate the
+ * name in the store, where topics are keyed by NUL terminated strings
+ */
+static bool valid_will_topic(const u8 *topic, u16 len)
+{
+    if (len == 0)
+        return false;
+    for (u16 i = 0; i < len; ++i)
+        if (topic[i] == '\0' || topic[i] == '+' || topic[i] == '#')
+            return false;
+    return true;
+}
 
 /*
  * MQTT Connect packet unpack function, it's the first mandatory packet that
@@ -263,6 +291,22 @@ static int unpack_mqtt_connect(u8 *buf, struct mqtt_packet *pkt, usize len)
     avail -= sizeof(u8) + (2 * sizeof(u16));
 
     /*
+     * MQTT v3.1.1 §3.1.2.3-§3.1.2.8: the connect flags must be well formed.
+     * The reserved bit has to be 0, the Will QoS cannot be 3, when the Will
+     * flag is 0 the Will QoS and Will Retain bits have to be 0 as well and a
+     * Password without a Username is not allowed. A Will QoS of 3 slipping
+     * through would later be packed as-is into the LWT PUBLISH, emitting an
+     * invalid packet to every subscriber
+     */
+    if (pkt->connect.bits.reserved != 0 ||
+        pkt->connect.bits.will_qos == 3 ||
+        (pkt->connect.bits.will == 0 &&
+         (pkt->connect.bits.will_qos != 0 ||
+          pkt->connect.bits.will_retain != 0)) ||
+        (pkt->connect.bits.password == 1 && pkt->connect.bits.username == 0))
+        return -MQTT_ERR;
+
+    /*
      * MQTT v3.1.1 §3.1.3.1: the client id fits client_id[MQTT_CLIENT_ID_LEN]
      * (including the terminating NUL). A longer one used to be memcpy'd
      * over the end of the buffer: a malformed CONNECT could smash the stack
@@ -281,22 +325,49 @@ static int unpack_mqtt_connect(u8 *buf, struct mqtt_packet *pkt, usize len)
         avail -= cid_len;
     }
 
-    /* Read the will topic and message if will is set on flags */
+    /*
+     * Read the will topic and message if will is set on flags. The check is
+     * on the destination pointer, not on the returned length: a zero-length
+     * string is a valid encoding (e.g. an empty password) and yields a
+     * non-NULL pointer, while truncation sets it to NULL
+     */
     if (pkt->connect.bits.will == 1) {
-        if (!unpack_string16(&buf, &avail, &pkt->connect.payload.will_topic))
+        pkt->connect.payload.will_topic_len =
+            unpack_string16(&buf, &avail, &pkt->connect.payload.will_topic);
+        if (!pkt->connect.payload.will_topic ||
+            !valid_will_topic(pkt->connect.payload.will_topic,
+                              pkt->connect.payload.will_topic_len))
             return -MQTT_ERR;
-        if (!unpack_string16(&buf, &avail, &pkt->connect.payload.will_message))
+        /*
+         * The length is kept as well: an application message is a binary
+         * blob, the will payload included, so strlen() would truncate it at
+         * the first NUL it carries
+         */
+        pkt->connect.payload.will_message_len = unpack_string16(
+            &buf, &avail, &pkt->connect.payload.will_message);
+        if (!pkt->connect.payload.will_message)
             return -MQTT_ERR;
     }
 
     /* Read the username if username flag is set */
-    if (pkt->connect.bits.username == 1 &&
-        !unpack_string16(&buf, &avail, &pkt->connect.payload.username))
-        return -MQTT_ERR;
+    if (pkt->connect.bits.username == 1) {
+        unpack_string16(&buf, &avail, &pkt->connect.payload.username);
+        if (!pkt->connect.payload.username)
+            return -MQTT_ERR;
+    }
 
     /* Read the password if password flag is set */
-    if (pkt->connect.bits.password == 1 &&
-        !unpack_string16(&buf, &avail, &pkt->connect.payload.password))
+    if (pkt->connect.bits.password == 1) {
+        unpack_string16(&buf, &avail, &pkt->connect.payload.password);
+        if (!pkt->connect.payload.password)
+            return -MQTT_ERR;
+    }
+
+    /*
+     * MQTT v3.1.1 §3.1.2: any byte left after the last declared field makes
+     * the packet malformed, refuse it instead of silently ignoring the tail
+     */
+    if (avail > 0)
         return -MQTT_ERR;
 
     return MQTT_OK;
@@ -354,9 +425,15 @@ static int unpack_mqtt_publish(u8 *buf, struct mqtt_packet *pkt, usize len)
     if (!pkt->publish.topic)
         return -MQTT_ERR;
 
+    /*
+     * From here on the topic is owned by this frame: every failure below has
+     * to release it, as the caller destroys the packet only on success and
+     * used to leak the topic (up to 64KB) on each malformed PUBLISH
+     */
+
     /* The topic name must carry at least one character (§3.3.2.1) */
     if (pkt->publish.topiclen == 0)
-        return -MQTT_ERR;
+        goto err;
 
     /*
      * MQTT v3.1.1 §3.3.2-2: the topic name of a PUBLISH must not contain
@@ -367,26 +444,20 @@ static int unpack_mqtt_publish(u8 *buf, struct mqtt_packet *pkt, usize len)
     for (u16 i = 0; i < pkt->publish.topiclen; ++i) {
         u8 ch = pkt->publish.topic[i];
         if (ch == '\0' || ch == '+' || ch == '#')
-            return -MQTT_ERR;
+            goto err;
     }
 
     /* Read packet id */
     if (pkt->header.bits.qos > AT_MOST_ONCE) {
         if (avail < sizeof(u16))
-            return -MQTT_ERR;
+            goto err;
         pkt->publish.pkt_id = unpack_integer(&buf, 'H');
         avail -= sizeof(u16);
         /*
-         * A QoS > 0 PUBLISH must name a non-zero identifier (§2.2.1), reject
-         * it before the payload is allocated: only the topic is owned at
-         * this point, release it here since the caller's error path never
-         * destroys a PUBLISH
+         * A QoS > 0 PUBLISH must name a non-zero identifier (§2.2.1)
          */
-        if (pkt->publish.pkt_id == 0) {
-            free_memory(pkt->publish.topic);
-            pkt->publish.topic = NULL;
-            return -MQTT_ERR;
-        }
+        if (pkt->publish.pkt_id == 0)
+            goto err;
     }
 
     /*
@@ -399,9 +470,15 @@ static int unpack_mqtt_publish(u8 *buf, struct mqtt_packet *pkt, usize len)
     pkt->publish.payload    = unpack_bytes(&buf, avail, avail);
 
     if (!pkt->publish.payload)
-        return -MQTT_ERR;
+        goto err;
 
     return MQTT_OK;
+
+err:
+    free_memory(pkt->publish.topic);
+    pkt->publish.topic    = NULL;
+    pkt->publish.topiclen = 0;
+    return -MQTT_ERR;
 }
 
 static int unpack_mqtt_subscribe(u8 *buf, struct mqtt_packet *pkt, usize len)
@@ -417,6 +494,13 @@ static int unpack_mqtt_subscribe(u8 *buf, struct mqtt_packet *pkt, usize len)
         return -MQTT_ERR;
     subscribe.pkt_id = unpack_integer(&buf, 'H');
     avail -= sizeof(u16);
+
+    /*
+     * The packet identifier of a SUBSCRIBE can never be 0 (§2.2.1), the
+     * reserved identifier would collide with the broker's own allocation
+     */
+    if (subscribe.pkt_id == 0)
+        return -MQTT_ERR;
 
     /*
      * Read in a loop all remaining bytes specified by len of the Fixed Header.
@@ -467,6 +551,16 @@ static int unpack_mqtt_subscribe(u8 *buf, struct mqtt_packet *pkt, usize len)
         ++i;
     }
 
+    /*
+     * A SUBSCRIBE with an empty payload is a protocol error (§3.8.3) and
+     * would reach the handler as a zero-length tuple array, sized VLAs of
+     * zero (undefined behaviour) included
+     */
+    if (i == 0) {
+        free_memory(subscribe.tuples);
+        return -MQTT_ERR;
+    }
+
     subscribe.tuples_len = i;
     pkt->subscribe       = subscribe;
 
@@ -499,6 +593,10 @@ static int unpack_mqtt_unsubscribe(u8 *buf, struct mqtt_packet *pkt, usize len)
     unsubscribe.pkt_id = unpack_integer(&buf, 'H');
     avail -= sizeof(u16);
 
+    /* The packet identifier of an UNSUBSCRIBE can never be 0 (§2.2.1) */
+    if (unsubscribe.pkt_id == 0)
+        return -MQTT_ERR;
+
     /*
      * Read in a loop all remaining bytes specified by len of the Fixed Header.
      * From now on the payload consists of 2-tuples formed by:
@@ -530,6 +628,12 @@ static int unpack_mqtt_unsubscribe(u8 *buf, struct mqtt_packet *pkt, usize len)
         ++i;
     }
 
+    /* An UNSUBSCRIBE with an empty payload is a protocol error (§3.10.3) */
+    if (i == 0) {
+        free_memory(unsubscribe.tuples);
+        return -MQTT_ERR;
+    }
+
     unsubscribe.tuples_len = i;
     pkt->unsubscribe       = unsubscribe;
 
@@ -554,7 +658,35 @@ static int unpack_mqtt_ack(u8 *buf, struct mqtt_packet *pkt, usize len)
     if (len < sizeof(u16))
         return -MQTT_ERR;
     pkt->ack = (struct mqtt_ack){.pkt_id = unpacku16(buf)};
+
+    /* A packet identifier of 0 is reserved and must be rejected (§2.2.1) */
+    if (pkt->ack.pkt_id == 0)
+        return -MQTT_ERR;
+
     return MQTT_OK;
+}
+
+/*
+ * MQTT v3.1.1 §2.2.2: the four low bits of the first byte are part of the
+ * Fixed Header. Only PUBLISH may set them freely (there they carry DUP, QoS
+ * and RETAIN); on every other type they are reserved and the spec fixes their
+ * value: 0b0010 for PUBREL, SUBSCRIBE and UNSUBSCRIBE (§3.6.1, §3.8.1,
+ * §3.10.1) and 0b0000 everywhere else. A packet with any other value is
+ * malformed and the connection has to be closed, which is what returning
+ * false here leads to
+ */
+static bool valid_fixed_header_flags(u8 byte)
+{
+    switch (byte >> 4) {
+    case PUBREL:
+    case SUBSCRIBE:
+    case UNSUBSCRIBE:
+        return (byte & 0x0F) == 0x02;
+    case PUBLISH:
+        return true;
+    default:
+        return (byte & 0x0F) == 0x00;
+    }
 }
 
 /*
@@ -569,12 +701,17 @@ int mqtt_unpack(u8 *buf, struct mqtt_packet *pkt, u8 byte, usize len)
 
     pkt->header = (union mqtt_header){.byte = byte};
 
+    if (!valid_fixed_header_flags(byte))
+        return -MQTT_ERR;
+
     /*
      * PINGREQ, PINGRESP and DISCONNECT carry no payload, there is nothing to
-     * decode for them
+     * decode for them. §3.12.1, §3.13.1 and §3.14.1 leave them with no
+     * variable header either: a Remaining Length above 0 describes bytes
+     * that have no meaning, a malformed packet
      */
     if (type >= PINGREQ && type <= DISCONNECT)
-        return rc;
+        return len == 0 ? rc : -MQTT_ERR;
 
     /*
      * Every other type must have its own decoding routine: the types a
@@ -720,8 +857,8 @@ void mqtt_suback(struct mqtt_packet *pkt, u16 pkt_id, u8 *rcs, u16 rcslen)
     memcpy(pkt->suback.rcs, rcs, rcslen);
 }
 
-void mqtt_packet_publish(struct mqtt_packet *pkt, u16 pkt_id, usize topiclen,
-                         u8 *topic, usize payloadlen, u8 *payload)
+void mqtt_publish(struct mqtt_packet *pkt, u16 pkt_id, usize topiclen,
+                  u8 *topic, usize payloadlen, u8 *payload)
 {
     pkt->publish = (struct mqtt_publish){.pkt_id     = pkt_id,
                                          .topiclen   = topiclen,
@@ -755,12 +892,24 @@ void mqtt_packet_destroy(struct mqtt_packet *pkt)
         pkt->connect.payload.password = NULL;
         break;
     case SUBSCRIBE:
-    case UNSUBSCRIBE:
         for (unsigned i = 0; i < pkt->subscribe.tuples_len; i++)
             free_memory(pkt->subscribe.tuples[i].topic);
         free_memory(pkt->subscribe.tuples);
         pkt->subscribe.tuples     = NULL;
         pkt->subscribe.tuples_len = 0;
+        break;
+    case UNSUBSCRIBE:
+        /*
+         * The tuples of an UNSUBSCRIBE carry no QoS byte, so their layout
+         * differs from the SUBSCRIBE ones: going through pkt->subscribe here
+         * used to read the union with the wrong member type, only working by
+         * accident of the two structs sharing the same size and alignment
+         */
+        for (unsigned i = 0; i < pkt->unsubscribe.tuples_len; i++)
+            free_memory(pkt->unsubscribe.tuples[i].topic);
+        free_memory(pkt->unsubscribe.tuples);
+        pkt->unsubscribe.tuples     = NULL;
+        pkt->unsubscribe.tuples_len = 0;
         break;
     case SUBACK:
         free_memory(pkt->suback.rcs);
@@ -803,6 +952,13 @@ int mqtt_pack_mono(u8 *buf, u8 op, u16 id)
     case UNSUBACK:
         byte = UNSUBACK_B;
         break;
+    /*
+     * An unknown opcode would otherwise be packed as a 0x00 byte: report the
+     * failure so the caller can skip the write instead of emitting a bogus
+     * packet
+     */
+    default:
+        return 0;
     }
     pack(buf++, "B", byte);
     buf += mqtt_encode_length(buf, MQTT_HEADER_LEN);
@@ -815,7 +971,7 @@ int mqtt_pack_mono(u8 *buf, u8 op, u16 id)
  * buffer size of the packet based on the opcode. Accept an optional pointer
  * to get the len reserved for storing the remaining length of the full packet
  * excluding the fixed header (1 byte) and the bytes needed to store the
- * value itself (1 to 3 bytes).
+ * value itself (1 to 4 bytes).
  */
 usize mqtt_size(const struct mqtt_packet *pkt, usize *len)
 {
@@ -835,10 +991,10 @@ usize mqtt_size(const struct mqtt_packet *pkt, usize *len)
         break;
     }
     /*
-     * Here we take into account the number of bytes needed to store the total
-     * amount of bytes size of the packet, excluding the encoding space to
-     * store the value itself and the fixed header, updating len pointer if
-     * not NULL.
+     * Number of bytes the Remaining Length itself takes on the wire, picked
+     * from the value it will hold (size currently counts it as a single
+     * byte): up to 127 one byte, up to 16383 two, up to 2097151 three and
+     * four bytes beyond that, up to the 268435455 limit of §2.2.3
      */
     int remaininglen_offset = 0;
     if ((size - 1) > 0x200000) // 3 bytes <= 128 * 128 * 128
@@ -865,6 +1021,13 @@ static void mqtt_packet_free(const struct ref *refcount)
 struct mqtt_packet *mqtt_packet_alloc(u8 byte)
 {
     struct mqtt_packet *packet = try_alloc(sizeof(*packet));
+
+    /*
+     * Zero the whole union first: only the header and the reference counter
+     * are set below, and a destructor running on a partially built packet
+     * would otherwise chase pointers left over from the heap
+     */
+    memset(packet, 0, sizeof(*packet));
     packet->header             = (union mqtt_header){.byte = byte};
     packet->refcount           = (struct ref){mqtt_packet_free, 0};
     packet->refcount.count     = ATOMIC_VAR_INIT(0);

@@ -71,9 +71,11 @@ void sol_log(int level, const char *fmt, ...)
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
 
-    /* Truncate message too long and copy 3 bytes to make space for 3 dots */
-    memcpy(msg + MAX_LOG_SIZE, "...", 3);
-    msg[MAX_LOG_SIZE + 3] = '\0';
+    /* Truncate messages longer than MAX_LOG_SIZE, appending three dots */
+    if (strlen(msg) > MAX_LOG_SIZE) {
+        memcpy(msg + MAX_LOG_SIZE, "...", 3);
+        msg[MAX_LOG_SIZE + 3] = '\0';
+    }
 
     // Open two handler, one for standard output and a second for the
     // persistent log file

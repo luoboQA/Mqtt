@@ -29,9 +29,15 @@
 #include "bst.h"
 #include "memory.h"
 
-#define MAX(a, b)  a > b ? a : b
-#define HEIGHT(n)  !n ? 0 : n->height
-#define BALANCE(n) !n ? 0 : (HEIGHT(n->left)) - (HEIGHT(n->right))
+/*
+ * Macro parenthesis matter: without the outer parentheses an expression such
+ * as `1 + MAX(a, b)` would expand to `1 + a > b ? a : b`, which due to
+ * operator precedence evaluates as `(1 + a) > b ? a : b`, silently breaking
+ * every height computation in this file (and with it the whole AVL balance)
+ */
+#define MAX(a, b)  ((a) > (b) ? (a) : (b))
+#define HEIGHT(n)  ((n) ? (n)->height : 0)
+#define BALANCE(n) ((n) ? (HEIGHT((n)->left)) - (HEIGHT((n)->right)) : 0)
 
 struct bst_node *bst_new(unsigned char key, const void *data)
 {
@@ -60,11 +66,11 @@ static struct bst_node *bst_rotate_right(struct bst_node *y)
 
 static struct bst_node *bst_rotate_left(struct bst_node *x)
 {
-    struct bst_node *y  = x->left;
-    struct bst_node *t2 = y->right;
+    struct bst_node *y  = x->right;
+    struct bst_node *t2 = y->left;
 
-    y->right            = x;
-    x->left             = t2;
+    y->left             = x;
+    x->right            = t2;
 
     x->height           = MAX(HEIGHT(x->left), HEIGHT(x->right)) + 1;
     y->height           = MAX(HEIGHT(y->left), HEIGHT(y->right)) + 1;
@@ -183,9 +189,15 @@ struct bst_node *bst_delete(struct bst_node *node, unsigned char key)
 {
     if (!node)
         return node;
+    /*
+     * `else if` is essential here: with a second plain `if`, deleting a key
+     * from the left subtree would make the second condition false and fall
+     * into the `else` branch, removing the *current* node (often the root)
+     * right after the left subtree had already been fixed recursively
+     */
     if (key < node->key)
         node->left = bst_delete(node->left, key);
-    if (key > node->key)
+    else if (key > node->key)
         node->right = bst_delete(node->right, key);
     else {
         if (!node->left || !node->right) {

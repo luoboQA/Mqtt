@@ -61,7 +61,14 @@ err:
 static int set_cloexec(int fd)
 {
     int flags, result;
-    flags = fcntl(fd, F_GETFL, 0);
+
+    /*
+     * F_GETFD/F_SETFD operate on the file descriptor flags, where FD_CLOEXEC
+     * lives. The old code read the file status flags (F_GETFL) and wrote
+     * them into the descriptor flags: it happened to work because FD_CLOEXEC
+     * is bit 0, but it also leaked O_* access-mode bits into the wrong word
+     */
+    flags = fcntl(fd, F_GETFD, 0);
 
     if (flags == -1)
         goto err;
@@ -212,10 +219,18 @@ static int accept_conn(int sfd, char *ip)
 {
 
     int clientsock;
-    struct sockaddr_in addr;
+    /*
+     * The listening socket is created with AF_UNSPEC, so it can be IPv4 or
+     * IPv6: a struct sockaddr_in would truncate an sockaddr_in6 and report a
+     * wrong address (and port) in the logs, sockaddr_storage covers both
+     */
+    struct sockaddr_storage addr;
     socklen_t addrlen = sizeof(addr);
 
     if ((clientsock = accept(sfd, (struct sockaddr *)&addr, &addrlen)) < 0) {
+        /* Retry on a signal, report anything else */
+        if (errno == EINTR)
+            return accept_conn(sfd, ip);
         if (errno != EWOULDBLOCK && errno != EAGAIN)
             perror("accept");
         return -1;
@@ -228,16 +243,30 @@ static int accept_conn(int sfd, char *ip)
     if (conf->socket_family == INET)
         (void)set_tcpnodelay(clientsock);
 
-    char ip_buff[INET_ADDRSTRLEN];
-    if (inet_ntop(AF_INET, &addr.sin_addr, ip_buff, sizeof(ip_buff)) == NULL) {
-        if (close(clientsock) < 0)
-            perror("close");
-        return -1;
+    char ip_buff[INET6_ADDRSTRLEN];
+    if (addr.ss_family == AF_INET6) {
+        struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)&addr;
+        if (inet_ntop(AF_INET6, &in6->sin6_addr, ip_buff, sizeof(ip_buff)) ==
+            NULL) {
+            if (close(clientsock) < 0)
+                perror("close");
+            return -1;
+        }
+        if (ip)
+            snprintf(ip, INET6_ADDRSTRLEN + 8, "[%s]:%i", ip_buff,
+                     ntohs(in6->sin6_port));
+    } else {
+        struct sockaddr_in *in4 = (struct sockaddr_in *)&addr;
+        if (inet_ntop(AF_INET, &in4->sin_addr, ip_buff, sizeof(ip_buff)) ==
+            NULL) {
+            if (close(clientsock) < 0)
+                perror("close");
+            return -1;
+        }
+        if (ip)
+            snprintf(ip, INET6_ADDRSTRLEN + 8, "%s:%i", ip_buff,
+                     ntohs(in4->sin_port));
     }
-
-    if (ip)
-        snprintf(ip, INET_ADDRSTRLEN + 6, "%s:%i", ip_buff,
-                 ntohs(addr.sin_port));
 
     return clientsock;
 }
@@ -253,6 +282,9 @@ ssize_t send_bytes(int fd, const unsigned char *buf, size_t len)
     while (total < len) {
         n = send(fd, buf + total, bytesleft, MSG_NOSIGNAL);
         if (n == -1) {
+            /* A signal must not be mistaken for a socket failure: retry */
+            if (errno == EINTR)
+                continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK)
                 break;
             else
@@ -283,6 +315,9 @@ ssize_t recv_bytes(int fd, unsigned char *buf, size_t bufsize)
     while (total < (ssize_t)bufsize) {
 
         if ((n = recv(fd, buf, bufsize - total, 0)) < 0) {
+            /* A signal must not be mistaken for a socket failure: retry */
+            if (errno == EINTR)
+                continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK)
                 break;
             else
@@ -325,7 +360,7 @@ SSL_CTX *create_ssl_context(void)
     ctx = SSL_CTX_new(TLS_server_method());
 #else
     ctx = SSL_CTX_new(SSLv23_method());
-#endif // __linux__
+#endif /* OPENSSL_VERSION_NUMBER */
 
     if (!ctx) {
         perror("Unable to create SSL context");
@@ -356,7 +391,7 @@ SSL_CTX *create_ssl_context(void)
     SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION);
 #endif
 #ifdef SSL_OP_NO_CLIENT_RENEGOTIATION
-    SSL_CTX_set_options(ssl->ctx, SSL_OP_NO_CLIENT_RENEGOTIATION);
+    SSL_CTX_set_options(ctx, SSL_OP_NO_CLIENT_RENEGOTIATION);
 #endif
 
     return ctx;
@@ -402,14 +437,39 @@ void load_certificates(SSL_CTX *ctx, const char *ca, const char *cert,
     }
 }
 
+/*
+ * Wrap an accepted descriptor in a new SSL object and drive the server side
+ * of the handshake. The socket is non-blocking, so a WANT_READ/WANT_WRITE
+ * here is the normal case (the ClientHello has not arrived yet, or its reply
+ * does not fit): OpenSSL resumes the handshake transparently on the next
+ * SSL_read()/SSL_write(), and this function returns the SSL object so the
+ * connection can be registered. A NULL return means the handshake really
+ * failed (bad certificate, unsupported version, allocation failure) and the
+ * caller must reject the connection instead of registering a socket whose
+ * every future I/O would error out
+ */
 SSL *ssl_accept(SSL_CTX *ctx, int fd)
 {
     SSL *ssl = SSL_new(ctx);
-    SSL_set_fd(ssl, fd);
+    if (!ssl) {
+        ERR_print_errors_fp(stderr);
+        return NULL;
+    }
+    if (!SSL_set_fd(ssl, fd)) {
+        ERR_print_errors_fp(stderr);
+        SSL_free(ssl);
+        return NULL;
+    }
     SSL_set_accept_state(ssl);
     ERR_clear_error();
-    if (SSL_accept(ssl) <= 0)
-        ERR_print_errors_fp(stderr);
+    if (SSL_accept(ssl) <= 0) {
+        int err = SSL_get_error(ssl, 0);
+        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+            ERR_print_errors_fp(stderr);
+            SSL_free(ssl);
+            return NULL;
+        }
+    }
     return ssl;
 }
 
@@ -425,11 +485,43 @@ ssize_t ssl_send_bytes(SSL *ssl, const unsigned char *buf, size_t len)
     while (total < len) {
         if ((n = SSL_write(ssl, buf + total, bytesleft)) <= 0) {
             int err = SSL_get_error(ssl, n);
-            if (err == SSL_ERROR_WANT_WRITE || SSL_ERROR_NONE)
-                continue;
+            /*
+             * The socket is non-blocking: SSL_ERROR_WANT_WRITE means the
+             * kernel buffer is full (and WANT_READ means the handshake or a
+             * renegotiation needs a packet back). Returning to the event loop
+             * and waiting for the next EPOLLOUT/EPOLLIN is the only correct
+             * move: the old code looped here, and since SSL_write() returns
+             * immediately with the same code, a slow or silent peer pinned
+             * the thread at 100% CPU forever, stalling every other connection
+             * on the same loop. Report it as EAGAIN so the caller keeps the
+             * unwritten tail and retries on the next event, like the plain
+             * send_bytes() does
+             */
+            if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
+                errno = EAGAIN;
+                break;
+            }
             if (err == SSL_ERROR_ZERO_RETURN ||
                 (err == SSL_ERROR_SYSCALL && !errno))
                 return 0; // Connection closed
+            /*
+             * OpenSSL 3.0 reports a peer that vanished without the TLS
+             * close_notify alert as SSL_ERROR_SSL with this reason. For a
+             * *write* this is a dead connection, not an EOF: it must leave
+             * here as -1 with a real errno, because write_data() only takes
+             * the disconnect branch when wrote < 0 and errno is not EAGAIN.
+             * Returning 0 instead would make it assume nothing was
+             * available to write, reset towrite and silently discard the
+             * whole pending buffer. The old fall-through did return -1 but
+             * with errno still 0, so the log line read "error sending data:
+             * Success"
+             */
+#ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
+            if (err == SSL_ERROR_SSL &&
+                ERR_GET_REASON(ERR_peek_last_error()) ==
+                    SSL_R_UNEXPECTED_EOF_WHILE_READING)
+                errno = ECONNRESET;
+#endif
             if (errno == EAGAIN || errno == EWOULDBLOCK)
                 break;
             else
@@ -459,11 +551,36 @@ ssize_t ssl_recv_bytes(SSL *ssl, unsigned char *buf, size_t bufsize)
 
         if ((n = SSL_read(ssl, buf, bufsize - total)) <= 0) {
             int err = SSL_get_error(ssl, n);
-            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_NONE)
-                continue;
+            /*
+             * Same reasoning as ssl_send_bytes(): WANT_READ (no complete TLS
+             * record has arrived yet) and WANT_WRITE (the reply needs a
+             * flight out) must yield to the event loop instead of spinning,
+             * with errno left as EAGAIN so recv_data()'s caller knows no
+             * error happened and simply has to wait for more bytes
+             */
+            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                errno = EAGAIN;
+                break;
+            }
             if (err == SSL_ERROR_ZERO_RETURN ||
                 (err == SSL_ERROR_SYSCALL && !errno))
                 return 0; // Connection closed
+            /*
+             * OpenSSL 3.0 reports a peer that vanished without the TLS
+             * close_notify alert as SSL_ERROR_SSL with this reason instead
+             * of a plain EOF. A client that kills its process or drops the
+             * network is the routine case for a broker: treating it as the
+             * disconnect it is keeps recv_data()'s semantics (0 == peer
+             * closed), where the old fall-through returned -1 with errno
+             * still 0 and logged "error reading data: Success" before
+             * reporting a socket error for what is a normal close
+             */
+#ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
+            if (err == SSL_ERROR_SSL &&
+                ERR_GET_REASON(ERR_peek_last_error()) ==
+                    SSL_R_UNEXPECTED_EOF_WHILE_READING)
+                return 0;
+#endif
             if (errno == EAGAIN || errno == EWOULDBLOCK)
                 break;
             else
@@ -507,7 +624,12 @@ static ssize_t conn_recv(struct connection *c, unsigned char *buf, size_t len)
     return recv_bytes(c->fd, buf, len);
 }
 
-static void conn_close(struct connection *c) { close(c->fd); }
+static void conn_close(struct connection *c)
+{
+    if (c->fd >= 0 && close(c->fd) < 0)
+        perror("close");
+    c->fd = -1;
+}
 
 // TLS version of the connection functions
 // XXX Not so neat, improve later
@@ -517,6 +639,17 @@ static int conn_tls_accept(struct connection *c, int serverfd)
     if (fd < 0)
         return fd;
     c->ssl = ssl_accept(c->ctx, fd);
+    if (!c->ssl) {
+        /*
+         * The handshake failed outright: drop the descriptor and report the
+         * failure like a rejected accept, or the caller would register a
+         * client that can never complete a TLS exchange
+         */
+        if (close(fd) < 0)
+            perror("close");
+        c->fd = -1;
+        return -1;
+    }
     c->fd  = fd;
     return fd;
 }
@@ -535,8 +668,17 @@ static ssize_t conn_tls_recv(struct connection *c, unsigned char *buf,
 
 static void conn_tls_close(struct connection *c)
 {
-    if (c->ssl)
+    if (c->ssl) {
+        /*
+         * Send the close_notify before releasing the object: skipping the
+         * shutdown makes the peer see an unclean close (it cannot tell a
+         * truncated record from a real one). A best effort is enough here,
+         * the descriptor is about to be closed anyway
+         */
+        SSL_shutdown(c->ssl);
         SSL_free(c->ssl);
+        c->ssl = NULL;
+    }
     if (c->fd >= 0 && close(c->fd) < 0)
         perror("close");
 }
