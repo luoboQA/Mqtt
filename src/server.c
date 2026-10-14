@@ -720,6 +720,15 @@ static ssize_t recv_packet(struct client *c)
          * Read the first two bytes, the first should contain the message type
          * code
          */
+        /*
+         * recv_bytes() returns 0 both on EOF and on "EAGAIN with no data",
+         * telling them apart only through errno. recv() returning 0 (EOF)
+         * does NOT set errno, so a stale EAGAIN from an earlier partial
+         * read would mislabel a disconnect as EAGAIN and spin the event
+         * loop forever: clear it so the checks below see only what this
+         * call did
+         */
+        errno           = 0;
         nread = recv_data(&c->conn, c->rbuf + c->read, 2 - c->read);
 
         if (errno != EAGAIN && errno != EWOULDBLOCK && nread <= 0)
@@ -768,6 +777,7 @@ static ssize_t recv_packet(struct client *c)
          * once the continuation bits are decoded
          */
         if (c->read < 4) {
+            errno   = 0;
             nread = recv_data(&c->conn, c->rbuf + c->read, 4 - c->read);
 
             if (errno != EAGAIN && errno != EWOULDBLOCK && nread <= 0)
@@ -793,6 +803,7 @@ static ssize_t recv_packet(struct client *c)
                 break;
             if (pos >= MQTT_MAX_LEN_BYTES)
                 return -ERRPACKETERR;
+            errno   = 0;
             nread = recv_data(&c->conn, c->rbuf + c->read, 5 - c->read);
             if (nread <= 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -838,6 +849,7 @@ static ssize_t recv_packet(struct client *c)
      * Last status, we have access to the length of the packet and we know for
      * sure that it's not a PINGREQ/PINGRESP/DISCONNECT packet.
      */
+    errno   = 0;
     nread = recv_data(&c->conn, c->rbuf + c->read, c->toread - c->read);
 
     if (errno != EAGAIN && errno != EWOULDBLOCK && nread <= 0)

@@ -1,5 +1,6 @@
 import struct
 import socket
+import time
 import unittest
 import sol_test
 import base_testcase
@@ -47,6 +48,24 @@ class TestMalformed(base_testcase.BaseTestcase):
 
     def test_random_garbage(self):
         self.send_raw(b'\x01\x02\x03\x04\x05\xff\xfe\xfd\x00\x7f')
+        self.assert_broker_alive()
+
+    def test_disconnect_after_partial_header(self):
+        # A client that sends a single header byte and then closes used to
+        # leave errno set to EAGAIN from the partial read, while recv()
+        # returning 0 (EOF) never updates errno. recv_packet() mistook the
+        # EOF for "try again" on a level-triggered fd and spun the worker
+        # at 100% CPU forever. The disconnect must be detected, not retried
+        conn = self.get_connection()
+        conn.settimeout(2)
+        try:
+            conn.sendall(sol_test.create_connect('partial-hdr'))
+            conn.recv(100)
+            conn.sendall(b'\x30')   # one byte of a PUBLISH header, then EOF
+        finally:
+            conn.close()
+        # Give the broker a beat to (wrongly) re-arm the read if it regressed
+        time.sleep(0.2)
         self.assert_broker_alive()
 
     def test_reserved_packet_type_zero(self):
