@@ -639,8 +639,9 @@ static usize pack_mqtt_publish(const struct mqtt_packet *pkt, u8 *buf)
     pack(buf++, "B", pkt->header.byte);
 
     /*
-     * TODO handle case where step is > 1, e.g. when a message longer than 128
-     * bytes is published
+     * Remaining Length is encoded with the MQTT variable-length algorithm:
+     * mqtt_encode_length() emits as many bytes as needed (continuation bits
+     * set), so payloads longer than 127 bytes are handled correctly
      */
     buf += mqtt_encode_length(buf, len);
 

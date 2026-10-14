@@ -639,8 +639,16 @@ static int ev_process_event(struct ev_ctx *ctx, int idx, int mask)
          * fd level-triggered ready until every loop has observed it; the
          * descriptor is released together with the process anyway
          */
-        e->rcallback(ctx, e->rdata);
-        ++fired;
+        /*
+         * The shared run eventfd is never removed from a loop while it is
+         * being processed, but guard it the same way the read branch below
+         * does: a slot zeroed by a concurrent ev_del_fd would otherwise be
+         * dispatched through a NULL callback
+         */
+        if (e->rcallback) {
+            e->rcallback(ctx, e->rdata);
+            ++fired;
+        }
     } else {
         if (mask & EV_EVENTFD) {
 #ifdef __linux__

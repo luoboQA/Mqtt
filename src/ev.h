@@ -66,13 +66,15 @@ struct ev {
 /*
  * Event loop context, carry the expected number of events to be monitored at
  * every cycle and an opaque pointer to the backend used as engine
- * (Select | Epoll | Kqueue).
- * By now we stick with epoll and skip over select, cause as the current
- * threaded model employed by the server is not very friendly with select
- * Level-trigger default setting. But it would be quiet easy abstract over the
- * select model as well for single threaded uses or in a loop per thread
- * scenario (currently thanks to epoll Edge-triggered + EPOLLONESHOT we can
- * share a single loop over multiple threads).
+ * (Epoll, with Poll/Select/Kqueue fallbacks for platforms that lack it).
+ *
+ * The server runs one loop per thread: every eventloop_start() builds its own
+ * ev_ctx and, on the epoll backend, its own epoll descriptor, so a loop is
+ * owned by a single thread. Registrations are level-triggered (no EPOLLET and
+ * no EPOLLONESHOT): a readable or writable descriptor stays ready until it is
+ * drained or removed. A worker thread that must reply on a client owned by
+ * another loop arms it cross-thread through ev_fire_event(), which writes the
+ * target slot and issues an epoll_ctl() MOD against that loop's descriptor.
  */
 struct ev_ctx {
     int events_nr;

@@ -1238,11 +1238,10 @@ static void stop_handler(struct ev_ctx *ctx, void *arg)
 }
 
 /*
- * IO worker function, wait for events on a dedicated epoll descriptor which
- * is shared among multiple threads for input and output only, following the
- * normal EPOLL semantic, EPOLLIN for incoming bytes to be unpacked and
- * processed by a worker thread, EPOLLOUT for bytes incoming from a worker
- * thread, ready to be delivered out.
+ * IO worker function, wait for events on a dedicated epoll descriptor owned
+ * by this thread, following the normal EPOLL semantic, EPOLLIN for incoming
+ * bytes to be unpacked and processed by a worker thread, EPOLLOUT for bytes
+ * incoming from a worker thread, ready to be delivered out.
  */
 static void eventloop_start(void *args)
 {

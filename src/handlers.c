@@ -643,8 +643,12 @@ static int connect_handler(struct io_event *e)
         cc->has_lwt              = true;
         const char *will_topic   = (const char *)c->payload.will_topic;
         const char *will_message = (const char *)c->payload.will_message;
-        // TODO check for will_topic != NULL
-        // I'm sure that the string will be NUL terminated by unpack function
+        /*
+         * Both are guaranteed non-NULL here: unpack_mqtt_connect() returns an
+         * error when the will bit is set and either string fails to decode,
+         * so a CONNECT that reached this handler always carries both, NUL
+         * terminated by the unpacker
+         */
         size_t msg_len = strlen(will_message);
         size_t tpc_len = strlen(will_topic);
 
@@ -721,8 +725,11 @@ static int connect_handler(struct io_event *e)
         log_info("\t%s", cc->session->lwt_msg.publish.payload);
     }
 
-    // TODO check for session already present
-
+    /*
+     * Session presence is decided above: a persistent session carried over
+     * from a previous connection sets session_present, a clean session over
+     * a stale one tears the old one down first
+     */
     cc->clean_session = c->bits.clean_session;
 
     set_connack(cc, MQTT_CONNECTION_ACCEPTED, session_present);
@@ -1282,7 +1289,15 @@ static int publish_handler(struct io_event *e)
 #endif
 
     struct mqtt_packet *pkt = mqtt_packet_alloc(e->data.header.byte);
-    // TODO must perform a deep copy here
+    /*
+     * A deliberate shallow copy, not a missing deep copy: it transfers
+     * ownership of the topic/payload heap buffers to the refcounted pkt,
+     * which frees them in mqtt_packet_destroy(). process_message() never
+     * destroys a PUBLISH io.data precisely so these buffers are released
+     * exactly once, here, when pkt's refcount drops to zero. Deep-copying
+     * would leave the original e->data.publish buffers unreachable and leak
+     * them on every message
+     */
     pkt->publish            = e->data.publish;
 
     /*
