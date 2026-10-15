@@ -27,6 +27,8 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
 #include <string.h>
 #include <unistd.h>
 #ifdef __linux__
@@ -39,6 +41,85 @@
 #include "ev.h"
 #include "memory.h"
 #include "util.h"
+
+/*
+ * ==================
+ *  Wakeup descriptor
+ * ==================
+ *
+ * poll() and select() copy the descriptor set they are given when they enter
+ * the kernel, so a descriptor rearmed from another thread (a publish towards
+ * a client living on this loop, a takeover, the keepalive scan) is invisible
+ * to a wait already in progress: the thread would stay parked and the client
+ * would never see its bytes. Every such loop watches a wakeup descriptor of
+ * its own and rearms from the outside write to it. epoll does not need it:
+ * epoll_ctl() is a system call the kernel applies to a wait in progress.
+ */
+#if defined(EPOLL)
+#define EV_BACKEND_NEEDS_WAKEUP 0
+#else
+#define EV_BACKEND_NEEDS_WAKEUP 1
+#endif
+
+#if EV_BACKEND_NEEDS_WAKEUP
+
+#if defined(__linux__)
+#include <sys/eventfd.h>
+
+static int ev_wakeup_create(void)
+{
+    return eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+}
+
+static void ev_wakeup_notify(int fd)
+{
+    if (fd < 0)
+        return;
+    uint64_t one = 1;
+    (void)!write(fd, &one, sizeof(one));
+}
+
+static void ev_wakeup_drain(int fd)
+{
+    uint64_t value;
+    (void)!read(fd, &value, sizeof(value));
+}
+#else
+/* A self-pipe is the portable equivalent of the eventfd above */
+static int ev_wakeup_create(void)
+{
+    int fds[2];
+    if (pipe(fds) != 0)
+        return -1;
+    fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL, 0) | O_NONBLOCK);
+    fcntl(fds[1], F_SETFL, fcntl(fds[1], F_GETFL, 0) | O_NONBLOCK);
+    close(fds[1]); /* Only the read end is watched */
+    return fds[0];
+}
+
+static void ev_wakeup_notify(int fd)
+{
+    char byte = 'w';
+    if (fd >= 0)
+        (void)!write(fd, &byte, sizeof(byte));
+}
+
+static void ev_wakeup_drain(int fd)
+{
+    char buffer[64];
+    while (read(fd, buffer, sizeof(buffer)) > 0)
+        ;
+}
+#endif
+
+/* Watched by every loop that needs one, it only has to empty the descriptor */
+static void ev_wakeup_callback(struct ev_ctx *ctx, void *arg)
+{
+    (void)arg;
+    ev_wakeup_drain(ctx->wakeup);
+}
+
+#endif /* EV_BACKEND_NEEDS_WAKEUP */
 
 #if defined(EPOLL)
 
@@ -230,13 +311,18 @@ static int ev_api_init(struct ev_ctx *ctx, int events_nr)
 
 static void ev_api_destroy(struct ev_ctx *ctx)
 {
-    free_memory(((struct poll_api *)ctx->api)->fds);
+    struct poll_api *p_api = ctx->api;
+    free_memory(p_api->fds);
     free_memory(ctx->api);
 }
 
 static int ev_api_get_event_type(struct ev_ctx *ctx, int idx)
 {
     struct poll_api *p_api = ctx->api;
+    /* A tombstone left by a removal: nothing to report, and its fd of -1
+       would index the monitored array out of bounds */
+    if (p_api->fds[idx].fd < 0)
+        return EV_NONE;
     int ev_mask            = ctx->events_monitored[p_api->fds[idx].fd].mask;
     // We want to remember the previous events only if they're not of type
     // CLOSE or TIMER
@@ -279,6 +365,28 @@ static int ev_api_poll(struct ev_ctx *ctx, time_t timeout)
 }
 
 /*
+ * Slot for a new descriptor: the first tombstone left by a removal, or a new
+ * entry at the end of the array (grown if needed)
+ */
+static struct pollfd *ev_api_poll_slot(struct poll_api *p_api, int fd)
+{
+    for (int i = 0; i < p_api->nfds; ++i)
+        if (p_api->fds[i].fd == -1) {
+            p_api->fds[i] = (struct pollfd){.fd = fd};
+            return &p_api->fds[i];
+        }
+
+    if (p_api->nfds >= p_api->events_monitored) {
+        p_api->events_monitored *= 2;
+        p_api->fds = try_realloc(p_api->fds, p_api->events_monitored *
+                                                 sizeof(struct pollfd));
+    }
+    struct pollfd *slot = &p_api->fds[p_api->nfds++];
+    *slot               = (struct pollfd){.fd = fd};
+    return slot;
+}
+
+/*
  * Poll maintain in his state the number of file descriptor it monitor in a
  * fixed size array just like the events we monitor over the primitive. If a
  * resize is needed cause the number of fds have reached the length of the fds
@@ -287,17 +395,10 @@ static int ev_api_poll(struct ev_ctx *ctx, time_t timeout)
 static int ev_api_watch_fd(struct ev_ctx *ctx, int fd)
 {
     struct poll_api *p_api = ctx->api;
+    struct pollfd *slot    = ev_api_poll_slot(p_api, fd);
 
-    /* Grow *before* writing, the slot is at index nfds */
-    if (p_api->nfds >= p_api->events_monitored) {
-        p_api->events_monitored *= 2;
-        p_api->fds = try_realloc(p_api->fds, p_api->events_monitored *
-                                                 sizeof(struct pollfd));
-    }
-    p_api->fds[p_api->nfds].fd     = fd;
-    p_api->fds[p_api->nfds].events = POLLIN;
-    p_api->fds[p_api->nfds].revents = 0;
-    p_api->nfds++;
+    slot->events  = POLLIN;
+    slot->revents = 0;
     return EV_OK;
 }
 
@@ -307,18 +408,17 @@ static int ev_api_del_fd(struct ev_ctx *ctx, int fd)
     for (int i = 0; i < p_api->nfds; ++i) {
         if (p_api->fds[i].fd == fd) {
             /*
-             * Shift the whole slot, not just the descriptor: leaving the old
-             * events/revents on the compacted position mismatched the
-             * watched interest with the fd and could make a descriptor
-             * report POLLOUT for a neighbour's registration
+             * The slot is left where it is, as a tombstone: poll() ignores a
+             * negative descriptor, and the batch being dispatched was indexed
+             * against the array as it was *before* the call. Shifting the
+             * entries (as this used to) handed the remaining events of that
+             * batch to the descriptors of their neighbours, and could leave
+             * the cursor on a slot whose fd is -1, which then indexed
+             * events_monitored[-1]
              */
-            for (int j = i; j < p_api->nfds - 1; ++j)
-                p_api->fds[j] = p_api->fds[j + 1];
-            p_api->nfds--;
-            /* Forget the vacated tail slot */
-            p_api->fds[p_api->nfds].fd      = -1;
-            p_api->fds[p_api->nfds].events  = 0;
-            p_api->fds[p_api->nfds].revents = 0;
+            p_api->fds[i].fd      = -1;
+            p_api->fds[i].events  = 0;
+            p_api->fds[i].revents = 0;
             break;
         }
     }
@@ -331,21 +431,14 @@ static int ev_api_del_fd(struct ev_ctx *ctx, int fd)
 static int ev_api_register_event(struct ev_ctx *ctx, int fd, int mask)
 {
     struct poll_api *p_api = ctx->api;
+    struct pollfd *slot    = ev_api_poll_slot(p_api, fd);
 
-    /* Grow *before* writing, the slot is at index nfds */
-    if (p_api->nfds >= p_api->events_monitored) {
-        p_api->events_monitored *= 2;
-        p_api->fds = try_realloc(p_api->fds, p_api->events_monitored *
-                                                 sizeof(struct pollfd));
-    }
-    p_api->fds[p_api->nfds].fd      = fd;
-    p_api->fds[p_api->nfds].events  = 0;
+    slot->events = 0;
     if (mask & EV_READ)
-        p_api->fds[p_api->nfds].events |= POLLIN;
+        slot->events |= POLLIN;
     if (mask & EV_WRITE)
-        p_api->fds[p_api->nfds].events |= POLLOUT;
-    p_api->fds[p_api->nfds].revents = 0;
-    p_api->nfds++;
+        slot->events |= POLLOUT;
+    slot->revents = 0;
     return EV_OK;
 }
 
@@ -358,6 +451,12 @@ static int ev_api_fire_event(struct ev_ctx *ctx, int fd, int mask)
             break;
         }
     }
+    /*
+     * The array above is only read again when this loop calls poll() once
+     * more: the wait it may be parked on right now was given a copy of it, so
+     * it has to be woken up explicitly (see EV_BACKEND_NEEDS_WAKEUP)
+     */
+    ev_wakeup_notify(ctx->wakeup);
     return EV_OK;
 }
 
@@ -406,12 +505,15 @@ static int ev_api_init(struct ev_ctx *ctx, int events_nr)
     FD_ZERO(&s_api->wfds);
     FD_ZERO(&s_api->_rfds);
     FD_ZERO(&s_api->_wfds);
-    ctx->api   = s_api;
-    ctx->maxfd = 0;
+    ctx->api = s_api;
+    ctx->maxfd    = 0;
     return EV_OK;
 }
 
-static void ev_api_destroy(struct ev_ctx *ctx) { free_memory(ctx->api); }
+static void ev_api_destroy(struct ev_ctx *ctx)
+{
+    free_memory(ctx->api);
+}
 
 static int ev_api_get_event_type(struct ev_ctx *ctx, int idx)
 {
@@ -531,6 +633,9 @@ static int ev_api_fire_event(struct ev_ctx *ctx, int fd, int mask)
         FD_SET(fd, &s_api->rfds);
     if (mask & EV_WRITE)
         FD_SET(fd, &s_api->wfds);
+    /* See the poll backend: the sets are copied when select() enters the
+       kernel, a wait in progress has to be woken explicitly */
+    ev_wakeup_notify(ctx->wakeup);
     return EV_OK;
 }
 
@@ -819,6 +924,15 @@ static void ev_add_monitored(struct ev_ctx *ctx, int fd, int mask,
 {
     pthread_mutex_lock(&ctx->lock);
     /*
+     * A negative descriptor is a connection that has been closed, and its
+     * events may still be in flight: the slot it used to own is zeroed by
+     * ev_del_fd(), and indexing the array with -1 would write right before
+     * its first element
+     */
+    if (fd < 0)
+        return;
+
+    /*
      * Grow the monitored array when the descriptor does not fit. The check
      * has to be `>=`: the array holds monitored_nr slots, indexed 0 ..
      * monitored_nr - 1, so an fd *equal* to the capacity is already past its
@@ -877,6 +991,23 @@ int ev_init(struct ev_ctx *ctx, int events_nr)
     ctx->events_nr        = events_nr;
     ctx->monitored_nr     = events_nr;
     ctx->events_monitored = try_calloc(events_nr, sizeof(struct ev));
+
+#if EV_BACKEND_NEEDS_WAKEUP
+    /*
+     * One wakeup descriptor per loop, watched like any other read descriptor:
+     * this is what lets another thread pull this loop out of a blocking wait
+     * when it rearms one of its descriptors (see ev_wakeup_notify). It is
+     * registered here, once the monitored array exists
+     */
+    ctx->wakeup = ev_wakeup_create();
+    if (ctx->wakeup >= 0) {
+        ev_add_monitored(ctx, ctx->wakeup, EV_READ, ev_wakeup_callback, NULL);
+        ev_api_watch_fd(ctx, ctx->wakeup);
+    }
+#else
+    ctx->wakeup = -1;
+#endif
+
     return EV_OK;
 }
 
@@ -893,6 +1024,8 @@ void ev_destroy(struct ev_ctx *ctx)
             ctx->events_monitored[i].mask != EV_NONE)
             ev_del_fd(ctx, ctx->events_monitored[i].fd);
     }
+    if (ctx->wakeup >= 0)
+        close(ctx->wakeup);
     pthread_mutex_destroy(&ctx->lock);
     free_memory(ctx->events_monitored);
     ctx->events_monitored = NULL;
@@ -939,6 +1072,9 @@ void ev_stop(struct ev_ctx *ctx) { ctx->stop = 1; }
 
 int ev_watch_fd(struct ev_ctx *ctx, int fd, int mask)
 {
+    /* A closed descriptor has nothing to monitor (see ev_add_monitored) */
+    if (fd < 0)
+        return EV_OK;
     ev_add_monitored(ctx, fd, mask, NULL, NULL);
     return ev_api_watch_fd(ctx, fd);
 }
@@ -971,6 +1107,8 @@ int ev_del_fd(struct ev_ctx *ctx, int fd)
 int ev_register_event(struct ev_ctx *ctx, int fd, int mask,
                       void (*callback)(struct ev_ctx *, void *), void *data)
 {
+    if (fd < 0)
+        return -EV_ERR;
     ev_add_monitored(ctx, fd, mask, callback, data);
     int ret = 0;
     ret     = ev_api_register_event(ctx, fd, mask);
@@ -1065,8 +1203,25 @@ int ev_fire_event(struct ev_ctx *ctx, int fd, int mask,
                   void (*callback)(struct ev_ctx *, void *), void *data)
 {
     int ret = 0;
+    /*
+     * An event fired at a descriptor that has been closed in the meantime (a
+     * connection deactivated while its write was still queued) has nothing to
+     * deliver: the backends would be handed a -1, and the select one shifts
+     * it into the descriptor set, corrupting memory next to it
+     */
+    if (fd < 0)
+        return EV_OK;
     ev_add_monitored(ctx, fd, mask, callback, data);
+    /*
+     * The poll and select backends rearm by writing the descriptor set their
+     * loop is waiting on, and this call comes from another loop: the context
+     * lock serializes it with the reads of the owner (epoll talks to the
+     * kernel instead and does not need it, but the lock is taken the same
+     * way, it only costs an uncontended futex)
+     */
+    pthread_mutex_lock(&ctx->lock);
     ret = ev_api_fire_event(ctx, fd, mask);
+    pthread_mutex_unlock(&ctx->lock);
     if (ret < 0)
         return -EV_ERR;
     if (mask & EV_EVENTFD) {

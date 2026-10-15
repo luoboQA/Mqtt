@@ -32,9 +32,24 @@
 #include <stdbool.h>
 
 // Eventloop backend check
+//
+// The backend can be forced at compile time (-DEVENTLOOP=poll on the cmake
+// command line, or -DSOL_EVENTLOOP_* by hand), which is what makes the three
+// implementations testable on a single machine: the kernel version only
+// decides when nothing is forced, and on anything but Linux the override is
+// ignored (kqueue is the only backend there)
 #ifdef __linux__
 #include <linux/version.h>
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 5, 44)
+#if defined(SOL_EVENTLOOP_EPOLL)
+#define EPOLL             1
+#define EVENTLOOP_BACKEND "epoll"
+#elif defined(SOL_EVENTLOOP_POLL)
+#define POLL              1
+#define EVENTLOOP_BACKEND "poll"
+#elif defined(SOL_EVENTLOOP_SELECT)
+#define SELECT            1
+#define EVENTLOOP_BACKEND "select"
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(2, 5, 44)
 #define EPOLL             1
 #define EVENTLOOP_BACKEND "epoll"
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(2, 1, 23)

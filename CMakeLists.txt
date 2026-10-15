@@ -6,8 +6,18 @@ set (CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 OPTION(DEBUG "add debug flags" OFF)
 OPTION(TSAN "build with ThreadSanitizer" OFF)
+SET(EVENTLOOP "default" CACHE STRING
+    "Event loop backend: default, epoll, poll or select (Linux only)")
 
 add_definitions("-D_DEFAULT_SOURCE")
+
+if (EVENTLOOP STREQUAL "epoll")
+    add_definitions("-DSOL_EVENTLOOP_EPOLL")
+elseif (EVENTLOOP STREQUAL "poll")
+    add_definitions("-DSOL_EVENTLOOP_POLL")
+elseif (EVENTLOOP STREQUAL "select")
+    add_definitions("-DSOL_EVENTLOOP_SELECT")
+endif ()
 find_package(OpenSSL REQUIRED)
 
 set(EXECUTABLE_OUTPUT_PATH ${CMAKE_BINARY_DIR})

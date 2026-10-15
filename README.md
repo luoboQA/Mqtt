@@ -100,6 +100,13 @@ $ cmake .
 $ make
 ```
 
+### Event loop backends
+
+The multiplexing backend is picked from the kernel the broker is built for,
+and can be forced at configure time to exercise the other implementations on
+the same machine: `cmake -S . -B build-poll -DEVENTLOOP=poll` (or `select`,
+`epoll`; Linux only). The running backend is printed at startup.
+
 ### Sanitizer builds
 
 ```sh

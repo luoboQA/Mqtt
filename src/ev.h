@@ -103,6 +103,14 @@ struct ev_ctx {
      * callback or the blocking wait: only while the slot is read or written
      */
     pthread_mutex_t lock;
+    /*
+     * Descriptor a loop watches so another thread can pull it out of its
+     * blocking wait: poll() and select() copy the descriptor set on entry, so
+     * a rearm done from the outside is invisible to a wait in progress.
+     * Written to by ev_fire_event() (the backends that need it, see
+     * EV_BACKEND_NEEDS_WAKEUP), drained by the callback watching it
+     */
+    int wakeup;
     void *api; // opaque pointer to platform defined backends
 };
 
