@@ -1,16 +1,22 @@
-[![Build Status](https://travis-ci.org/codepr/sol.svg?branch=master)](https://travis-ci.org/codepr/sol)
-
 Sol
 ===
 
-Oversimplified MQTT broker written from scratch, which mimic mosquitto
-features. Implemented to learning how the protocol works, it supports
-almost all MQTT v3.1.1 commands on linux platform and relies on EPOLL interface
-for multiplexing I/O. The basic development process is documented in this
-[series of posts](https://codepr.github.io/posts/sol-mqtt-broker), referring to
-the [tutorial branch](https://github.com/codepr/sol/tree/tutorial); the master
-branch is the most up-to-date and tested.
-**Not for production use**.
+An oversimplified MQTT broker written from scratch, which mimics mosquitto's
+features. Implemented to learn how the protocol works, it supports almost all
+MQTT v3.1.1 commands on Linux and multiplexes its I/O over epoll (poll and
+select are available too, see below). The basic development process is
+documented in this [series of posts](https://codepr.github.io/posts/sol-mqtt-broker),
+referring to the [tutorial branch](https://github.com/codepr/sol/tree/tutorial);
+this fork keeps the teaching material (guided scripts, a protocol level test
+suite, comments tied to the specification) and adds what a lab or a small
+deployment needs: on disk persistence of the stored state, topic level
+authorization, a memory policy, verified TLS, and sanitizer clean builds.
+
+**Not production ready**, on purpose: what is missing for that is listed under
+[To be implemented](#to-be-implemented), the known deviations from the
+specification are spelled out under [Known
+simplifications](#教学简化--known-simplifications), and none of them is
+hidden behind a promise the code does not keep.
 
                     ┌─────────────────────────────┐
                     │         sol.c (main)        │
@@ -38,13 +44,17 @@ branch is the most up-to-date and tested.
 
 ### Features
 
-It's still a work in progress but it already handles the most of the basic
-features expected from an MQTT broker. It does not leak memory as of now,
-there's probably some corner cases, not deeply investigated yet.
+It is still a work in progress, but it handles most of the features expected
+from an MQTT broker, and the parts of it that are hard to see (memory, threads)
+are checked with address/undefined and thread sanitizers over the whole
+integration suite rather than by eye.
 
 - Configuration file on disk
 - Support for QoS messages 0, 1 and 2
 - Retained messages per topic
+- On disk persistence of the retained messages and of the persistent sessions
+  (their subscriptions and the messages queued for their disconnected
+  clients), snapshotted periodically and on a clean shutdown
 - `max_memory` enforcement: unused topics are reclaimed, the oldest queued
   messages are dropped under pressure and new connections are refused when
   nothing is left to give back (`reclaim_interval` sets the idle interval)
@@ -61,8 +71,9 @@ there's probably some corner cases, not deeply investigated yet.
 - SSL/TLS connections, configuration accepts minimum protocols to be used
 - Logging on disk
 - Daemon mode
-- Multiplexing IO with abstraction over backend, currently supports
-  select/poll/epoll choosing the better implementation.
+- Multiplexing I/O behind an abstraction: epoll, poll and select are all
+  implemented, the default one is picked from the kernel and any of them can be
+  forced at build time (`-DEVENTLOOP=...`), each exercised by the test suite
 - Multithread load-balancing on connections for high concurrent performance
 
 ### To be implemented
@@ -99,7 +110,10 @@ beyond a trusted network still wants, in the order it usually starts to hurt:
   启动时会有一条 warning。
 - **每个会话固定预分配 65536 项的在途表**（`i_msgs`/`i_acks`，约 2MB/会话），
   会话数量很大时内存增长很快。
-- **没有磁盘持久化**：`clean_session=false` 的离线消息只存在于内存里，进程重启即丢。
+- **持久化只覆盖"存储"状态**：保留消息、持久会话的订阅和离线队列会落盘
+  （`persistence_file`），但**不包含**快照那一刻仍在线连接的在途 QoS 1/2 状态、
+  入站 QoS 2 去重集合和遗嘱——这些只对"重启已经拆掉的那条连接"有意义。
+  另外快照是周期性的，硬崩溃（kill -9 / 断电）最多丢一个 `persistence_interval`。
 
 ## Build
 
@@ -114,7 +128,7 @@ The unit tests run as part of the build (`sol_test`), and the integration
 suite comes with the repository:
 
 ```sh
-$ python3 tests/integration/run.py     # starts its own broker, 59 tests
+$ python3 tests/integration/run.py     # starts its own broker, 63 tests
 ```
 
 It covers the protocol (raw packets), the delivery paths, the sessions, the
@@ -193,9 +207,21 @@ log_level DEBUG
 
 log_path /tmp/sol.log
 
-# Max memory to be used, after which the system starts to reclaim memory by
-# freeing older items stored
+# Max memory the broker may hold. Over this limit it acts in three steps,
+# each one logged: it reclaims the topics nothing refers to anymore, then drops
+# the oldest messages queued for the clients that are away, and when even that
+# is not enough it refuses new connections until the memory comes back down
 max_memory 2GB
+
+# Seconds between two reclamations of the unused topics while the broker is
+# under its memory limit (over the limit it reclaims on every check instead)
+# reclaim_interval 60s
+
+# State that must survive a restart: retained messages and persistent sessions
+# are snapshotted here, every persistence_interval seconds when something
+# changed and once more on a clean shutdown. Unset keeps everything in memory
+# persistence_file /tmp/sol.db
+# persistence_interval 30s
 
 # Max memory that will be allocated for each request
 max_request_size 2MB
@@ -215,7 +241,9 @@ stats_publish_interval 10s
 # dropped after one and a half times this value of silence. 0 disables the cap
 # keepalive 60s
 
-# TLS certs paths, cafile act as a flag as well to set TLS/SSL ON
+# TLS certs paths. cafile doubles as the flag turning TLS on, and the server
+# does not ask the clients for a certificate of their own: it is the clients
+# that need the authority to verify this server
 # cafile /etc/sol/certs/ca.crt
 # certfile /etc/sol/certs/cert.crt
 # keyfile /etc/sol/certs/cert.key
@@ -253,9 +281,9 @@ user2:$6$vtHdafhGhxpXwgBa$Y3Etz8koC1YPSYhXpTnhz.2vJTZvCUGk3xUdjyLr9z9XgE8asNwfYD
 
 The broker provides an access through a simple IO multiplexing event-loop based
 TCP server, the model is designed to be self-contained and thus easy to spread
-on multiple threads. Another approach and probably more elegant would be to
-share a single event loop to multiple threads, at the cost of higher complexity
-and race-conditions to be handled.
+on multiple threads: there are `THREADSNR` worker loops plus the one the main
+thread runs, each with an event context and a subset of the connections, and a
+connection stays on the loop that accepted it.
 
 ```
                             THREADS 1..N
@@ -287,7 +315,26 @@ main drawback is that in worst cases a scenario that can originate is where some
 threads are serving heavy-load clients and some others are esentially idling
 without partecipating or helping.
 
+What that costs in practice, and what the code does about it:
+
+- the state that is shared between loops (the topic store, the sessions, the
+  client map) is guarded by a global mutex, always taken before a client's one;
+- a loop can send work to another one (a message for a client living there, a
+  takeover, the keepalive scan) and the periodic tasks all run on the main
+  loop, so they touch every connection;
+- the per loop bookkeeping an outside thread has to touch is either atomic
+  (the counters, `last_seen`, the Keep Alive) or behind a small lock (the
+  monitored descriptor array), and the loops that cannot nudge a blocking wait
+  by themselves (poll, select) watch a wakeup descriptor for that purpose;
+- the whole integration suite is run under ThreadSanitizer
+  (`tests/run_tsan.sh`), which is what found and closed the races listed in the
+  commit history rather than leaving them to be discovered under load.
+
 ## Benchmarks
+
+> The numbers below are the upstream project's, from 2020 and against mosquitto
+> 1.6.8 out of the box. They are kept for context; `tests/stress.py` in this
+> fork is what to use to measure the broker as it is now, on your own machine.
 
 I've run some basic benchmarks comparing Sol and Mosquitto's performance, using
 [mqtt-benchmark](https://github.com/krylovsk/mqtt-benchmark) tool to test
