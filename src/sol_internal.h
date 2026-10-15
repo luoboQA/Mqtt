@@ -241,11 +241,18 @@ struct client {
                              * TLS encrypted communication by using callbacks
                              */
     struct client_session *session; /* The session associated to the client */
-    time_t last_seen; /* The timestamp of the last action performed */
-    unsigned short keepalive; /* Keep Alive seconds taken from the CONNECT
-                               * (MQTT v3.1.1 §3.1.2.10), 0 disables the
-                               * check entirely */
-    bool online;      /* Just an online flag */
+    /*
+     * The timestamp of the last action performed and the Keep Alive of this
+     * connection: written by the loop that owns the client and read by the
+     * keepalive scan running on another one, hence the atomic types (the
+     * thread sanitizer flagged the plain ones as races)
+     */
+    _Atomic time_t last_seen;
+    _Atomic unsigned short keepalive; /* Keep Alive seconds taken from the
+                                       * CONNECT (MQTT v3.1.1 §3.1.2.10), 0
+                                       * disables the check entirely */
+    _Atomic bool online; /* Just an online flag, read by the delivery while
+                            the owner loop may be deactivating the client */
     bool connected;   /* States if the client has already processed a connection
                          packet */
     bool has_lwt; /* States if the connection packet carried a LWT message */

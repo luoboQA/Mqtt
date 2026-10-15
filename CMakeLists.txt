@@ -5,6 +5,7 @@ set (VERSION 0.18.5)
 set (CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 OPTION(DEBUG "add debug flags" OFF)
+OPTION(TSAN "build with ThreadSanitizer" OFF)
 
 add_definitions("-D_DEFAULT_SOURCE")
 find_package(OpenSSL REQUIRED)
@@ -30,14 +31,23 @@ if (APPLE)
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L/opt/homebrew/opt/openssl@3/lib")
 endif (APPLE)
 
-if (DEBUG)
+if (TSAN)
+    # ThreadSanitizer cannot be combined with the address/undefined sanitizers
+    # of the DEBUG build (they are mutually exclusive), and the -pg profiling
+    # instrumentation gets in its way: this is a build of its own
+    message(STATUS "Configuring build for ThreadSanitizer")
+    TARGET_LINK_LIBRARIES(sol pthread ssl crypto crypt)
+    TARGET_LINK_LIBRARIES(sol_test pthread ssl crypto crypt)
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wunused -Werror -pedantic \
+    -Wno-unused-result -std=c11 -ggdb -O1 -fsanitize=thread")
+elseif (DEBUG)
     message(STATUS "Configuring build for debug")
     TARGET_LINK_LIBRARIES(sol pthread ssl crypto crypt)
     TARGET_LINK_LIBRARIES(sol_test pthread ssl crypto crypt)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wunused -Werror -pedantic \
     -Wno-unused-result -std=c11 -ggdb -fsanitize=address \
     -fsanitize=undefined -fno-omit-frame-pointer -pg")
-else (DEBUG)
+else ()
     message(STATUS "Configuring build for production")
 if (APPLE)
     TARGET_LINK_LIBRARIES(sol pthread ssl crypto)
@@ -49,7 +59,7 @@ endif (APPLE)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wunused -Werror -pedantic \
     -Wno-unused-result -std=c11 -O3")
 
-endif (DEBUG)
+endif ()
 
 add_custom_command(
     TARGET sol_test

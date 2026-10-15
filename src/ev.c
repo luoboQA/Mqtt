@@ -722,7 +722,19 @@ static int ev_process_event(struct ev_ctx *ctx, int idx, int mask)
 {
     if (mask == EV_NONE)
         return EV_OK;
+
+    /*
+     * The slot is copied out under the lock: another loop may be rewriting it
+     * right now (it fires an event at a client living here), and the
+     * callbacks themselves are invoked with the lock released, they call back
+     * into this module (a rearm, another fire) and would deadlock
+     */
+    pthread_mutex_lock(&ctx->lock);
     struct ev *e = ev_api_fetch_event(ctx, idx, mask);
+    struct ev snapshot = *e;
+    pthread_mutex_unlock(&ctx->lock);
+    e = &snapshot;
+
     int err = 0, fired = 0, fd = e->fd;
     if (mask & EV_CLOSEFD) {
         /*
@@ -805,6 +817,7 @@ static void ev_add_monitored(struct ev_ctx *ctx, int fd, int mask,
                              void (*callback)(struct ev_ctx *, void *),
                              void *ptr)
 {
+    pthread_mutex_lock(&ctx->lock);
     /*
      * Grow the monitored array when the descriptor does not fit. The check
      * has to be `>=`: the array holds monitored_nr slots, indexed 0 ..
@@ -844,6 +857,7 @@ static void ev_add_monitored(struct ev_ctx *ctx, int fd, int mask,
         ctx->events_monitored[fd].wdata     = ptr;
         ctx->events_monitored[fd].wcallback = callback;
     }
+    pthread_mutex_unlock(&ctx->lock);
 }
 
 static inline int ev_get_event_type(struct ev_ctx *ctx, int idx)
@@ -856,6 +870,7 @@ int ev_init(struct ev_ctx *ctx, int events_nr)
     int err = ev_api_init(ctx, events_nr);
     if (err < 0)
         return err;
+    pthread_mutex_init(&ctx->lock, NULL);
     ctx->stop             = 0;
     ctx->fired_events     = 0;
     ctx->maxevents        = events_nr;
@@ -867,6 +882,8 @@ int ev_init(struct ev_ctx *ctx, int events_nr)
 
 void ev_destroy(struct ev_ctx *ctx)
 {
+    /* No other loop can reach this context anymore: the caller joins every
+       thread before destroying them (see start_server) */
     /*
      * Walk the whole capacity of the array: maxevents only tracks the highest
      * descriptor ever registered and would leave the last slot unvisited
@@ -876,6 +893,7 @@ void ev_destroy(struct ev_ctx *ctx)
             ctx->events_monitored[i].mask != EV_NONE)
             ev_del_fd(ctx, ctx->events_monitored[i].fd);
     }
+    pthread_mutex_destroy(&ctx->lock);
     free_memory(ctx->events_monitored);
     ctx->events_monitored = NULL;
     ctx->monitored_nr     = 0;
@@ -908,7 +926,9 @@ int ev_run(struct ev_ctx *ctx)
             break;
         }
         for (int i = 0; i < n; ++i) {
+            pthread_mutex_lock(&ctx->lock);
             events = ev_get_event_type(ctx, i);
+            pthread_mutex_unlock(&ctx->lock);
             ctx->fired_events += ev_process_event(ctx, i, events);
         }
     }
@@ -928,8 +948,11 @@ int ev_del_fd(struct ev_ctx *ctx, int fd)
     /* A descriptor beyond the array was never registered: nothing to clear */
     if (fd < 0 || fd >= ctx->monitored_nr)
         return ev_api_del_fd(ctx, fd);
+
+    pthread_mutex_lock(&ctx->lock);
     memset(ctx->events_monitored + fd, 0x00, sizeof(struct ev));
     ctx->events_monitored[fd].fd = -1;
+    pthread_mutex_unlock(&ctx->lock);
     return ev_api_del_fd(ctx, fd);
 }
 

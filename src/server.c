@@ -51,8 +51,24 @@ pthread_mutex_t mutex;
  */
 struct listen_payload {
     int fd;
-    atomic_bool cronjobs;
+    bool cronjobs;
+    /*
+     * Slot this loop owns in the `loops` array below. Every thread gets a
+     * payload of its own: they used to share one struct, and a worker could
+     * read `cronjobs` after the main thread had already set it, registering a
+     * second (and third) copy of every periodic task
+     */
+    int index;
 };
+
+/*
+ * The event contexts of every loop, filled in when each thread starts and
+ * disposed of once every thread has left its own (see eventloop_start and the
+ * end of start_server): a loop that is stopping can still be the target of
+ * another one (a delivery, a takeover), so nothing may be released until all
+ * of them are done
+ */
+static struct ev_ctx *loops[THREADSNR + 1];
 
 /* Seconds in a Sol, easter egg */
 static const double SOL_SECONDS = 88775.24;
@@ -1570,9 +1586,10 @@ static void stop_handler(struct ev_ctx *ctx, void *arg)
 static void eventloop_start(void *args)
 {
     struct listen_payload *loop_data = args;
-    struct ev_ctx ctx;
-    int sfd = loop_data->fd;
-    ev_init(&ctx, EVENTLOOP_MAX_EVENTS);
+    struct ev_ctx *ctx               = try_alloc(sizeof(*ctx));
+    int sfd                          = loop_data->fd;
+    loops[loop_data->index]          = ctx;
+    ev_init(ctx, EVENTLOOP_MAX_EVENTS);
     /*
      * Register the shared run descriptor: on Linux it is the eventfd, on
      * other platforms the *read* end of the pipe (index 0). The write end
@@ -1581,26 +1598,36 @@ static void eventloop_start(void *args)
      * the shutdown event never arrived and the broker had to be killed
      */
 #ifdef __linux__
-    ev_register_event(&ctx, conf->run, EV_CLOSEFD | EV_READ, stop_handler,
+    ev_register_event(ctx, conf->run, EV_CLOSEFD | EV_READ, stop_handler,
                       NULL);
 #else
-    ev_register_event(&ctx, conf->run[0], EV_CLOSEFD | EV_READ, stop_handler,
+    ev_register_event(ctx, conf->run[0], EV_CLOSEFD | EV_READ, stop_handler,
                       NULL);
 #endif
     // Register listening FD with accept callback
-    ev_register_event(&ctx, sfd, EV_READ, accept_callback, &sfd);
-    // Register periodic tasks
+    ev_register_event(ctx, sfd, EV_READ, accept_callback, &sfd);
+    /*
+     * Periodic tasks run on one loop only, the one start_server() starts on
+     * its own thread: every thread has its own payload now, so a worker can
+     * no longer catch a flag the main thread set after starting it
+     */
     if (loop_data->cronjobs == true) {
-        ev_register_cron(&ctx, publish_stats, NULL, conf->stats_pub_interval,
+        ev_register_cron(ctx, publish_stats, NULL, conf->stats_pub_interval,
                          0);
-        ev_register_cron(&ctx, inflight_msg_check, NULL, 1, 0);
-        ev_register_cron(&ctx, keepalive_check, NULL, 1, 0);
-        ev_register_cron(&ctx, persistence_check, NULL, 1, 0);
-        ev_register_cron(&ctx, memory_check, NULL, 1, 0);
+        ev_register_cron(ctx, inflight_msg_check, NULL, 1, 0);
+        ev_register_cron(ctx, keepalive_check, NULL, 1, 0);
+        ev_register_cron(ctx, persistence_check, NULL, 1, 0);
+        ev_register_cron(ctx, memory_check, NULL, 1, 0);
     }
     // Start the loop, blocking call
-    ev_run(&ctx);
-    ev_destroy(&ctx);
+    ev_run(ctx);
+    /*
+     * The context is deliberately *not* destroyed here: another loop may
+     * still be about to fire an event at it (a delivery to one of its
+     * clients, a takeover), and walking a freed array is exactly the
+     * use-after-free the sanitizer found at shutdown. start_server() disposes
+     * of every context once all the loops have returned
+     */
 }
 
 /*
@@ -1694,23 +1721,39 @@ int start_server(const char *addr, const char *port)
     log_info("Server start");
     info.start_time                  = time(NULL);
 
-    struct listen_payload loop_start = {sfd, ATOMIC_VAR_INIT(false)};
+    struct listen_payload main_loop = {.fd = sfd, .cronjobs = true,
+                                       .index = THREADSNR};
 
 #if THREADSNR > 0
     pthread_t thrs[THREADSNR];
+    /* One payload per thread, alive until the joins below */
+    struct listen_payload worker_loops[THREADSNR];
     for (int i = 0; i < THREADSNR; ++i) {
+        worker_loops[i] = (struct listen_payload){.fd = sfd, .cronjobs = false,
+                                                  .index = i};
         pthread_create(&thrs[i], NULL, (void *(*)(void *)) & eventloop_start,
-                       &loop_start);
+                       &worker_loops[i]);
     }
 #endif
-    loop_start.cronjobs = true;
     // start eventloop, could be spread on multiple threads
-    eventloop_start(&loop_start);
+    eventloop_start(&main_loop);
 
 #if THREADSNR > 0
     for (int i = 0; i < THREADSNR; ++i)
         pthread_join(thrs[i], NULL);
 #endif
+
+    /*
+     * Every loop has returned by now, so no other thread can reach these
+     * contexts anymore: this is the point where they can be released
+     */
+    for (int i = 0; i <= THREADSNR; ++i) {
+        if (!loops[i])
+            continue;
+        ev_destroy(loops[i]);
+        free_memory(loops[i]);
+        loops[i] = NULL;
+    }
 
     /*
      * Final snapshot, catching whatever the last periodic run did not: every

@@ -100,6 +100,18 @@ $ cmake .
 $ make
 ```
 
+### Sanitizer builds
+
+```sh
+$ cmake -S . -B build-asan -DDEBUG=ON && make -C build-asan sol   # ASan + UBSan
+$ cmake -S . -B build-tsan -DTSAN=ON && make -C build-tsan sol   # TSan
+```
+
+Both sanitizers are meant to be exercised through the integration suite: run it
+with the sanitized binary in place of `./sol`. The ThreadSanitizer one needs
+the address space randomization disabled (it refuses to start otherwise on
+recent kernels), which `tests/run_tsan.sh` takes care of.
+
 ## Quickstart play
 
 The broker can be tested using `mosquitto_sub` and `mosquitto_pub` or with

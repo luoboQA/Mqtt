@@ -28,6 +28,7 @@
 #ifndef EV_H
 #define EV_H
 
+#include <pthread.h>
 #include <time.h>
 
 #define EV_OK  0
@@ -93,6 +94,15 @@ struct ev_ctx {
     int monitored_nr;
     unsigned long long fired_events;
     struct ev *events_monitored;
+    /*
+     * Guards the monitored array above. The loop that owns this context reads
+     * it while dispatching, and other loops write to it (a publish towards a
+     * client living here, a takeover, the keepalive scan fire an event at
+     * it), which the thread sanitizer flags as a data race on the callback
+     * pointers and on the reallocation of the array. Never held across a
+     * callback or the blocking wait: only while the slot is read or written
+     */
+    pthread_mutex_t lock;
     void *api; // opaque pointer to platform defined backends
 };
 
