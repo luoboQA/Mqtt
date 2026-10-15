@@ -55,6 +55,9 @@ there's probably some corner cases, not deeply investigated yet.
 - Support multiple topics subscriptions through wildcard (#) and (+) for single
   level wildcard e.g. foo/+/bar/#
 - Authentication through username and password
+- Topic level authorization through an access control file (`acl_file`):
+  per client or per user rules of `read`/`write`/`readwrite` over topic
+  filters, evaluated in order, deny by default
 - SSL/TLS connections, configuration accepts minimum protocols to be used
 - Logging on disk
 - Daemon mode
@@ -171,6 +174,11 @@ stats_publish_interval 10s
 # Authentication
 # allow_anonymous false
 # password_file /etc/sol/passwd
+
+# Access control list, one rule per line:
+#   <allow|deny> <read|write|readwrite> <client:id|user:name|*> <topic filter>
+# evaluated in order, a topic no rule covers is denied
+# acl_file /etc/sol/sol.acl
 
 # TLS protocols, supported versions should be listed comma separated
 # example:

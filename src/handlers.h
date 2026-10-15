@@ -79,4 +79,10 @@ void publish_lwt(struct mqtt_packet *);
 
 int handle_command(unsigned, struct io_event *);
 
+/*
+ * Does a topic name match a filter, with the same wildcard rules a
+ * subscription follows? Used by the access control list
+ */
+bool topic_access_match(const char *topic, const char *filter);
+
 #endif

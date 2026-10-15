@@ -26,6 +26,7 @@
  */
 
 #include "server.h"
+#include "acl.h"
 #include "config.h"
 #include "ev.h"
 #include "handlers.h"
@@ -714,6 +715,7 @@ static void client_init(struct client *client)
     client->connected     = false;
     client->clean_session = true;
     client->client_id[0]  = '\0';
+    client->username[0]   = '\0';
     client->status        = WAITING_HEADER;
     client->rc            = 0;
     client->rpos          = ATOMIC_VAR_INIT(0);
@@ -1653,6 +1655,13 @@ int start_server(const char *addr, const char *port)
     }
 
     /*
+     * Topic level authorization: an access control list is read before the
+     * listening socket exists, so no client can be served before the rules
+     * are in place
+     */
+    acl_load(conf->acl_file);
+
+    /*
      * Rebuild what a previous run left behind: the retained messages and the
      * persistent sessions. This happens before the listening socket exists,
      * so no client can race it, and persistence_load() takes no lock for the
@@ -1712,6 +1721,7 @@ int start_server(const char *addr, const char *port)
 
     close(sfd);
     AUTH_DESTROY(server.auths);
+    acl_destroy();
     topic_store_destroy(server.store);
 
     /* Destroy SSL context, if any present */

@@ -26,6 +26,7 @@
  */
 
 #include "handlers.h"
+#include "acl.h"
 #include "config.h"
 #include "logging.h"
 #include "memory.h"
@@ -917,6 +918,26 @@ static int connect_handler(struct io_event *e)
      * connected, kick him out accordingly to the MQTT v3.1.1 specs.
      */
     snprintf(cc->client_id, MQTT_CLIENT_ID_LEN, "%s", c->payload.client_id);
+    /*
+     * Keep the username for the access control list: rules can name a user
+     * instead of a client id, and the CONNECT payload is gone by the time the
+     * first SUBSCRIBE or PUBLISH has to be checked
+     */
+    if (c->bits.username == 1 && c->payload.username)
+        snprintf(cc->username, MQTT_CLIENT_ID_LEN, "%s", c->payload.username);
+
+    /*
+     * The will is a publication the broker makes on the client's behalf, so
+     * it needs the same permission a PUBLISH would: a client that cannot
+     * write a topic must not be able to write it through its will either
+     */
+    if (c->bits.will &&
+        !acl_check(cc->client_id, cc->username,
+                   (const char *)c->payload.will_topic, ACL_WRITE)) {
+        log_warning("ACL: %s is not allowed to publish its will to %s",
+                    cc->client_id, c->payload.will_topic);
+        goto not_authorized;
+    }
 
     /*
      * Will of the connection this one is about to take over, if any: it is
@@ -1146,6 +1167,15 @@ bad_auth:
     cc->close_after_write = true;
 
     return MQTT_BAD_USERNAME_OR_PASSWORD;
+
+not_authorized:
+    log_debug("Sending CONNACK to %s (%u, %u)",
+              cc->client_id[0] ? cc->client_id : "unknown", session_present,
+              MQTT_NOT_AUTHORIZED);
+    set_connack(cc, MQTT_NOT_AUTHORIZED, session_present);
+    /* Same §3.2.2.3 rule as above: flush then close */
+    cc->close_after_write = true;
+    return MQTT_NOT_AUTHORIZED;
 
 id_rejected:
     log_debug("Sending CONNACK to %s (%u, %u)",
@@ -1410,6 +1440,35 @@ bool session_subscribe(struct client_session *session, const char *filter,
 }
 
 /*
+ * Does a topic name match a filter? Used by the access control list, which
+ * speaks the same wildcard language a SUBSCRIBE does: the name and the filter
+ * are normalized the way the store keys them and matched with the very rules
+ * a subscription follows
+ */
+bool topic_access_match(const char *topic, const char *filter)
+{
+    if (!topic || !filter)
+        return false;
+
+    size_t tlen = strlen(topic);
+    char *name  = try_alloc(tlen + 2);
+    if (tlen > 0 && topic[tlen - 1] == '/')
+        snprintf(name, tlen + 1, "%s", topic);
+    else
+        snprintf(name, tlen + 2, "%s/", topic);
+
+    size_t flen   = strlen(filter);
+    char *pattern = try_alloc(flen + 2);
+    snprintf(pattern, flen + 1, "%s", filter);
+    bool multilevel = normalize_filter(pattern, filter);
+
+    bool match = match_subscription(name, pattern, multilevel) == SOL_OK;
+    free_memory(name);
+    free_memory(pattern);
+    return match;
+}
+
+/*
  * Argument passed to retained_collect while scanning the whole topic store
  */
 struct retained_collection {
@@ -1474,6 +1533,19 @@ static int subscribe_handler(struct io_event *e)
                                 s->tuples[i].topic_len)) {
             log_warning("Rejecting malformed topic filter from %s",
                         c->client_id);
+            rcs[i] = MQTT_SUBACK_FAILURE;
+            continue;
+        }
+
+        /*
+         * A subscription the access control list does not allow is answered
+         * with the failure code of §3.8.4, like a malformed filter: the rest
+         * of the packet is served normally
+         */
+        if (!acl_check(c->client_id, c->username,
+                       (const char *)s->tuples[i].topic, ACL_READ)) {
+            log_warning("ACL: %s is not allowed to subscribe to %s",
+                        c->client_id, s->tuples[i].topic);
             rcs[i] = MQTT_SUBACK_FAILURE;
             continue;
         }
@@ -1892,6 +1964,19 @@ static int publish_handler(struct io_event *e)
     else
         snprintf(topic, p->topiclen + 1, "%s", (const char *)p->topic);
 
+    /*
+     * MQTT has no way to refuse a PUBLISH: a topic the access control list
+     * does not allow is dropped here, and the acknowledgement still flows so
+     * the client is not left retransmitting it forever. The client sees a
+     * publish that went through and reached nobody
+     */
+    if (!acl_check(c->client_id, c->username, (const char *)p->topic,
+                   ACL_WRITE)) {
+        log_warning("ACL: %s is not allowed to publish to %s, message dropped",
+                    c->client_id, p->topic);
+        goto ack_only;
+    }
+
 #if THREADSNR > 0
     pthread_mutex_lock(&mutex);
     pthread_mutex_lock(&c->mutex);
@@ -1953,6 +2038,7 @@ static int publish_handler(struct io_event *e)
     if (publish_message(pkt, t) == 0)
         DECREF(pkt, struct mqtt_packet);
 
+ack_only:
     // We have to answer to the publisher
     if (qos == AT_MOST_ONCE)
         goto exit;

@@ -136,6 +136,12 @@ struct config {
     /* File path on the filesystem pointing to the password_file */
     char password_file[0xFFF];
     /*
+     * File holding the topic level authorization rules. Empty (the default)
+     * leaves the broker without an access control list: every authenticated
+     * client may read and write every topic
+     */
+    char acl_file[0xFFF];
+    /*
      * File the broker snapshots its stored state to (the retained messages
      * and the persistent sessions with their queued messages). An empty path
      * disables persistence entirely, which is the default

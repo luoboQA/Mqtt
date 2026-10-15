@@ -234,6 +234,9 @@ struct client {
     unsigned char *wbuf;            /* The writing buffer */
     char client_id[MQTT_CLIENT_ID_LEN]; /* The client ID according to MQTT specs
                                          */
+    char username[MQTT_CLIENT_ID_LEN]; /* The username the CONNECT carried,
+                                          empty when it did not: the access
+                                          control list matches rules on it */
     struct connection conn; /* A connection structure, takes care of plain or
                              * TLS encrypted communication by using callbacks
                              */
