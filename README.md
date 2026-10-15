@@ -67,8 +67,16 @@ there's probably some corner cases, not deeply investigated yet.
 
 ### To be implemented
 
-- Persistence on disk for inflight messages on disconnected clients
-- Check on max memory used
+The two entries that used to sit here (persistence of the state of a
+disconnected client, and enforcing `max_memory`) are done. What a deployment
+beyond a trusted network still wants, in the order it usually starts to hurt:
+
+- a write ahead log (or an fsync'd append) for the persistence, which is a
+  periodic snapshot today: a hard crash costs up to one interval;
+- operability: a pid file, log rotation, a configuration reload, metrics
+  beyond the `$SOL` feed;
+- the scale limits stay what they are: one process, and roughly 2MB of tables
+  pre-allocated per session.
 
 ### Maybe
 
