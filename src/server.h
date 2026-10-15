@@ -122,6 +122,12 @@ struct server {
     struct client_session *sessions;
     // UTHASH handle pointer for authentications
     struct authentication *auths;
+    /*
+     * Set while the broker is over its max_memory and has nothing left to
+     * give back: new connections are refused until it drops again. Written
+     * by the memory_check() periodic task, read on every accept
+     */
+    volatile atomic_bool over_memory;
     // Application TLS context
     SSL_CTX *ssl_ctx;
 };
@@ -150,7 +156,17 @@ void enqueue_event_write(const struct client *);
  * server mutex, `keep` is the connection taking the id over (skipped if it
  * somehow matches the registered one)
  */
-void server_kick_duplicate(const char *, const struct client *);
+/*
+ * Disconnect the client currently holding `client_id`, if any, as MQTT
+ * v3.1.1 §3.1.4-2 requires when a second connection takes that id over.
+ * When the victim had a will, a deep copy of it is left in `will`: its
+ * connection is closed by the server without a DISCONNECT, so §3.1.2.5 wants
+ * it published. The caller owns the copy and releases it with
+ * mqtt_packet_destroy() (publish_lwt() takes the global mutex, which the
+ * caller holds here, so the delivery has to happen after unlocking)
+ */
+void server_kick_duplicate(const char *, const struct client *,
+                           struct mqtt_packet *will);
 
 /*
  * Make the entire process a daemon running in background

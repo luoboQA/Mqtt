@@ -45,6 +45,9 @@ there's probably some corner cases, not deeply investigated yet.
 - Configuration file on disk
 - Support for QoS messages 0, 1 and 2
 - Retained messages per topic
+- `max_memory` enforcement: unused topics are reclaimed, the oldest queued
+  messages are dropped under pressure and new connections are refused when
+  nothing is left to give back (`reclaim_interval` sets the idle interval)
 - Session present check and handling
 - Last Will & Testament, delivered on any disconnection that is not a clean
   DISCONNECT (network error, protocol error, keepalive expiry)
@@ -79,8 +82,10 @@ there's probably some corner cases, not deeply investigated yet.
 - **`$` 开头的主题可以发布**：`$SOL/...` 只是命名约定，broker 不拦客户端发布。订阅侧
   已按 §4.7.2 处理：`#`/`+` 开头的过滤器不匹配 `$` 开头的主题，必须显式订阅
   `$SOL/#`（见 `examples/stats_demo.py`）。
-- **`max_memory` 配置目前不生效**：解析了但没有回收逻辑（见 "To be implemented"）。
-  同理，空主题（无订阅者、无保留消息）不会从主题树里清理。
+- **`max_memory` 是三级策略而不是硬上限**：超限时依次"回收空主题 → 丢弃最旧的离线
+  队列消息 → 拒绝新连接"，每一步都会打日志。低于进程基线（约 50MB，主要是客户端
+  内存池与每条连接 2×`max_request_size` 的缓冲）的限额会让 broker 一开始就拒收连接，
+  启动时会有一条 warning。
 - **每个会话固定预分配 65536 项的在途表**（`i_msgs`/`i_acks`，约 2MB/会话），
   会话数量很大时内存增长很快。
 - **没有磁盘持久化**：`clean_session=false` 的离线消息只存在于内存里，进程重启即丢。

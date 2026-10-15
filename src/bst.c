@@ -209,8 +209,18 @@ struct bst_node *bst_delete(struct bst_node *node, unsigned char key)
                 *node = *tmp;
             free_memory(tmp);
         } else {
+            /*
+             * Two children: the in-order successor takes this node's place,
+             * and it takes *everything* it carries. Copying the key alone
+             * left the payload of the deleted entry on a node that is about
+             * to be removed, with the successor's payload stranded on the
+             * node now answering to the successor's key: the trie above uses
+             * this to reach its children by character, and the mix-up made it
+             * walk into nodes that had just been freed
+             */
             struct bst_node *tmp = bst_min(node->right);
             node->key            = tmp->key;
+            node->data           = tmp->data;
             node->right          = bst_delete(node->right, tmp->key);
         }
     }

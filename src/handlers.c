@@ -30,6 +30,7 @@
 #include "logging.h"
 #include "memory.h"
 #include "mqtt.h"
+#include "persistence.h"
 #include "server.h"
 #include "sol_internal.h"
 #include <stdio.h>
@@ -63,6 +64,9 @@ static void session_init(struct client_session *, const char *);
 /* Keep the session list of the topics it holds a subscriber entry on in sync */
 static void session_track_topic(struct client_session *, struct topic *);
 static void session_untrack_topic(struct client_session *, struct topic *);
+
+/* Drop the first nodes of a list without touching the data they point to */
+static void list_drop_prefix(List *, unsigned long);
 
 static struct client_session *client_session_alloc(const char *);
 
@@ -115,12 +119,7 @@ static struct mqtt_packet *mqtt_publish_copy(const struct mqtt_packet *src)
 {
     struct mqtt_packet *copy = mqtt_packet_alloc(src->header.byte);
 
-    copy->publish = (struct mqtt_publish){
-        .pkt_id     = 0,
-        .topiclen   = src->publish.topiclen,
-        .topic      = dup_bytes(src->publish.topic, src->publish.topiclen),
-        .payloadlen = src->publish.payloadlen,
-        .payload    = dup_bytes(src->publish.payload, src->publish.payloadlen)};
+    mqtt_packet_copy(copy, src);
     /* The caller owns the copy from here on */
     INCREF(copy, struct mqtt_packet);
     return copy;
@@ -163,7 +162,12 @@ static void session_free(const struct ref *refcount)
     struct client_session *session =
         container_of(refcount, struct client_session, refcount);
     list_destroy(session->subscriptions, 0);
-    list_destroy(session->outgoing_msgs, 0);
+    /*
+     * Deep: the queue nodes hold struct queued_msg wrappers allocated here,
+     * while the packets themselves are released by the loop below (their
+     * reference belongs to the inflight entries, not to the queue)
+     */
+    list_destroy(session->outgoing_msgs, 1);
     /*
      * Release the packets still awaiting an acknowledgement: the pending
      * list mirrors the i_msgs table, so there is no need to walk all 65535
@@ -186,6 +190,8 @@ static void session_free(const struct ref *refcount)
      */
     mqtt_packet_destroy(&session->lwt_msg);
     free_memory(session);
+    /* A session that goes away is a record the file must not keep */
+    persistence_mark_dirty();
 }
 
 static void session_init(struct client_session *session, const char *session_id)
@@ -213,6 +219,22 @@ static struct client_session *client_session_alloc(const char *session_id)
 {
     struct client_session *session = try_alloc(sizeof(*session));
     session_init(session, session_id);
+    return session;
+}
+
+/*
+ * Create a persistent session and register it in the server map: the entry
+ * point the persistence loader uses to rebuild a session it read back from
+ * disk. It runs before the event loops exist, so it takes no lock, and the
+ * session starts exactly like the one a clean_session=false CONNECT leaves
+ * behind when its client disconnects
+ */
+struct client_session *session_restore(const char *session_id)
+{
+    struct client_session *session = client_session_alloc(session_id);
+    session->clean_session         = false;
+    INCREF(session, struct client_session);
+    HASH_ADD_STR(server.sessions, session_id, session);
     return session;
 }
 
@@ -323,6 +345,98 @@ static inline void inflight_msg_init(struct inflight_msg *imsg,
     imsg->seen   = time(NULL);
     imsg->packet = p;
     imsg->qos    = p->header.bits.qos;
+}
+
+/*
+ * Queue a message for a session that is not connected: the queue entry keeps
+ * the packet pointer and the identifier it was given, the inflight entry owns
+ * the reference that keeps the packet alive and the pending list is kept in
+ * sync. Deliberately leaves i_acks alone: that table holds the PUBREL pending
+ * state of a QoS 2 delivery, arming it for a plain PUBLISH leaked a PUBREL
+ * into every QoS 1 flow
+ */
+static void queue_offline_msg(struct client_session *s, struct mqtt_packet *pkt,
+                              u16 mid)
+{
+    struct queued_msg *qm = try_alloc(sizeof(*qm));
+    /*
+     * The identifier travels with the entry and has to be in the packet too:
+     * it is what the reconnect packs into the replayed PUBLISH
+     */
+    pkt->publish.pkt_id = mid;
+    qm->packet          = pkt;
+    qm->mid             = mid;
+    /* Appended at the back, drained in order on reconnect */
+    list_push_back(s->outgoing_msgs, qm);
+    inflight_msg_init(&s->i_msgs[mid], pkt);
+    inflight_track_mid(s, mid);
+    ++s->inflights;
+    persistence_mark_dirty();
+}
+
+/*
+ * Queue a message for a disconnected session, the entry point the
+ * persistence loader uses to put back the messages it read from disk: the
+ * packet is built here (it owns its copies of the topic and of the payload)
+ * and takes an identifier of its own, one the reconnect will replay it with
+ */
+void session_queue_message(struct client_session *s, const char *topic,
+                           unsigned char qos, const unsigned char *payload,
+                           size_t len)
+{
+    if (!s || !topic)
+        return;
+
+    unsigned short mid = next_free_mid(s);
+    if (mid == 0) {
+        log_warning("No free packet identifier for %s, dropping a restored "
+                    "message",
+                    s->session_id);
+        return;
+    }
+
+    struct mqtt_packet *pkt = mqtt_packet_alloc(PUBLISH_B);
+    pkt->header.bits.qos    = qos;
+    pkt->publish            = (struct mqtt_publish){
+        .topiclen   = strlen(topic),
+        .topic      = dup_bytes((const unsigned char *)topic, strlen(topic)),
+        .payloadlen = len,
+        .payload    = dup_bytes(payload, len)};
+    /* Owned by the inflight entry the queue call below fills in */
+    INCREF(pkt, struct mqtt_packet);
+    queue_offline_msg(s, pkt, (u16)mid);
+}
+
+/*
+ * Drop the oldest message queued for a disconnected session: what the
+ * max_memory policy does to give memory back. The packet is released through
+ * the inflight entry that owns it, the identifier is dropped from the pending
+ * list so the retransmission scan never sends a message that does not exist
+ * anymore, and the queue slot goes away. False when there is nothing left to
+ * drop
+ */
+bool session_drop_oldest_queued(struct client_session *s)
+{
+    if (!s || !s->outgoing_msgs || !s->outgoing_msgs->head)
+        return false;
+
+    struct queued_msg *qm = s->outgoing_msgs->head->data;
+    if (qm && qm->packet) {
+        struct inflight_msg *imsg = &s->i_msgs[qm->mid];
+        if (imsg->packet) {
+            inflight_msg_clear(imsg);
+            imsg->packet = NULL;
+        }
+        s->i_acks[qm->mid] = -1;
+    }
+    if (s->inflights > 0)
+        --s->inflights;
+    if (qm)
+        inflight_untrack_mid(s, qm->mid);
+    /* Releases the queue node and its wrapper, not the packet */
+    list_drop_prefix(s->outgoing_msgs, 1);
+    persistence_mark_dirty();
+    return true;
 }
 
 /*
@@ -483,25 +597,13 @@ int publish_message(struct mqtt_packet *pkt, const struct topic *t)
                 if (s->clean_session == false) {
                     /*
                      * One single reference, owned by the inflight entry: the
-                     * outgoing queue only borrows the pointer and is cleared
-                     * without releasing anything when the session flushes it.
-                     * Appended at the back, not pushed on the head: the queue
-                     * is drained in list order on reconnect, so pushing would
-                     * hand the messages of a session back in reverse order
+                     * queue entry only borrows the pointer and is dropped
+                     * without releasing anything when the session flushes it
                      */
                     INCREF(pkt, struct mqtt_packet);
-                    list_push_back(s->outgoing_msgs, pkt);
-                    inflight_msg_init(&s->i_msgs[mid], pkt);
-                    /*
-                     * No i_acks entry here: that table holds the PUBREL
-                     * pending state of a QoS 2 message (armed by PUBREC),
-                     * setting it for a plain PUBLISH made the
-                     * retransmission scan send a PUBREL for a QoS 1
-                     * message, a packet that has no meaning there
-                     */
-                    inflight_track_mid(s, mid);
-                    ++s->inflights;
+                    queue_offline_msg(s, pkt, (u16)mid);
                     all_at_most_once = false;
+                    persistence_mark_dirty();
                 }
                 continue;
             }
@@ -667,9 +769,10 @@ static inline int match_subscription(const char *topic, const char *wtopic,
  */
 
 /*
- * Drop the first `n` nodes of a list without touching their data: used to
- * forget the queue entries just flushed into the write buffer, the packets
- * themselves stay owned by the session's inflight table until acknowledged
+ * Drop the first `n` entries of the offline queue: both the list nodes and
+ * the struct queued_msg wrappers they hold are released. The packets are left
+ * alone on purpose, they stay owned by the session's inflight table until the
+ * subscriber acknowledges them
  */
 static void list_drop_prefix(List *l, unsigned long n)
 {
@@ -679,6 +782,7 @@ static void list_drop_prefix(List *l, unsigned long n)
         if (!l->head)
             l->tail = NULL;
         l->len--;
+        free_memory(node->data);
         free_memory(node);
     }
 }
@@ -733,7 +837,8 @@ static void set_connack(struct client *c, unsigned char rc, unsigned sp)
         unsigned long packed = 0;
         list_foreach(item, c->session->outgoing_msgs)
         {
-            size_t len = mqtt_size(item->data, NULL);
+            struct queued_msg *qm = item->data;
+            size_t len            = mqtt_size(qm->packet, NULL);
             /*
              * Stop at the first message that no longer fits the write
              * buffer: it stays in the queue with its packet id still
@@ -744,7 +849,7 @@ static void set_connack(struct client *c, unsigned char rc, unsigned sp)
              */
             if (c->towrite + len > conf->max_request_size)
                 break;
-            mqtt_pack(item->data, c->wbuf + c->towrite);
+            mqtt_pack(qm->packet, c->wbuf + c->towrite);
             c->towrite += len;
             ++packed;
         }
@@ -813,6 +918,13 @@ static int connect_handler(struct io_event *e)
      */
     snprintf(cc->client_id, MQTT_CLIENT_ID_LEN, "%s", c->payload.client_id);
 
+    /*
+     * Will of the connection this one is about to take over, if any: it is
+     * copied under the lock (the victim's session is still reachable there)
+     * and published right after, once the global mutex is released
+     */
+    struct mqtt_packet kicked_will = {0};
+
 #if THREADSNR > 0
     pthread_mutex_lock(&mutex);
 #endif
@@ -821,7 +933,7 @@ static int connect_handler(struct io_event *e)
      * connection the server must disconnect the older one. Done before the
      * session lookup so the state below is the one left by the kick
      */
-    server_kick_duplicate(cc->client_id, cc);
+    server_kick_duplicate(cc->client_id, cc, &kicked_will);
 
     // First we check if a session is present
     HASH_FIND_STR(server.sessions, cc->client_id, cc->session);
@@ -885,6 +997,21 @@ static int connect_handler(struct io_event *e)
 #if THREADSNR > 0
     pthread_mutex_unlock(&mutex);
 #endif
+
+    /*
+     * §3.1.2.5: the connection taken over above was closed by the server
+     * without a DISCONNECT, so the will it had registered goes out now, and
+     * it goes out *before* the will of this new connection replaces it in
+     * the session. publish_lwt() takes the global mutex itself, which is why
+     * this happens here and not inside the critical section
+     */
+    if (kicked_will.publish.topic) {
+        log_info("Delivering the will of the taken over connection (%s)",
+                 kicked_will.publish.topic);
+        publish_lwt(&kicked_will);
+        /* The packet owns its strings, the struct itself is on this stack */
+        mqtt_packet_destroy(&kicked_will);
+    }
 
     // Add LWT topic and message if present
     if (c->bits.will) {
@@ -982,6 +1109,7 @@ static int connect_handler(struct io_event *e)
                  * of storing an empty one (§3.3.1.3) */
                 if (msg_len > 0)
                     t->retained = mqtt_publish_copy(&cc->session->lwt_msg);
+                persistence_mark_dirty();
 #if THREADSNR > 0
                 pthread_mutex_unlock(&mutex);
 #endif
@@ -1165,6 +1293,123 @@ static bool valid_topic_filter(const char *f, size_t len)
 }
 
 /*
+ * Register one topic filter for a session: validation, normalization and the
+ * whole store dance (the '+' filters land in the wildcard index, a trailing
+ * "/#" is stripped to its prefix and flagged multilevel, an exact filter gets
+ * its subscriber entry on the node). It is the very body of a SUBSCRIBE
+ * tuple, shared with the persistence loader so a session rebuilt from disk
+ * ends up registered exactly like one that subscribed over the wire. The
+ * caller must hold the global mutex; false means the filter is malformed
+ */
+bool session_subscribe(struct client_session *session, const char *filter,
+                       unsigned char qos)
+{
+    if (!session || !valid_topic_filter(filter, strlen(filter)))
+        return false;
+
+    char topic[strlen(filter) + 2];
+    snprintf(topic, strlen(filter) + 1, "%s", filter);
+
+    /*
+     * Recursive subscribe to all children topics if the filter ends with
+     * "/#" (or is a bare "#"): the wildcard part is stripped from the stored
+     * filter and flagged as multilevel, see normalize_filter()
+     */
+    bool wildcard = normalize_filter(topic, filter);
+
+    /*
+     * Let's explore two possible scenarios:
+     * 1. Normal topic (no single level wildcard '+') which can end with
+     *    multilevel wildcard '#'
+     * 2. A topic contaning one or more single level wildcard '+'
+     */
+    struct topic *t = topic_store_get_or_put(server.store, topic);
+    if (!index(topic, '+')) {
+        struct subscriber *tmp;
+        HASH_FIND_STR(t->subscribers, session->session_id, tmp);
+        if (!tmp) {
+            tmp = topic_add_subscriber(t, session, qos);
+            /* Keep the entry alive for the subscriber map */
+            INCREF(tmp, struct subscriber);
+            /*
+             * A fresh entry takes its origin from the filter that made it,
+             * not from a generic EXACT default: the entry a multilevel
+             * filter creates on its own node (the "a" node of "a/#") is the
+             * record of that filter, and marking it exact as well made a
+             * later UNSUBSCRIBE of "a/#" keep delivering the bare "a" as if
+             * it were still subscribed. The WILD branch below completes the
+             * filter registration
+             */
+            tmp->origins = wildcard ? 0 : SUBSCRIBER_EXACT;
+            /*
+             * Track the topic once, on the first subscription of this node:
+             * a repeated SUBSCRIBE used to append the same topic again,
+             * growing the list (and the teardown loop) with every duplicate
+             */
+            session_track_topic(session, t);
+        } else {
+            /*
+             * MQTT v3.1.1 §3.8.4: a SUBSCRIBE for a filter already
+             * subscribed replaces the subscription, only the granted QoS
+             * may differ. The wildcard index shares this very subscriber
+             * record, so the new QoS applies there too
+             */
+            tmp->granted_qos = qos;
+        }
+        if (wildcard == true) {
+            /*
+             * Register the filter even when an entry for this client already
+             * lives on the node (e.g. the bare topic was subscribed before:
+             * "a" and "a/#" share the very same node): skipping it then used
+             * to silently drop the filter, no message under the prefix would
+             * ever match it. The WILD origin marks the registration as done,
+             * so a repeated SUBSCRIBE does not duplicate the index record
+             */
+            if (!(tmp->origins & SUBSCRIBER_WILD)) {
+                /*
+                 * The entry covers the filter (and its own topic, as "a/#"
+                 * matches "a"): remember it so that UNSUBSCRIBE of the
+                 * wildcard drops the record too
+                 */
+                tmp->origins |= SUBSCRIBER_WILD;
+                add_wildcard(topic, tmp, wildcard);
+                topic_store_map(server.store, topic, recursive_sub, tmp);
+            }
+        } else {
+            /*
+             * The entry now doubles as an explicit subscription of this very
+             * topic: remembering the origin lets a concurrent wildcard
+             * covering it survive its UNSUBSCRIBE (and vice versa)
+             */
+            tmp->origins |= SUBSCRIBER_EXACT;
+        }
+    } else {
+        /*
+         * Here we encountered at least 1 single level wildcard '+', we add
+         * the subscription to the wildcard index as we can't know at this
+         * point which topic it will match
+         *
+         * MQTT v3.1.1 §3.8.4: a SUBSCRIBE for a filter already subscribed
+         * replaces the previous subscription, only the granted QoS may
+         * differ. Indexing a fresh record on every repeat grew the wildcard
+         * index (and with it the client teardown loop) without bound while
+         * delivery kept deduplicating anyway, so a repeat now re-grants the
+         * QoS on the existing entry
+         */
+        struct subscription *ex = topic_store_find_wildcard_filter(
+            server.store, topic, session->session_id);
+        if (ex) {
+            ex->subscriber->granted_qos = qos;
+        } else {
+            struct subscriber *sub = subscriber_new(session, qos);
+            add_wildcard(topic, sub, wildcard);
+        }
+    }
+    persistence_mark_dirty();
+    return true;
+}
+
+/*
  * Argument passed to retained_collect while scanning the whole topic store
  */
 struct retained_collection {
@@ -1234,30 +1479,11 @@ static int subscribe_handler(struct io_event *e)
         }
 
         /*
-         * Check if the topic exists already or in case create it and store in
-         * the global map
-         */
-        char topic[s->tuples[i].topic_len + 2];
-        snprintf(topic, s->tuples[i].topic_len + 1, "%s", s->tuples[i].topic);
-
-        log_debug("\t%s (QoS %i)", topic, s->tuples[i].qos);
-
-        /*
-         * Recursive subscribe to all children topics if the topic ends with
-         * "/#" (or is a bare "#"): the wildcard part is stripped from the
-         * stored filter and flagged as multilevel, see normalize_filter()
-         */
-        bool wildcard =
-            normalize_filter(topic, (const char *)s->tuples[i].topic);
-
-        /*
-         * Let's explore two possible scenarios:
-         * 1. Normal topic (no single level wildcard '+') which can end with
-         *    multilevel wildcard '#'
-         * 2. A topic contaning one or more single level wildcard '+'
-         *
-         * The store is always mutated with the global mutex held first and
-         * the client mutex second, the canonical order shared with
+         * Register the filter: validation, normalization and the store
+         * mutation all live in session_subscribe(), the very code the
+         * persistence loader reuses to rebuild a session read back from
+         * disk. The store is always mutated with the global mutex held first
+         * and the client mutex second, the canonical order shared with
          * publish_message() delivery, otherwise an ABBA deadlock between a
          * SUBSCRIBE and a concurrent PUBLISH would be possible
          */
@@ -1265,98 +1491,32 @@ static int subscribe_handler(struct io_event *e)
         pthread_mutex_lock(&mutex);
         pthread_mutex_lock(&c->mutex);
 #endif
-        struct topic *t = topic_store_get_or_put(server.store, topic);
-        if (!index(topic, '+')) {
-            struct subscriber *tmp;
-            HASH_FIND_STR(t->subscribers, c->client_id, tmp);
-            if (!tmp) {
-                tmp = topic_add_subscriber(t, e->client->session,
-                                           s->tuples[i].qos);
-                // we increment reference for the subscriptions session
-                INCREF(tmp, struct subscriber);
-                /*
-                 * A fresh entry takes its origin from the filter that made
-                 * it, not from the generic EXACT default subscriber_new()
-                 * seeds: the entry a multilevel filter creates on its own
-                 * node (the "a" node of "a/#") is the record of that filter,
-                 * and marking it exact as well made a later UNSUBSCRIBE of
-                 * "a/#" keep delivering the bare "a" as if it were still
-                 * subscribed. The origin is set here, the WILD branch below
-                 * completes the filter registration
-                 */
-                tmp->origins = wildcard ? 0 : SUBSCRIBER_EXACT;
-                /*
-                 * Track the topic once, on the first subscription of this
-                 * node: a repeated SUBSCRIBE used to append the same topic
-                 * again, growing the list (and the teardown loop) with every
-                 * duplicate
-                 */
-                session_track_topic(e->client->session, t);
-            } else {
-                /*
-                 * MQTT v3.1.1 §3.8.4: a SUBSCRIBE for a filter already
-                 * subscribed replaces the subscription, only the granted
-                 * QoS may differ. The wildcard index shares this very
-                 * subscriber record, so the new QoS applies there too
-                 */
-                tmp->granted_qos = s->tuples[i].qos;
-            }
-            if (wildcard == true) {
-                /*
-                 * Register the filter even when an entry for this client
-                 * already lives on the node (e.g. the bare topic was
-                 * subscribed before: "a" and "a/#" share the very same
-                 * node): skipping it then used to silently drop the
-                 * filter, no message under the prefix would ever match it.
-                 * The WILD origin marks the registration as done, so a
-                 * repeated SUBSCRIBE does not duplicate the index record
-                 */
-                if (!(tmp->origins & SUBSCRIBER_WILD)) {
-                    /*
-                     * The entry covers the filter (and its own topic, as
-                     * "a/#" matches "a"): remember it so that UNSUBSCRIBE
-                     * of the wildcard drops the record too
-                     */
-                    tmp->origins |= SUBSCRIBER_WILD;
-                    add_wildcard(topic, tmp, wildcard);
-                    topic_store_map(server.store, topic, recursive_sub, tmp);
-                }
-            } else {
-                /*
-                 * The entry now doubles as an explicit subscription of
-                 * this very topic: remembering the origin lets a
-                 * concurrent wildcard covering it survive its
-                 * UNSUBSCRIBE (and vice versa)
-                 */
-                tmp->origins |= SUBSCRIBER_EXACT;
-            }
-        } else {
-            /*
-             * Here we encountered at least 1 single level wildcard '+', we add
-             * the subscription to the wildcard index as we can't know at this
-             * point which topic it will match
-             *
-             * MQTT v3.1.1 §3.8.4: a SUBSCRIBE for a filter already subscribed
-             * replaces the previous subscription, only the granted QoS may
-             * differ. Indexing a fresh record on every repeat grew the
-             * wildcard index (and with it the client teardown loop) without
-             * bound while delivery kept deduplicating anyway, so a repeat now
-             * re-grants the QoS on the existing entry. The new QoS governs
-             * every topic this filter has not been matched against yet; a
-             * topic already carrying a cloned subscriber keeps the QoS it was
-             * attached with, an overlap MQTT 3.1.1 leaves to the server
-             */
-            struct subscription *ex =
-                topic_store_find_wildcard_filter(server.store, topic,
-                                                 c->client_id);
-            if (ex) {
-                ex->subscriber->granted_qos = s->tuples[i].qos;
-            } else {
-                struct subscriber *sub =
-                    subscriber_new(e->client->session, s->tuples[i].qos);
-                add_wildcard(topic, sub, wildcard);
-            }
+        bool registered = session_subscribe(e->client->session,
+                                            (const char *)s->tuples[i].topic,
+                                            s->tuples[i].qos);
+        if (!registered) {
+            log_warning("Rejecting malformed topic filter from %s",
+                        c->client_id);
+            rcs[i] = MQTT_SUBACK_FAILURE;
+#if THREADSNR > 0
+            pthread_mutex_unlock(&mutex);
+            pthread_mutex_unlock(&c->mutex);
+#endif
+            continue;
         }
+
+        /*
+         * The filter is kept the way the store keys it (trailing '/', the
+         * '#' of a multilevel filter stripped) to match the retained
+         * messages against it after the SUBACK: the same normalization
+         * session_subscribe() just applied
+         */
+        char topic[s->tuples[i].topic_len + 2];
+        snprintf(topic, s->tuples[i].topic_len + 1, "%s", s->tuples[i].topic);
+        bool wildcard =
+            normalize_filter(topic, (const char *)s->tuples[i].topic);
+        log_debug("\t%s (QoS %i)", topic, s->tuples[i].qos);
+
         /*
          * Retained messages matching the subscriptions must be flushed after
          * the SUBACK, keep a copy of every filter to scan the store for them
@@ -1568,6 +1728,7 @@ static int unsubscribe_handler(struct io_event *e)
     pthread_mutex_unlock(&mutex);
 #endif
 
+    persistence_mark_dirty();
     if (outgoing_reserve(c, MQTT_ACK_LEN)) {
         mqtt_pack_mono(c->wbuf + c->towrite, UNSUBACK,
                        e->data.unsubscribe.pkt_id);
@@ -1783,6 +1944,7 @@ static int publish_handler(struct io_event *e)
         }
         if (p->payloadlen > 0)
             t->retained = mqtt_publish_copy(pkt);
+        persistence_mark_dirty();
     }
 #if THREADSNR > 0
     pthread_mutex_unlock(&mutex);

@@ -164,6 +164,20 @@ struct inflight_msg {
 };
 
 /*
+ * A message waiting in the offline queue of a persistent session. The packet
+ * is borrowed, the inflight entry of its identifier holds the one reference
+ * that keeps it alive, but the identifier travels with the queue entry: the
+ * shared packet carries whichever id the last subscriber of the original
+ * publish was given, so the accounting (i_msgs, the pending list, the
+ * inflight counter) could not be undone from the packet alone when the
+ * memory pressure policy drops the oldest queued messages
+ */
+struct queued_msg {
+    struct mqtt_packet *packet;
+    u16 mid;
+};
+
+/*
  * The client actions can be summarized as a roughly simple state machine,
  * comprised by 4 states:
  * - WAITING_HEADER it's the base state, waiting for the next packet to be
@@ -265,8 +279,8 @@ struct client_session {
     unsigned next_free_mid; /* The next 'free' message ID */
     List *subscriptions;    /* All the clients subscriptions, stored as topic
                                structs */
-    List *outgoing_msgs; /* Outgoing messages during disconnection time, stored
-                            as mqtt_packet pointers */
+    List *outgoing_msgs; /* Messages queued while the client is away, stored
+                            as struct queued_msg entries */
     volatile atomic_ushort inflights; /* Just a counter stating the presence of
                                          inflight messages */
     bool clean_session;               /* Clean session flag */
@@ -413,9 +427,18 @@ bool topic_store_contains(const struct topic_store *, const char *);
 void topic_store_put(struct topic_store *, struct topic *);
 
 /*
- * Remove a topic into the store
+ * Remove a topic into the store. The name has to stay valid for the whole
+ * call, the destructor releases the topic (its name included)
  */
 void topic_store_del(struct topic_store *, const char *);
+
+/*
+ * Release the topics nothing can reach anymore: no subscriber, no retained
+ * message, and no session listing them. What the max_memory policy uses to
+ * give the store's memory back; the broker's own '$' topics are never
+ * reclaimed
+ */
+void topic_store_reclaim(struct topic_store *);
 
 /*
  * Add a wildcard topic to the topic_store struct, does not check if it already
@@ -471,6 +494,23 @@ void topic_store_match_wildcards(struct topic_store *, const char *,
  * Check if the store holds any wildcard subscription
  */
 bool topic_store_wildcards_empty(const struct topic_store *);
+
+/*
+ * Callback invoked once for every wildcard subscription registered by one
+ * client, with the filter it was registered under (the normalized name, the
+ * '#' of a multilevel filter stripped) and its multilevel flag
+ */
+typedef void (*wildcard_entry_cb)(const char *filter, bool multilevel,
+                                  unsigned char qos, void *arg);
+
+/*
+ * Walk the wildcard index and invoke the callback for every subscription
+ * belonging to `client_id`: the wildcard records are only reachable by
+ * matching a topic, this walks them for the persistence writer. The caller
+ * must hold the global mutex
+ */
+void topic_store_wildcards_foreach(struct topic_store *, const char *client_id,
+                                   wildcard_entry_cb, void *arg);
 
 #define has_inflight(session)   ((session)->inflights > 0)
 

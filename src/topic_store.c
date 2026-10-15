@@ -27,6 +27,7 @@
  */
 
 #include "list.h"
+#include "logging.h"
 #include "memory.h"
 #include "sol_internal.h"
 #include "trie.h"
@@ -424,7 +425,9 @@ void topic_store_put(struct topic_store *store, struct topic *t)
 }
 
 /*
- * Remove a topic into the store
+ * Remove a topic into the store. The key has to stay valid for the whole
+ * call: the destructor releases the topic, name included, and the trie walks
+ * the key once more afterwards to prune the nodes the removal emptied
  */
 void topic_store_del(struct topic_store *store, const char *name)
 {
@@ -467,6 +470,70 @@ struct topic *topic_store_get_or_put(struct topic_store *store,
     t = topic_new(try_strdup(name));
     topic_store_put(store, t);
     return t;
+}
+
+/*
+ * Argument of the walk that collects the topics nobody holds anymore
+ */
+struct reclaim_set {
+    struct topic **topics;
+    size_t len;
+    size_t cap;
+};
+
+/*
+ * Collect one candidate for the reclamation: a topic with no subscriber and
+ * no retained message is dead weight, nothing can reach it again (a PUBLISH
+ * or a SUBSCRIBE would simply create it anew).
+ *
+ * Note that "no subscriber" is also a guarantee that no session still lists
+ * the topic: a session drops the entry from its list as soon as its last
+ * origin goes away, so a topic left in a list always carries a subscriber
+ * entry for that session. That is what makes deleting the topic safe, a
+ * session list holding a freed pointer would corrupt the next teardown.
+ *
+ * The broker's own topics ('$' prefixed, the statistics feed) are left alone:
+ * they are published to, not subscribed, and would all look reclaimable
+ */
+static void reclaim_collect(struct trie_node *node, void *arg)
+{
+    if (!node || !node->data)
+        return;
+    struct topic *t = node->data;
+    if (t->subscribers || t->retained || t->name[0] == '$')
+        return;
+
+    struct reclaim_set *set = arg;
+    if (set->len == set->cap) {
+        set->cap    = set->cap ? set->cap * 2 : 16;
+        set->topics = try_realloc(set->topics, set->cap * sizeof(*set->topics));
+    }
+    set->topics[set->len++] = t;
+}
+
+/*
+ * Give back the memory of the topics nobody uses anymore: the candidates are
+ * collected first and removed afterwards, since deleting a node while the
+ * trie is being walked would pull the ground from under the walk
+ */
+void topic_store_reclaim(struct topic_store *store)
+{
+    struct reclaim_set set = {NULL, 0, 0};
+
+    topic_store_map(store, NULL, reclaim_collect, &set);
+
+    for (size_t i = 0; i < set.len; ++i) {
+        /*
+         * The name is copied: topic_store_del() releases the topic, its name
+         * included, and keeps using the key to prune the trie
+         */
+        char *name = try_strdup(set.topics[i]->name);
+        log_debug("Reclaiming the unused topic %s", name);
+        topic_store_del(store, name);
+        free_memory(name);
+    }
+
+    free_memory(set.topics);
 }
 
 /*
@@ -554,6 +621,40 @@ struct subscription *topic_store_find_wildcard_filter(struct topic_store *store,
             return s;
     }
     return NULL;
+}
+
+/*
+ * Recursive half of topic_store_wildcards_foreach(): the index has no order
+ * and no lookup by client, so the whole tree is walked and the records of the
+ * requested client are handed to the callback
+ */
+static void wild_node_foreach(struct wild_node *node, const char *id,
+                              wildcard_entry_cb fn, void *arg)
+{
+    if (!node)
+        return;
+
+    if (node->subs) {
+        list_foreach(item, node->subs)
+        {
+            struct subscription *s = item->data;
+            if (strncmp(s->subscriber->id, id, MQTT_CLIENT_ID_LEN) == 0)
+                fn(s->topic, s->multilevel, s->subscriber->granted_qos, arg);
+        }
+    }
+
+    struct wild_level *lvl, *tmp;
+    HASH_ITER(hh, node->children, lvl, tmp)
+    {
+        wild_node_foreach(lvl->node, id, fn, arg);
+    }
+}
+
+void topic_store_wildcards_foreach(struct topic_store *store,
+                                   const char *client_id,
+                                   wildcard_entry_cb fn, void *arg)
+{
+    wild_node_foreach(store->wildcards->root, client_id, fn, arg);
 }
 
 /*

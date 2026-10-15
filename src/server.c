@@ -33,6 +33,7 @@
 #include "memory.h"
 #include "memorypool.h"
 #include "network.h"
+#include "persistence.h"
 #include "sol_internal.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -587,6 +588,116 @@ static void keepalive_check(struct ev_ctx *ctx, void *data)
 }
 
 /*
+ * The max_memory policy, in the order the configuration promises: first the
+ * topics nobody holds anymore are released, then the oldest messages queued
+ * for the clients that are away, and when even that is not enough new
+ * connections are refused until the broker comes back under its limit. Under
+ * the limit the reclamation still runs, on its own (much slower) interval;
+ * every level of the policy is logged when it acts
+ */
+static void memory_check(struct ev_ctx *ctx, void *data)
+{
+    (void)ctx;
+    (void)data;
+
+    bool limited = conf->max_memory > 0;
+    bool over    = limited && memory_used() > conf->max_memory;
+
+    /* Under pressure every check acts, otherwise the walk runs on its own
+       (much slower) interval */
+    static time_t last_reclaim = 0;
+    time_t now                 = time(NULL);
+    bool reclaim = over || now - last_reclaim >= (time_t)conf->reclaim_interval;
+    if (reclaim)
+        last_reclaim = now;
+
+    /*
+     * The state of the broker is evaluated on every check, even when there is
+     * nothing to reclaim: a broker that came back under its limit (a
+     * subscriber went away, a client acknowledged its backlog) has to accept
+     * connections again, and waiting for the next reclamation interval would
+     * keep it refusing them for up to `reclaim_interval` seconds
+     */
+    if (!reclaim && !server.over_memory)
+        return;
+
+#if THREADSNR > 0
+    pthread_mutex_lock(&mutex);
+#endif
+
+    /* Level one: the topics nothing refers to anymore */
+    if (reclaim)
+        topic_store_reclaim(server.store);
+
+    /* Level two: the oldest queued messages, until the limit is honoured */
+    over = limited && memory_used() > conf->max_memory;
+    if (over) {
+        struct client_session *s, *tmp;
+        HASH_ITER(hh, server.sessions, s, tmp)
+        {
+            while (limited && memory_used() > conf->max_memory &&
+                   session_drop_oldest_queued(s))
+                log_warning("Memory over the limit: dropped the oldest "
+                            "message queued for %s",
+                            s->session_id);
+        }
+    }
+
+    /*
+     * Level three: nothing left to give back. New connections are refused
+     * until it drops, which is the only lever left once every reclaimable
+     * byte has been reclaimed
+     */
+    bool still_over = limited && memory_used() > conf->max_memory;
+    if (still_over && !server.over_memory)
+        log_warning("Memory over the limit (%lu bytes used, %lu allowed): "
+                    "refusing new connections until it drops",
+                    (unsigned long)memory_used(),
+                    (unsigned long)conf->max_memory);
+    else if (!still_over && server.over_memory)
+        log_info("Memory back under the limit, accepting connections again");
+    server.over_memory = still_over;
+
+#if THREADSNR > 0
+    pthread_mutex_unlock(&mutex);
+#endif
+}
+
+/*
+ * Periodic snapshot of everything the broker must not lose on a restart:
+ * the retained messages and the persistent sessions, with their subscriptions
+ * and the messages queued for their away clients. The whole snapshot runs
+ * under the global mutex, which makes it a consistent point in time (and
+ * blocks the publishers for the few milliseconds a file of any teaching size
+ * takes to write); `persistence_interval` decides how often it is even
+ * considered, and the dirty flag makes sure an idle broker never touches the
+ * file at all
+ */
+static void persistence_check(struct ev_ctx *ctx, void *data)
+{
+    (void)ctx;
+    (void)data;
+
+    if (!conf->persistence_file[0])
+        return;
+
+    static time_t last_check = 0;
+    time_t now               = time(NULL);
+    if (now - last_check < (time_t)conf->persistence_interval)
+        return;
+    last_check = now;
+
+#if THREADSNR > 0
+    pthread_mutex_lock(&mutex);
+#endif
+    if (persistence_is_dirty())
+        persistence_save(conf->persistence_file);
+#if THREADSNR > 0
+    pthread_mutex_unlock(&mutex);
+#endif
+}
+
+/*
  * ======================================================
  *  Private functions and callbacks for server behaviour
  * ======================================================
@@ -767,7 +878,8 @@ static void kick_callback(struct ev_ctx *ctx, void *arg)
     info.active_connections--;
 }
 
-void server_kick_duplicate(const char *client_id, const struct client *keep)
+void server_kick_duplicate(const char *client_id, const struct client *keep,
+                           struct mqtt_packet *will)
 {
     struct client *old = NULL;
     HASH_FIND_STR(server.clients_map, client_id, old);
@@ -796,9 +908,22 @@ void server_kick_duplicate(const char *client_id, const struct client *keep)
 #if THREADSNR > 0
     pthread_mutex_lock(&old->mutex);
 #endif
+    /*
+     * MQTT v3.1.1 §3.1.2.5: the victim's connection is closed by the server
+     * without a DISCONNECT packet, so its will has to be published. The copy
+     * is taken here, while the session is still reachable, and handed back to
+     * the caller which delivers it once the global mutex is released
+     * (publish_lwt() locks that very mutex and would deadlock this thread)
+     */
+    if (will && old->has_lwt && old->session &&
+        old->session->lwt_msg.publish.topic)
+        mqtt_packet_copy(will, &old->session->lwt_msg);
     HASH_DEL(server.clients_map, old);
     old->connected = false;
-    /* A kicked connection publishes no will message */
+    /*
+     * The victim publishes nothing on its own from now on: the will was
+     * claimed above and its close path must not deliver a second copy
+     */
     old->has_lwt   = false;
     old->session   = NULL;
     /*
@@ -1185,6 +1310,22 @@ static void accept_callback(struct ev_ctx *ctx, void *data)
          * Create a client structure to handle his context
          * connection
          */
+        /*
+         * The memory policy refuses new connections while the broker is over
+         * its limit and has nothing left to reclaim (see memory_check). The
+         * flag is atomic and read before taking the global mutex: the refusal
+         * path leaves through a `break`, and breaking with the lock held
+         * would abandon it for good. The listening socket is level triggered,
+         * so a small nap keeps the loop from spinning on a refusal
+         */
+        if (server.over_memory) {
+            log_debug("Refusing connection from %s: memory over the limit",
+                      conn.ip);
+            close_connection(&conn);
+            usleep(1000);
+            break;
+        }
+
 #if THREADSNR > 0
         pthread_mutex_lock(&mutex);
 #endif
@@ -1452,6 +1593,8 @@ static void eventloop_start(void *args)
                          0);
         ev_register_cron(&ctx, inflight_msg_check, NULL, 1, 0);
         ev_register_cron(&ctx, keepalive_check, NULL, 1, 0);
+        ev_register_cron(&ctx, persistence_check, NULL, 1, 0);
+        ev_register_cron(&ctx, memory_check, NULL, 1, 0);
     }
     // Start the loop, blocking call
     ev_run(&ctx);
@@ -1494,6 +1637,7 @@ int start_server(const char *addr, const char *port)
                   BASE_CLIENTS_NUM);
     server.clients_map = NULL;
     server.sessions    = NULL;
+    server.over_memory = false;
     pthread_mutex_init(&mutex, NULL);
 
     if (conf->allow_anonymous == false)
@@ -1507,6 +1651,25 @@ int start_server(const char *addr, const char *port)
             log_fatal("start_server failed: Out of memory");
         topic_store_put(server.store, t);
     }
+
+    /*
+     * Rebuild what a previous run left behind: the retained messages and the
+     * persistent sessions. This happens before the listening socket exists,
+     * so no client can race it, and persistence_load() takes no lock for the
+     * same reason
+     */
+    persistence_load(conf->persistence_file);
+
+    /*
+     * A limit below what the broker already holds would refuse every new
+     * connection from the first second, which looks like a hang from the
+     * outside: warn about it rather than let it surprise anybody
+     */
+    if (conf->max_memory > 0 && conf->max_memory <= memory_used())
+        log_warning("max_memory (%zu bytes) is below the memory the broker "
+                    "already uses (%zu bytes): raise it, or new connections "
+                    "will be refused",
+                    conf->max_memory, memory_used());
 
     /* Start listening for new connections */
     int sfd = make_listen(addr, port, conf->socket_family);
@@ -1539,6 +1702,13 @@ int start_server(const char *addr, const char *port)
     for (int i = 0; i < THREADSNR; ++i)
         pthread_join(thrs[i], NULL);
 #endif
+
+    /*
+     * Final snapshot, catching whatever the last periodic run did not: every
+     * loop has stopped by now, so there is no lock left to take
+     */
+    if (conf->persistence_file[0] && persistence_is_dirty())
+        persistence_save(conf->persistence_file);
 
     close(sfd);
     AUTH_DESTROY(server.auths);

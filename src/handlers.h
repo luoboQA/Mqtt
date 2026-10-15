@@ -28,11 +28,47 @@
 #ifndef HANDLERS_H
 #define HANDLERS_H
 
+#include <stdbool.h>
+#include <stddef.h>
+
 struct topic;
 struct mqtt_packet;
 struct io_event;
+struct client_session;
 
 int publish_message(struct mqtt_packet *, const struct topic *);
+
+/*
+ * Create a persistent session and register it in the server map, the entry
+ * point the persistence loader uses to rebuild what it read back from disk.
+ * Meant to run before the event loops start: it takes no lock
+ */
+struct client_session *session_restore(const char *session_id);
+
+/*
+ * Register `filter` for `session`, exactly like one tuple of a SUBSCRIBE
+ * packet would (the filter is validated and normalized here). The caller must
+ * hold the global mutex; returns false when the filter is malformed
+ */
+bool session_subscribe(struct client_session *, const char *filter,
+                       unsigned char qos);
+
+/*
+ * Queue a message for a session that is not connected, at QoS > 0: the packet
+ * is built here, takes an identifier of its own and is registered in the
+ * session inflight tables, so a later reconnect replays it. The caller must
+ * hold the global mutex
+ */
+void session_queue_message(struct client_session *, const char *topic,
+                           unsigned char qos, const unsigned char *payload,
+                           size_t len);
+
+/*
+ * Drop the oldest message queued for a disconnected session, releasing the
+ * packet, its inflight entry and the queue slot: what the max_memory policy
+ * does to give memory back. Returns false when the queue is already empty
+ */
+bool session_drop_oldest_queued(struct client_session *);
 
 /*
  * Deliver an LWT message through the same normalized path a normal PUBLISH

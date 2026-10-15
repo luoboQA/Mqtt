@@ -85,6 +85,14 @@ void sol_log(int level, const char *fmt, ...)
         return;
 
     fprintf(fp, "%lu %s\n", (unsigned long)time(NULL), msg);
-    if (fh)
+    if (fh) {
         fprintf(fh, "%lu %s\n", (unsigned long)time(NULL), msg);
+        /*
+         * Flushed right away: a broker is usually watched through its log
+         * file (`tail -f`), and a message sitting in a stdio buffer for
+         * minutes is a message nobody sees. The volume of a broker log is
+         * low enough for the extra write to be irrelevant
+         */
+        fflush(fh);
+    }
 }

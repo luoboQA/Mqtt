@@ -290,6 +290,13 @@ static void add_config_value(const char *key, const char *value)
             config.allow_anonymous = false;
         else
             config.allow_anonymous = true;
+    } else if (STREQ("persistence_file", key, klen) == true) {
+        set_config_str(key, config.persistence_file,
+                       sizeof(config.persistence_file), value);
+    } else if (STREQ("persistence_interval", key, klen) == true) {
+        config.persistence_interval = read_time_with_mul(value);
+    } else if (STREQ("reclaim_interval", key, klen) == true) {
+        config.reclaim_interval = read_time_with_mul(value);
     } else if (STREQ("password_file", key, klen) == true) {
         set_config_str(key, config.password_file, sizeof(config.password_file),
                        value);
@@ -417,6 +424,10 @@ void config_set_default(void)
     config.max_request_size   = read_memory_with_mul(DEFAULT_MAX_REQUEST_SIZE);
     config.tcp_backlog        = SOMAXCONN;
     config.stats_pub_interval = read_time_with_mul(DEFAULT_STATS_INTERVAL);
+    memset(config.persistence_file, 0x00, sizeof(config.persistence_file));
+    config.persistence_interval =
+        read_time_with_mul(DEFAULT_PERSISTENCE_INTERVAL);
+    config.reclaim_interval = read_time_with_mul(DEFAULT_RECLAIM_INTERVAL);
     config.keepalive          = read_time_with_mul(DEFAULT_KEEPALIVE);
     config.retransmit_interval = read_time_with_mul(DEFAULT_RETRANSMIT);
     config.tls                = false;
@@ -474,6 +485,9 @@ void config_print(void)
             log_info("\tTcp backlog: %d", config.tcp_backlog);
             log_info("\tKeepalive: %zu", config.keepalive);
             log_info("\tRetransmit interval: %zu", config.retransmit_interval);
+            if (config.persistence_file[0])
+                log_info("\tPersistence file: %s (every %zu seconds)",
+                         config.persistence_file, config.persistence_interval);
             if (config.tls == true)
                 config_print_tls_versions();
             log_info("\tFile handles soft limit: %li", get_fh_soft_limit());

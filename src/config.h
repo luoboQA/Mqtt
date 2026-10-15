@@ -73,6 +73,8 @@
 #define DEFAULT_MAX_REQUEST_SIZE "512KB"
 #define DEFAULT_STATS_INTERVAL   "10s"
 #define DEFAULT_KEEPALIVE        "60s"
+#define DEFAULT_PERSISTENCE_INTERVAL "30s"
+#define DEFAULT_RECLAIM_INTERVAL "60s"
 #define DEFAULT_RETRANSMIT       "20s"
 #ifdef TLS1_3_VERSION
 #define DEFAULT_TLS_PROTOCOLS (SOL_TLSv1_2 | SOL_TLSv1_3)
@@ -133,6 +135,21 @@ struct config {
     bool allow_anonymous;
     /* File path on the filesystem pointing to the password_file */
     char password_file[0xFFF];
+    /*
+     * File the broker snapshots its stored state to (the retained messages
+     * and the persistent sessions with their queued messages). An empty path
+     * disables persistence entirely, which is the default
+     */
+    char persistence_file[0xFFF];
+    /* Seconds between two periodic snapshots, only written when the state
+     * changed since the previous one */
+    size_t persistence_interval;
+    /*
+     * Seconds between two reclamations of the topics nothing refers to
+     * anymore, while the broker is *not* over its max_memory (under pressure
+     * the reclamation runs on every memory check instead)
+     */
+    size_t reclaim_interval;
 };
 
 extern struct config *conf;

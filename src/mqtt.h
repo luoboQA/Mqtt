@@ -335,6 +335,15 @@ void mqtt_packet_destroy(struct mqtt_packet *);
 void mqtt_set_dup(struct mqtt_packet *);
 
 /*
+ * Deep copy of the message a packet carries into `dst`, which owns its own
+ * topic and payload buffers afterwards (release them with
+ * mqtt_packet_destroy()): used to keep a message alive past the delivery that
+ * carries it, e.g. a retained message or the will of a client whose id is
+ * being taken over by a duplicate connection
+ */
+void mqtt_packet_copy(struct mqtt_packet *, const struct mqtt_packet *);
+
+/*
  * Helper function used to pack ACK packets, mono as the single field `packet
  * identifier` that ACKs packet carries
  */

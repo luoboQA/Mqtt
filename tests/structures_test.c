@@ -30,6 +30,7 @@
 #include "../src/iterator.h"
 #include "../src/list.h"
 #include "../src/memory.h"
+#include "../src/bst.h"
 #include "../src/trie.h"
 #include "unit.h"
 #include <stdlib.h>
@@ -219,6 +220,47 @@ static char *test_trie_delete(void)
 }
 
 /*
+ * Tests the delete on a BST node holding two children: the in-order successor
+ * takes the node's place and has to take its payload with it. Copying the key
+ * alone left the values swapped between the two keys, which the trie above
+ * (a BST of children keyed by character) walked straight into freed nodes
+ */
+static char *test_bst_delete_two_children(void)
+{
+    char *value_a = "a-value";
+    char *value_b = "b-value";
+    char *value_c = "c-value";
+    struct bst_node *root = NULL;
+
+    /* 'b' ends up with a child on each side, the case that used to lose the
+       payload of the node taking its place */
+    root = bst_insert(root, 'b', value_b);
+    root = bst_insert(root, 'a', value_a);
+    root = bst_insert(root, 'c', value_c);
+
+    root = bst_delete(root, 'b');
+
+    struct bst_node *node = bst_search(root, 'c');
+    ASSERT("bst::bst_delete_two_children...FAIL (c lost)", node != NULL);
+    ASSERT("bst::bst_delete_two_children...FAIL (c carries b's value)",
+           node->data == (void *)value_c);
+
+    node = bst_search(root, 'a');
+    ASSERT("bst::bst_delete_two_children...FAIL (a lost)", node != NULL);
+    ASSERT("bst::bst_delete_two_children...FAIL (a's value)",
+           node->data == (void *)value_a);
+
+    ASSERT("bst::bst_delete_two_children...FAIL (b survived)",
+           bst_search(root, 'b') == NULL);
+
+    /* Release what is left: the values are literals, only the nodes are ours */
+    free_memory(bst_search(root, 'a'));
+    free_memory(bst_search(root, 'c'));
+    printf("bst::bst_delete_two_children...OK\n");
+    return 0;
+}
+
+/*
  * Destructor for the delete test below: releases the payload and reports the
  * delete as successful, exactly what the topic store does with its topics
  */
@@ -347,6 +389,7 @@ char *structures_test(void)
     RUN_TEST(test_list_push_back);
     RUN_TEST(test_list_remove_node);
     RUN_TEST(test_list_iterator);
+    RUN_TEST(test_bst_delete_two_children);
     RUN_TEST(test_trie_create_node);
     RUN_TEST(test_trie_new);
     RUN_TEST(test_trie_insert);

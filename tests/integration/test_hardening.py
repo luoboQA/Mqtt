@@ -299,6 +299,38 @@ class TestHardening(base_testcase.BaseTestcase):
             watcher.close()
         self.assert_broker_alive()
 
+    def test_will_published_on_client_id_takeover(self):
+        """§3.1.4-2 + §3.1.2.5: a second connection taking a client id over
+        makes the server close the old connection without a DISCONNECT, so
+        the will registered with it has to be published. The broker used to
+        drop it on the floor, taking the id over silently"""
+        watcher, _ = self.connect('kick-watch')
+        try:
+            self.subscribe(watcher, 1, {'kick/will': 0})
+            victim = self.get_connection()
+            try:
+                victim.settimeout(3)
+                victim.sendall(sol_test.create_connect(
+                    'kick-victim', will_topic='kick/will',
+                    will_payload=b'taken over'))
+                victim.recv(100)  # CONNACK
+                # Same id from another connection: the victim gets kicked
+                taker, _ = self.connect('kick-victim')
+                try:
+                    _, topic, payload, _ = sol_test.read_publish(
+                        watcher.recv(100))
+                    self.assertEqual(topic, 'kick/will')
+                    self.assertEqual(payload, b'taken over')
+                    # The takeover connection is alive and usable
+                    self.subscribe(taker, 2, {'kick/other': 0})
+                finally:
+                    taker.close()
+            finally:
+                victim.close()
+        finally:
+            watcher.close()
+        self.assert_broker_alive()
+
     def test_will_payload_keeps_nul_bytes(self):
         """An application message is a binary blob, the will payload is one:
         its length comes from the packet, while a strlen() driven copy

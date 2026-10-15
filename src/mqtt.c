@@ -178,6 +178,20 @@ usize mqtt_decode_length(u8 *buf, unsigned *pos, unsigned avail)
  */
 
 /*
+ * Duplicate `len` bytes into a fresh NUL terminated buffer: an application
+ * message may carry any byte, NUL included, so the copy is driven by the
+ * length and never by strlen()
+ */
+static u8 *copy_bytes(const u8 *src, usize len)
+{
+    u8 *dst = try_alloc(len + 1);
+    if (src && len > 0)
+        memcpy(dst, src, len);
+    dst[len] = '\0';
+    return dst;
+}
+
+/*
  * MQTT v3.1.1 §3.1.3.2: the Will Topic is a Topic Name, so it obeys §4.7: it
  * carries at least one character and holds no wildcard. A '#' or '+' accepted
  * here would later be published verbatim on an abrupt disconnect, handing the
@@ -873,6 +887,33 @@ void mqtt_publish(struct mqtt_packet *pkt, u16 pkt_id, usize topiclen,
  * and its caller both releasing the IO data) degrades to a no-op instead
  * of a double free abort
  */
+/*
+ * Deep copy of the message a packet carries: `dst` owns its own topic and
+ * payload buffers afterwards, released with mqtt_packet_destroy() (or by the
+ * reference counter, when the destination is a refcounted packet). The
+ * identifier is reset: a copied message has no packet identifier until a
+ * delivery hands it one, the source's belongs to another flow entirely
+ */
+void mqtt_packet_copy(struct mqtt_packet *dst, const struct mqtt_packet *src)
+{
+    /*
+     * The whole struct is overwritten, reference counter included, so the
+     * destination's own destructor is saved first: a packet allocated with
+     * mqtt_packet_alloc() releases itself through it, and clobbering it with
+     * the source's (NULL for a packet embedded in a session) made the first
+     * DECREF of the copy jump to address zero
+     */
+    void (*free_fn)(const struct ref *) = dst->refcount.free;
+
+    *dst = *src;
+    dst->publish.topic = copy_bytes(src->publish.topic, src->publish.topiclen);
+    dst->publish.payload =
+        copy_bytes(src->publish.payload, src->publish.payloadlen);
+    dst->publish.pkt_id     = 0;
+    dst->refcount.free      = free_fn;
+    dst->refcount.count     = ATOMIC_VAR_INIT(0);
+}
+
 void mqtt_packet_destroy(struct mqtt_packet *pkt)
 {
 
