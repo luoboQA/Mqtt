@@ -1,0 +1,36 @@
+#!/bin/sh
+#
+# Generate the self signed certificates the TLS tests (and any manual TLS
+# run) need: a small certificate authority and a server certificate signed by
+# it, with a subject alternative name for 127.0.0.1 so that a client
+# connecting to the loopback address can verify the hostname instead of being
+# told to trust anything.
+#
+# The files land in certs/, which is ignored by git: they are test material,
+# not something a repository should carry.
+
+set -e
+cd "$(dirname "$0")/.."
+mkdir -p certs
+cd certs
+
+if [ -f ca.crt ] && [ -f server.crt ] && [ -f server.key ]; then
+    echo "certs/ already holds a certificate authority and a server certificate"
+    exit 0
+fi
+
+# Certificate authority
+openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt \
+    -days 3650 -subj "/CN=sol test CA" >/dev/null 2>&1
+
+# Server certificate, signed by the authority, valid for localhost
+openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr \
+    -subj "/CN=localhost" >/dev/null 2>&1
+cat > server.ext <<'EOF'
+subjectAltName = DNS:localhost, IP:127.0.0.1
+EOF
+openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+    -out server.crt -days 3650 -extfile server.ext >/dev/null 2>&1
+rm -f server.csr server.ext
+
+echo "wrote certs/ca.crt, certs/server.crt and certs/server.key"

@@ -100,6 +100,28 @@ $ cmake .
 $ make
 ```
 
+## Testing
+
+The unit tests run as part of the build (`sol_test`), and the integration
+suite comes with the repository:
+
+```sh
+$ python3 tests/integration/run.py     # starts its own broker, 59 tests
+```
+
+It covers the protocol (raw packets), the delivery paths, the sessions, the
+persistence, the memory policy, the access control list, TLS and daemon mode,
+each module starting a broker of its own where it needs a specific
+configuration. `tests/gen_certs.sh` prepares the certificates the TLS tests
+use (they are not part of the repository).
+
+Two more tools are meant to be run by hand:
+
+```sh
+$ python3 tests/stress.py [--help]     # load generator, N clients fanning out
+$ ./tests/run_tsan.sh                  # the suite against a TSan build
+```
+
 ### Event loop backends
 
 The multiplexing backend is picked from the kernel the broker is built for,
