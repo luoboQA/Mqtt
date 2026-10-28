@@ -38,3 +38,6 @@ passwd_file
 .clangd
 .vscode
 .history/
+.venv/
+.claude/
+build*/

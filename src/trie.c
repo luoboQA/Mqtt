@@ -118,7 +118,7 @@ size_t trie_size(const Trie *trie) { return trie->size; }
  * the new inserted data in order to simplify some operations as the addition
  * of expiring keys with a set TTL.
  */
-struct node_data *trie_insert(Trie *trie, const char *key, const void *data)
+void *trie_insert(Trie *trie, const char *key, const void *data)
 {
 
     assert(trie && key);

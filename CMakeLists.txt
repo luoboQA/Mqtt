@@ -25,7 +25,7 @@ set(EXECUTABLE_OUTPUT_PATH ${CMAKE_BINARY_DIR})
 # Note: the sources are globbed when cmake runs, so adding or removing a file
 # under src/ needs another `cmake .` before make can see it
 file(GLOB SOURCES src/*.c)
-file(GLOB TEST src/hashtable.c src/bst.c src/config.c src/list.c src/trie.c
+file(GLOB TEST src/bst.c src/config.c src/list.c src/trie.c
     src/util.c src/iterator.c src/logging.c src/memory.c tests/*.c)
 
 set(AUTHOR "Andrea Giacomo Baldan")

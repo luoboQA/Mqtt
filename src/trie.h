@@ -94,7 +94,7 @@ size_t trie_size(const Trie *);
  * - hk: hk-value
  * - hel: hel-value
  */
-struct node_data *trie_insert(Trie *, const char *, const void *);
+void *trie_insert(Trie *, const char *, const void *);
 
 /*
  * Remove a key from the trie, releasing its payload through the trie
