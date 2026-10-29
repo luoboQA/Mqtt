@@ -253,6 +253,13 @@ int start_server(struct server *server, const char *addr, const char *port)
     }
 
     /*
+     * No event loop can touch a client now. Close remaining sockets and
+     * release buffers before snapshotting; persistent sessions stay mapped
+     * until the final snapshot has been written.
+     */
+    client_shutdown_all(server);
+
+    /*
      * Final snapshot, catching whatever the last periodic run did not: every
      * loop has stopped by now, so there is no lock left to take
      */
@@ -263,6 +270,8 @@ int start_server(struct server *server, const char *addr, const char *port)
     AUTH_DESTROY(server->auths);
     acl_destroy();
     topic_store_destroy(server->store);
+    session_destroy_all(server);
+    memorypool_destroy(server->pool);
 
     /* Destroy SSL context, if any present */
     if (conf->tls == true) {

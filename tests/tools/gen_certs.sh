@@ -15,7 +15,7 @@
 # not something a repository should carry.
 
 set -e
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 mkdir -p certs
 cd certs
 

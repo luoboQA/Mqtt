@@ -130,6 +130,7 @@ bool session_drop_oldest_queued(struct client_session *);
  * persistence loader to replay a `session-del` record
  */
 void session_delete(struct server *server, const char *session_id);
+void session_destroy_all(struct server *server);
 
 /*
  * Remove one filter from a session, the body of an UNSUBSCRIBE tuple shared

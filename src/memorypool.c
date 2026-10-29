@@ -118,6 +118,17 @@ void memorypool_destroy(struct memorypool *pool)
     free_memory(pool);
 }
 
+/* Visit every block, including free slots, while the chunks remain stable. */
+void memorypool_foreach(struct memorypool *pool, void (*visit)(void *))
+{
+    for (struct memorypool_chunk *chunk = pool->chunks; chunk;
+         chunk = chunk->header.next) {
+        unsigned char *blocks = (unsigned char *)(chunk + 1);
+        for (size_t i = 0; i < pool->blocks_nr; ++i)
+            visit(blocks + i * pool->blocksize);
+    }
+}
+
 void *memorypool_alloc(struct memorypool *pool)
 {
     /*

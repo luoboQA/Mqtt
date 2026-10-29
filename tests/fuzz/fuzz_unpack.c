@@ -37,8 +37,8 @@
  * shape the event loop does, so a crash here is a crash a client can trigger.
  */
 
-#include "../src/memory.h"
-#include "../src/mqtt.h"
+#include "../../src/memory.h"
+#include "../../src/mqtt.h"
 #include <stddef.h>
 #include <stdint.h>
 

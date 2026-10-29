@@ -380,6 +380,26 @@ static bool client_deactivate(struct client *client)
     return released;
 }
 
+/* Close any live connection and release buffers retained by reusable slots. */
+static void client_shutdown_slot(void *ptr)
+{
+    struct client *client = ptr;
+
+    if (client->online)
+        client_deactivate(client);
+
+    free_memory(client->rbuf);
+    free_memory(client->wbuf);
+    client->rbuf = NULL;
+    client->wbuf = NULL;
+}
+
+/* Called only after every event loop has stopped. */
+void client_shutdown_all(struct server *server)
+{
+    memorypool_foreach(server->pool, client_shutdown_slot);
+}
+
 /*
  * The one entry point of the close paths (read, write and protocol errors):
  * drops the connection and updates the statistics, unless the client was

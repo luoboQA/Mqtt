@@ -162,6 +162,16 @@ void session_delete(struct server *server, const char *session_id)
     persistence_mark_dirty();
 }
 
+/* Release in-memory sessions after the final snapshot has been written. */
+void session_destroy_all(struct server *server)
+{
+    while (server->sessions) {
+        struct client_session *session = server->sessions;
+        HASH_DEL(server->sessions, session);
+        DECREF(session, struct client_session);
+    }
+}
+
 /*
  * Keep the pending list in sync with the i_msgs hash: the periodic
  * retransmission scan walks it once per second per client while holding both

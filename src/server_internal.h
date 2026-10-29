@@ -35,6 +35,7 @@ struct ev_ctx;
 /* Event-loop callbacks and periodic jobs shared by server startup. */
 void client_accept_callback(struct ev_ctx *, void *);
 void client_shutdown(struct ev_ctx *, struct client *, int);
+void client_shutdown_all(struct server *);
 void cron_topics_init(struct server *);
 void cron_publish_stats(struct ev_ctx *, void *);
 void cron_inflight_msg_check(struct ev_ctx *, void *);

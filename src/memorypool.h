@@ -57,6 +57,7 @@ struct memorypool {
 
 struct memorypool *memorypool_new(size_t, size_t);
 void memorypool_destroy(struct memorypool *);
+void memorypool_foreach(struct memorypool *, void (*)(void *));
 void *memorypool_alloc(struct memorypool *);
 void memorypool_free(struct memorypool *, void *);
 
