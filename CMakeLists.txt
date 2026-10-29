@@ -32,6 +32,7 @@ set(SOURCES
     src/acl.c
     src/bst.c
     src/config.c
+    src/connect.c
     src/ev.c
     src/handlers.c
     src/iterator.c
@@ -43,8 +44,11 @@ set(SOURCES
     src/network.c
     src/pack.c
     src/persistence.c
+    src/publish.c
     src/server.c
+    src/session.c
     src/sol.c
+    src/subscribe.c
     src/subscriber.c
     src/topic.c
     src/topic_match.c

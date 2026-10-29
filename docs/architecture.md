@@ -19,10 +19,12 @@
                         └───────┬───────────────────────┬─────────┘
                                 │                       │
                  ┌──────────────▼──────────┐   ┌────────▼─────────────┐
-                 │        handlers.c       │   │  topic_store.c        │
-                 │ CONNECT/SUB/PUB/ACK...  │   │  精确主题 + 通配索引   │
-                 │ 会话、投递、QoS 状态机    │   │  topic.c/subscriber.c │
-                 └───┬────────┬────────┬───┘   └────────┬─────────────┘
+                 │ handlers.c（分发表）      │   │  topic_store.c        │
+                 │ connect.c  CONNECT/遗嘱  │   │  精确主题 + 通配索引   │
+                 │ subscribe.c 订阅/保留消息 │   │  topic.c/subscriber.c │
+                 │ publish.c PUBLISH/QoS ACK│   └────────┬─────────────┘
+                 │ session.c 会话/inflight   │            │
+                 └───┬────────┬────────┬───┘            │
                      │        │        │                │
         ┌────────────▼──┐ ┌───▼─────┐ ┌▼──────────┐ ┌───▼──────────┐
         │    mqtt.c     │ │ acl.c   │ │persistence│ │  memory.c    │
@@ -36,8 +38,9 @@
         └───────────────┘   └──────────────┘   └──────────────────┘
 ```
 
-依赖方向基本是单向的：`sol.c → server.c → handlers.c → mqtt/topic_store/
-persistence/acl → memory/util`。`topic_match.c` 是叶子模块，不依赖任何东西，
+依赖方向基本是单向的：`sol.c → server.c → handlers.c（及 connect/session/
+subscribe/publish）→ mqtt/topic_store/persistence/acl → memory/util`。
+`handlers_internal.h` 只放这几个命令模块之间共享的内部原型。`topic_match.c` 是叶子模块，不依赖任何东西，
 这是它能在没有 broker 的情况下被单测的原因。
 
 ## 2. 进程、线程与事件循环
@@ -190,7 +193,9 @@ publish_handler
 | 新增/修改 MQTT 包字段 | `mqtt.c`、`mqtt.h`、`tests/mqtt_test.c` |
 | 改主题匹配规则 | `topic_match.c`、`tests/topic_match_test.c` |
 | 改订阅索引 | `topic_store.c`、`trie.c` |
-| 改 QoS/会话行为 | `handlers.c`、`sol_internal.h` |
+| 改 QoS/会话行为 | `session.c`、`publish.c`、`sol_internal.h` |
+| 改 CONNECT/遗嘱 | `connect.c` |
+| 改订阅/保留消息 | `subscribe.c` |
 | 改连接/事件循环 | `server.c`、`ev.c`、`network.c` |
 | 改持久化格式 | `persistence.c`、`tests/integration/test_persistence.py` |
 | 改配置项 | `config.c`、`config.h`、`etc/conf/sol.conf`、`tests/config_test.c` |
