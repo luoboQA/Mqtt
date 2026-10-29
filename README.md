@@ -118,10 +118,15 @@ The binary lands in `build/sol`; `cmake --install build` puts it in
 Everything runs through CTest, from a fresh build directory:
 
 ```sh
-$ cmake -S . -B build -DDEBUG=ON
-$ cmake --build build -j
-$ ctest --test-dir build --output-on-failure
+$ cmake -S . -B build-debug -DDEBUG=ON
+$ cmake --build build-debug -j
+$ ctest --test-dir build-debug --output-on-failure
 ```
+
+The project option `DEBUG=ON` enables AddressSanitizer and UndefinedBehaviorSanitizer;
+it is separate from CMake's `CMAKE_BUILD_TYPE=Debug`. Use a fresh build directory
+when changing source location or operating system: CMake caches absolute paths and
+will reject a directory generated from another checkout path.
 
 Tests are grouped by scope and execution mode; see the
 [`tests/README.md`](tests/README.md) directory index.
