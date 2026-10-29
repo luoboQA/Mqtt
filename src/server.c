@@ -44,6 +44,83 @@
 pthread_mutex_t mutex;
 
 /*
+ * Per peer address connection accounting for max_connections_per_ip. The
+ * table is only touched under the global mutex: the accept path inserts and
+ * increments, client_deactivate_locked() decrements, and an entry disappears
+ * when its count reaches zero so a scan of random addresses cannot grow the
+ * table forever
+ */
+struct ip_conn {
+    char ip[INET6_ADDRSTRLEN + 8];
+    unsigned count;
+    UT_hash_handle hh;
+};
+
+static struct ip_conn *ip_conns = NULL;
+
+/*
+ * The connection keeps the peer as "address:port" (or "[v6]:port") because
+ * that is what makes a log line useful, but the quota is per address: every
+ * new connection comes from a different source port, so keying the table on
+ * the whole string would never count two connections together. The last ':'
+ * is the separator in both forms (the IPv6 address is bracketed)
+ */
+static void ip_key(const char *ip, char *out, size_t outsz)
+{
+    const char *colon = strrchr(ip, ':');
+    size_t len        = colon ? (size_t)(colon - ip) : strlen(ip);
+    if (len >= outsz)
+        len = outsz - 1;
+    memcpy(out, ip, len);
+    out[len] = '\0';
+}
+
+/* Caller holds the global mutex. False when the peer is over its limit */
+static bool ip_conn_acquire(const char *ip)
+{
+    if (conf->max_connections_per_ip == 0)
+        return true;
+
+    char key[INET6_ADDRSTRLEN + 8];
+    ip_key(ip, key, sizeof(key));
+
+    struct ip_conn *entry = NULL;
+    HASH_FIND_STR(ip_conns, key, entry);
+    if (entry && entry->count >= conf->max_connections_per_ip)
+        return false;
+    if (!entry) {
+        entry = try_alloc(sizeof(*entry));
+        if (!entry)
+            return false;
+        snprintf(entry->ip, sizeof(entry->ip), "%s", key);
+        entry->count = 0;
+        HASH_ADD_STR(ip_conns, ip, entry);
+    }
+    entry->count++;
+    return true;
+}
+
+/* Caller holds the global mutex */
+static void ip_conn_release(const char *ip)
+{
+    if (conf->max_connections_per_ip == 0 || !ip || !ip[0])
+        return;
+    char key[INET6_ADDRSTRLEN + 8];
+    ip_key(ip, key, sizeof(key));
+
+    struct ip_conn *entry = NULL;
+    HASH_FIND_STR(ip_conns, key, entry);
+    if (!entry)
+        return;
+    if (entry->count > 0)
+        entry->count--;
+    if (entry->count == 0) {
+        HASH_DEL(ip_conns, entry);
+        free_memory(entry);
+    }
+}
+
+/*
  * Auxiliary structure to be used as init argument for eventloop, fd is the
  * listening socket we want to share between multiple instances, cronjobs is
  * just a flag to signal if we want to register cronjobs on that particular
@@ -831,6 +908,13 @@ static void client_init(struct client *client)
     }
     client->last_seen = time(NULL);
     client->keepalive = 0;
+    /*
+     * Start with a full bucket so a client may send up to max_publish_rate
+     * messages right after connecting instead of being throttled from the
+     * first one
+     */
+    client->rate_tokens = (double)conf->max_publish_rate;
+    client->rate_last   = 0.0;
     client->has_lwt   = false;
     client->close_after_write = false;
     client->kick_pending      = false;
@@ -870,6 +954,9 @@ static bool client_deactivate_locked(struct client *client)
     close_connection(&client->conn);
 
     client->online = false;
+
+    /* The peer address slot taken at accept time is free again */
+    ip_conn_release(client->conn.ip);
 
     /*
      * The clients map indexes live connections only: drop the entry no
@@ -1460,6 +1547,14 @@ static void accept_callback(struct ev_ctx *ctx, void *data)
         pthread_mutex_lock(&mutex);
 #endif
         struct client *c = memorypool_alloc(server.pool);
+        /*
+         * Take the peer address slot in the same critical section: the
+         * table is global, and a client that fails the per IP quota must
+         * give its pool slot back before the lock is released
+         */
+        bool ip_ok = c != NULL && ip_conn_acquire(conn.ip);
+        if (c && !ip_ok)
+            memorypool_free(server.pool, c);
 #if THREADSNR > 0
         pthread_mutex_unlock(&mutex);
 #endif
@@ -1470,6 +1565,13 @@ static void accept_callback(struct ev_ctx *ctx, void *data)
         if (!c) {
             log_error("No free client slot for %s, connection refused",
                       conn.ip);
+            close_connection(&conn);
+            break;
+        }
+        if (!ip_ok) {
+            log_warning("Refusing connection from %s: max_connections_per_ip "
+                        "(%u) reached",
+                        conn.ip, conf->max_connections_per_ip);
             close_connection(&conn);
             break;
         }
@@ -1613,7 +1715,8 @@ static void process_message(struct ev_ctx *ctx, struct client *c)
          * (CONNACK, SUBACK, UNSUBACK, PINGRESP or a reserved one): there's
          * nothing decoded beside the fixed header, so no handler can be run
          * safely, report it as a protocol error and let the switch below
-         * close the connection.
+         * close the connection. mqtt_unpack() has already released whatever
+         * a failed CONNECT had allocated
          */
         log_error("Protocol error: undecodable packet type %u sent by %s",
                   io.data.header.bits.type, c->client_id);
@@ -1829,7 +1932,7 @@ int start_server(const char *addr, const char *port)
         openssl_init();
         server.ssl_ctx = create_ssl_context();
         load_certificates(server.ssl_ctx, conf->cafile, conf->certfile,
-                          conf->keyfile);
+                          conf->keyfile, conf->require_client_cert);
     }
 
     log_info("Server start");

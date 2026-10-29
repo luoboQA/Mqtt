@@ -277,6 +277,14 @@ struct client {
                                        * disables the check entirely */
     _Atomic bool online; /* Just an online flag, read by the delivery while
                             the owner loop may be deactivating the client */
+    /*
+     * Token bucket for max_publish_rate: `rate_tokens` holds the whole
+     * messages the client may still send, refilled by the elapsed time since
+     * `rate_last` (monotonic seconds). Only the event loop that owns the
+     * client reads and writes them, so no lock is needed
+     */
+    double rate_tokens;
+    double rate_last;
     bool connected;   /* States if the client has already processed a connection
                          packet */
     bool has_lwt; /* States if the connection packet carried a LWT message */

@@ -41,6 +41,16 @@ char *remove_occur(char *, char);
 char *append_string(const char *, char *, size_t);
 bool check_passwd(const char *, const char *);
 
+/*
+ * MQTT v3.1.1 §1.5.3: a UTF-8 encoded string must be well formed, must not
+ * contain U+0000 and must not encode a surrogate. Returns false on an
+ * overlong form, a truncated sequence or a code point above U+10FFFF.
+ */
+bool utf8_valid(const unsigned char *, size_t);
+
+/* Compare two NUL terminated strings without an early exit on mismatch */
+bool constant_time_eq(const char *, const char *);
+
 long get_fh_soft_limit(void);
 
 #define STREQ(s1, s2, len) (strncasecmp((s1), (s2), (len)) == 0)

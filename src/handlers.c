@@ -36,6 +36,7 @@
 #include "sol_internal.h"
 #include "topic_match.h"
 #include <stdio.h>
+#include <time.h>
 
 /* Prototype for a command handler */
 typedef int handler(struct io_event *);
@@ -76,6 +77,9 @@ static unsigned short next_free_mid(struct client_session *);
 
 static void inflight_msg_init(struct client_session *, unsigned short,
                               struct mqtt_packet *);
+
+/* True when the session already holds max_inflight messages in flight */
+static bool inflight_window_full(const struct client_session *);
 
 /*
  * Reserve `len` bytes at the end of the client's write buffer, returns true
@@ -775,6 +779,13 @@ static void deliver_retained(struct client *c, struct topic *t,
     out->header.bits.retain = 1;
 
     if (qos > AT_MOST_ONCE) {
+        if (inflight_window_full(s)) {
+            log_warning("Inflight window full (%u messages) for %s, dropping "
+                        "retained message on %s",
+                        conf->max_inflight, s->session_id, t->name);
+            DECREF(out, struct mqtt_packet);
+            return;
+        }
         unsigned short mid = next_free_mid(s);
         if (mid == 0) {
             /* Every identifier is taken, drop it like the publish path does */
@@ -881,6 +892,19 @@ int publish_message(struct mqtt_packet *pkt, const struct topic *t)
          * message, proceed with the publish towards online subscriber.
          */
         if (pkt->header.bits.qos > AT_MOST_ONCE) {
+            if (inflight_window_full(s)) {
+                /*
+                 * The per-session window is full: drop the message rather
+                 * than grow the queue without bound. The log names the
+                 * session so an operator can correlate it with a slow or
+                 * stuck subscriber
+                 */
+                log_warning("Inflight window full (%u messages) for %s, "
+                            "dropping PUBLISH to %s",
+                            conf->max_inflight, s->session_id,
+                            pkt->publish.topic);
+                continue;
+            }
             mid = next_free_mid(s);
             if (mid == 0) {
                 /*
@@ -1564,7 +1588,7 @@ static bool normalize_filter(char *dst, const char *src)
  */
 static bool valid_topic_filter(const char *f, size_t len)
 {
-    if (len == 0)
+    if (len == 0 || !utf8_valid((const unsigned char *)f, len))
         return false;
 
     for (size_t i = 0; i < len; i++) {
@@ -2185,6 +2209,47 @@ void publish_lwt(struct mqtt_packet *will)
         publish_message(will, t);
 }
 
+/*
+ * Refill the client token bucket with the time elapsed since the previous
+ * call and take one token. Returns false when the client is over its
+ * max_publish_rate; the caller drops the packet but still acknowledges it.
+ * The bucket starts full and holds at most one second worth of tokens, so a
+ * client that stays quiet cannot accumulate an unbounded burst credit
+ */
+static bool publish_rate_allow(struct client *c)
+{
+    if (conf->max_publish_rate == 0)
+        return true;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    double now = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+    if (c->rate_last > 0.0) {
+        double elapsed = now - c->rate_last;
+        if (elapsed > 0.0)
+            c->rate_tokens += elapsed * (double)conf->max_publish_rate;
+    }
+    c->rate_last = now;
+    if (c->rate_tokens > (double)conf->max_publish_rate)
+        c->rate_tokens = (double)conf->max_publish_rate;
+    if (c->rate_tokens < 1.0)
+        return false;
+    c->rate_tokens -= 1.0;
+    return true;
+}
+
+/*
+ * The session inflight window: true when the session already holds
+ * max_inflight QoS 1/2 messages awaiting an acknowledgement. The counter
+ * covers both the deliveries to a connected client and the messages queued
+ * for an away one, which is what keeps a single slow subscriber from growing
+ * its backlog without bound. A zero setting disables the cap
+ */
+static bool inflight_window_full(const struct client_session *s)
+{
+    return conf->max_inflight > 0 && s->inflights >= conf->max_inflight;
+}
+
 static int publish_handler(struct io_event *e)
 {
 
@@ -2238,6 +2303,21 @@ static int publish_handler(struct io_event *e)
             mqtt_packet_destroy(&e->data);
             return REPLY;
         }
+    }
+
+    /*
+     * Server side rate limit: a client sending more than max_publish_rate
+     * packets per second has the excess dropped. The QoS 1/2 acknowledgement
+     * still flows through ack_only, because MQTT has no way to tell a client
+     * to slow down and leaving the packet unacknowledged would only make it
+     * retransmit the same message forever
+     */
+    if (!publish_rate_allow(c)) {
+        log_warning("Publish rate limit (%u msg/s) exceeded for %s, dropping "
+                    "PUBLISH to %s",
+                    conf->max_publish_rate, c->client_id, p->topic);
+        mqtt_packet_destroy(&e->data);
+        goto ack_only;
     }
 
     /*

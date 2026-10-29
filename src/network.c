@@ -407,7 +407,7 @@ static int client_certificate_verify(int preverify_ok, X509_STORE_CTX *ctx)
 }
 
 void load_certificates(SSL_CTX *ctx, const char *ca, const char *cert,
-                       const char *key)
+                       const char *key, bool require_client_cert)
 {
 
     if (SSL_CTX_load_verify_locations(ctx, ca, NULL) <= 0) {
@@ -417,7 +417,18 @@ void load_certificates(SSL_CTX *ctx, const char *ca, const char *cert,
 
     SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE |
                               SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, client_certificate_verify);
+    /*
+     * Without require_client_cert the broker authenticates itself to the
+     * client and asks for nothing in return (the default, what a plain TLS
+     * listener does). With it the handshake only completes when the client
+     * presents a certificate that chains to `ca`: SSL_VERIFY_FAIL_IF_NO_PEER_CERT
+     * is what turns "ask for one" into "require one", SSL_VERIFY_PEER alone
+     * would accept a client that sends nothing
+     */
+    int mode = require_client_cert
+                   ? SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT
+                   : SSL_VERIFY_NONE;
+    SSL_CTX_set_verify(ctx, mode, client_certificate_verify);
     SSL_CTX_set_ecdh_auto(ctx, 1);
 
     if (SSL_CTX_use_certificate_chain_file(ctx, cert) <= 0) {

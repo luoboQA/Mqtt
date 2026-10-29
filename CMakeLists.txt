@@ -78,7 +78,8 @@ set(PROTO_TEST_SOURCES
     tests/proto_test.c
     tests/mqtt_test.c
     tests/topic_match_test.c
-    tests/config_test.c)
+    tests/config_test.c
+    tests/util_test.c)
 
 set(AUTHOR "Andrea Giacomo Baldan")
 set(LICENSE "BSD2 license")
@@ -118,10 +119,10 @@ endif ()
 
 if (APPLE)
     set(SOL_LIBS pthread ssl crypto)
-    set(CRYPT_LIBS "")
+    set(CRYPT_LIBS crypto)
 else ()
     set(SOL_LIBS pthread ssl crypto crypt)
-    set(CRYPT_LIBS crypt)
+    set(CRYPT_LIBS crypt crypto)
 endif ()
 
 # Executable

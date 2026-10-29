@@ -20,6 +20,10 @@ stats_publish_interval 1s
 max_request_size 64KB
 keepalive 60s
 retransmit_interval 2s
+# The queue tests deliberately pile up hundreds of messages for an away
+# client to watch the memory policy trim them, which the default inflight
+# window would drop long before
+max_inflight 0
 {extra}
 """
 

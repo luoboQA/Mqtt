@@ -234,6 +234,24 @@ static bool parse_port(const char *s, unsigned *out)
     return true;
 }
 
+/*
+ * A non negative decimal that fits an unsigned int, for the quota settings
+ * where 0 has the meaning "disabled". The old parse_int() stopped at the
+ * first non digit, so "20x" silently became 20
+ */
+static bool parse_uint(const char *s, unsigned *out)
+{
+    if (!s || !isdigit((unsigned char)*s))
+        return false;
+    errno             = 0;
+    char *end         = NULL;
+    unsigned long num = strtoul(s, &end, 10);
+    if (errno == ERANGE || end == s || *end != '\0' || num > UINT_MAX)
+        return false;
+    *out = (unsigned)num;
+    return true;
+}
+
 /* Format a memory in bytes to a more human-readable form, e.g. 64b or 18Kb
  * instead of huge numbers like 130230234 bytes */
 char *memory_to_string(size_t memory)
@@ -481,6 +499,40 @@ static bool add_config_value(const char *key, const char *value)
     } else if (STREQ("pid_file", key, klen) == true) {
         return set_config_str(key, config.pid_file, sizeof(config.pid_file),
                               value);
+    } else if (STREQ("max_inflight", key, klen) == true) {
+        unsigned n = 0;
+        if (!parse_uint(value, &n)) {
+            config_error(key, value,
+                         "expected a non negative number of messages");
+            return false;
+        }
+        config.max_inflight = n;
+    } else if (STREQ("max_publish_rate", key, klen) == true) {
+        unsigned n = 0;
+        if (!parse_uint(value, &n)) {
+            config_error(key, value,
+                         "expected a non negative number of messages per "
+                         "second");
+            return false;
+        }
+        config.max_publish_rate = n;
+    } else if (STREQ("max_connections_per_ip", key, klen) == true) {
+        unsigned n = 0;
+        if (!parse_uint(value, &n)) {
+            config_error(key, value,
+                         "expected a non negative number of connections");
+            return false;
+        }
+        config.max_connections_per_ip = n;
+    } else if (STREQ("require_client_cert", key, klen) == true) {
+        if (strcasecmp(value, "true") == 0)
+            config.require_client_cert = true;
+        else if (strcasecmp(value, "false") == 0)
+            config.require_client_cert = false;
+        else {
+            config_error(key, value, "expected true or false");
+            return false;
+        }
     } else if (STREQ("tls_protocols", key, klen) == true) {
         if (vlen == 0) {
             config_error(key, value, "expected at least one protocol");
@@ -636,6 +688,15 @@ bool config_check(void)
         }
     }
 
+    if (config.max_inflight > 65535)
+        config_error("max_inflight", "> 65535",
+                     "the MQTT packet identifier space holds at most 65535 "
+                     "messages in flight");
+
+    if (config.require_client_cert && !config.tls)
+        config_error("require_client_cert", "true",
+                     "requires TLS (set cafile, certfile and keyfile)");
+
     if (config.allow_anonymous == false) {
         if (config.password_file[0] == '\0')
             config_error("password_file", "",
@@ -681,6 +742,10 @@ void config_set_default(void)
     config.reclaim_interval = read_time_with_mul(DEFAULT_RECLAIM_INTERVAL);
     config.keepalive          = read_time_with_mul(DEFAULT_KEEPALIVE);
     config.retransmit_interval = read_time_with_mul(DEFAULT_RETRANSMIT);
+    config.max_inflight       = DEFAULT_MAX_INFLIGHT;
+    config.max_publish_rate   = 0;
+    config.max_connections_per_ip = 0;
+    config.require_client_cert = false;
     config.tls                = false;
     config.tls_protocols      = DEFAULT_TLS_PROTOCOLS;
     config.allow_anonymous    = true;
@@ -743,6 +808,15 @@ void config_print(void)
                          config.persistence_file, config.persistence_interval);
             if (config.tls == true)
                 config_print_tls_versions();
+            if (config.max_inflight)
+                log_info("\tMax inflight messages per session: %u",
+                         config.max_inflight);
+            if (config.max_publish_rate)
+                log_info("\tMax publish rate per client: %u msg/s",
+                         config.max_publish_rate);
+            if (config.max_connections_per_ip)
+                log_info("\tMax connections per IP: %u",
+                         config.max_connections_per_ip);
             log_info("\tFile handles soft limit: %li", get_fh_soft_limit());
         }
         const char *human_rsize = memory_to_string(config.max_request_size);

@@ -76,11 +76,19 @@ integration suite rather than by eye.
 - Periodic stats publishing
 - Support multiple topics subscriptions through wildcard (#) and (+) for single
   level wildcard e.g. foo/+/bar/#
-- Authentication through username and password
+- Authentication through username and password, hashed with scrypt by default
+  (`passwd.py`), with `crypt(3)` hashes still accepted for existing files
 - Topic level authorization through an access control file (`acl_file`):
   per client or per user rules of `read`/`write`/`readwrite` over topic
   filters, evaluated in order, deny by default
-- SSL/TLS connections, configuration accepts minimum protocols to be used
+- SSL/TLS connections, configuration accepts minimum protocols to be used,
+  with optional mutual TLS (`require_client_cert` asks the client for a
+  certificate signed by `cafile`)
+- UTF-8 validation of every string the protocol carries (client id,
+  username, topics, will, filters) as §1.5.3 requires
+- Per-session inflight window (`max_inflight`), per-client publish rate
+  (`max_publish_rate`) and per-address connection cap
+  (`max_connections_per_ip`)
 - Logging on disk
 - Daemon mode
 - Multiplexing I/O behind an abstraction: epoll, poll and select are all
@@ -97,8 +105,6 @@ the order it usually starts to hurt:
 
 - hot reload of the whole configuration (SIGHUP reopens the log file today,
   it does not re-read the file);
-- per-session quotas (inflight window, publish rate) so one client cannot
-  consume the global memory budget;
 - the scale limits stay what they are: one process, no clustering.
 
 ### Maybe
@@ -356,12 +362,27 @@ stats_publish_interval 10s
 # dropped after one and a half times this value of silence. 0 disables the cap
 # keepalive 60s
 
+# Per session window of QoS 1/2 messages in flight, online or queued for an
+# away client; over it new messages are dropped. 0 disables the cap
+# max_inflight 20
+
+# Maximum PUBLISH packets per second from one client; over it the packet is
+# dropped but the QoS 1/2 acknowledgement still flows. 0 disables the limit
+# max_publish_rate 1000
+
+# Maximum simultaneous connections from one peer address; 0 disables the limit
+# max_connections_per_ip 0
+
 # TLS certs paths. cafile doubles as the flag turning TLS on, and the server
 # does not ask the clients for a certificate of their own: it is the clients
 # that need the authority to verify this server
 # cafile /etc/sol/certs/ca.crt
 # certfile /etc/sol/certs/cert.crt
 # keyfile /etc/sol/certs/cert.key
+
+# Mutual TLS: ask every client for a certificate signed by cafile and refuse
+# the handshake when it is missing or untrusted. Requires the TLS files above
+# require_client_cert true
 
 # Authentication
 # allow_anonymous false
@@ -380,13 +401,19 @@ stats_publish_interval 10s
 If `allow_anonymous` is false, a password file have to be specified. The
 password file follows the standard format of username:password line by line.
 To generate one just add all entries needed in a file and run passwd.py after
-it:
+it. The default output is the memory-hard scrypt format
+`$scrypt$N$r$p$salt$hash`; `--crypt` still produces a `crypt(3)` hash for
+files that already use one:
 
 ```sh
 $ cat sample_passwd_file
 user1:pass1
 user2:pass2
 $ python passwd.py sample_passwd_file
+$ cat sample_passwd_file
+user1:$scrypt$16384$8$1$9f2c...$6a1d...
+user2:$scrypt$16384$8$1$04be...$b7e0...
+$ python passwd.py --crypt sample_passwd_file
 $ cat sample_passwd_file
 user1:$6$69qVAELLWuKXWQPQ$oO7lP/hNS4WPABTyK4nkJs4bcRLYFi365YX13cEc/QBJtQgqf2d5rOIUdqoUin.YVGXC3OXY9MSz7Z66ZDkCW/
 user2:$6$vtHdafhGhxpXwgBa$Y3Etz8koC1YPSYhXpTnhz.2vJTZvCUGk3xUdjyLr9z9XgE8asNwfYDRLIKN4Apz48KKwKz0YntjHsPRiE6r3g/

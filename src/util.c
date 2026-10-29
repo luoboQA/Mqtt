@@ -32,6 +32,9 @@
 #include <string.h>
 #include <crypt.h>
 #include <ctype.h>
+#include <errno.h>
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -151,10 +154,163 @@ void generate_random_id(char *dest)
     snprintf(dest, MQTT_CLIENT_ID_LEN - 1, "%s-%lu", SOL_PREFIX, utime_ns);
 }
 
+bool utf8_valid(const unsigned char *s, size_t len)
+{
+    size_t i = 0;
+    while (i < len) {
+        unsigned char c = s[i];
+        if (c == 0x00)
+            return false;
+        if (c < 0x80) {
+            i++;
+            continue;
+        }
+
+        size_t extra;
+        unsigned int cp;
+        if ((c & 0xE0) == 0xC0) {
+            extra = 1;
+            cp    = c & 0x1F;
+        } else if ((c & 0xF0) == 0xE0) {
+            extra = 2;
+            cp    = c & 0x0F;
+        } else if ((c & 0xF8) == 0xF0) {
+            extra = 3;
+            cp    = c & 0x07;
+        } else {
+            /* A continuation byte in lead position, or 0xF8..0xFF */
+            return false;
+        }
+        if (i + extra >= len)
+            return false;
+        for (size_t j = 1; j <= extra; ++j) {
+            unsigned char cc = s[i + j];
+            if ((cc & 0xC0) != 0x80)
+                return false;
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+        /* Overlong encodings are not a valid UTF-8 form (§1.5.3) */
+        if ((extra == 1 && cp < 0x80) || (extra == 2 && cp < 0x800) ||
+            (extra == 3 && cp < 0x10000))
+            return false;
+        if (cp > 0x10FFFF)
+            return false;
+        if (cp >= 0xD800 && cp <= 0xDFFF)
+            return false;
+        i += extra + 1;
+    }
+    return true;
+}
+
+bool constant_time_eq(const char *a, const char *b)
+{
+    if (!a || !b)
+        return false;
+    size_t la = strlen(a);
+    size_t lb = strlen(b);
+    /*
+     * The length itself is not a secret (the hash format fixes it), but the
+     * loop below must not stop at the first differing byte: always walk the
+     * longer string and fold the length difference into the result
+     */
+    size_t n         = la > lb ? la : lb;
+    unsigned char rc = (unsigned char)(la ^ lb);
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char ca = i < la ? (unsigned char)a[i] : 0;
+        unsigned char cb = i < lb ? (unsigned char)b[i] : 0;
+        rc |= (unsigned char)(ca ^ cb);
+    }
+    return rc == 0;
+}
+
+/*
+ * Decode a lowercase/uppercase hexadecimal string into `out`. Returns false
+ * on an odd length, an invalid digit or a result longer than `outsz`.
+ */
+static bool hex_decode(const char *hex, unsigned char *out, size_t outsz,
+                       size_t *outlen)
+{
+    size_t len = strlen(hex);
+    if (len == 0 || len % 2 != 0 || len / 2 > outsz)
+        return false;
+    for (size_t i = 0; i < len / 2; ++i) {
+        int hi = isdigit((unsigned char)hex[2 * i])
+                     ? hex[2 * i] - '0'
+                     : tolower((unsigned char)hex[2 * i]) - 'a' + 10;
+        int lo = isdigit((unsigned char)hex[2 * i + 1])
+                     ? hex[2 * i + 1] - '0'
+                     : tolower((unsigned char)hex[2 * i + 1]) - 'a' + 10;
+        if (hi < 0 || hi > 15 || lo < 0 || lo > 15)
+            return false;
+        out[i] = (unsigned char)((hi << 4) | lo);
+    }
+    *outlen = len / 2;
+    return true;
+}
+
+/*
+ * Verify a scrypt hash written by passwd.py as
+ *
+ *   $scrypt$N$r$p$<salt hex>$<hash hex>
+ *
+ * scrypt is memory hard, which is what makes an offline dictionary attack
+ * against a leaked password file expensive; crypt(3) alone (the SHA-512
+ * scheme most systems pick) is not. The parameters are bounded so a
+ * hand-edited file cannot make the broker allocate gigabytes per login.
+ */
+static bool check_scrypt(const char *passwd, const char *encoded)
+{
+    char buf[512];
+    if (strlen(encoded) >= sizeof(buf))
+        return false;
+    snprintf(buf, sizeof(buf), "%s", encoded);
+
+    char *saveptr = NULL;
+    char *scheme  = strtok_r(buf, "$", &saveptr);
+    char *sn      = strtok_r(NULL, "$", &saveptr);
+    char *sr      = strtok_r(NULL, "$", &saveptr);
+    char *sp      = strtok_r(NULL, "$", &saveptr);
+    char *shex    = strtok_r(NULL, "$", &saveptr);
+    char *hhex    = strtok_r(NULL, "$", &saveptr);
+    if (!scheme || strcmp(scheme, "scrypt") != 0 || !sn || !sr || !sp ||
+        !shex || !hhex || strtok_r(NULL, "$", &saveptr))
+        return false;
+
+    errno                  = 0;
+    char *end              = NULL;
+    unsigned long long N   = strtoull(sn, &end, 10);
+    if (errno == ERANGE || end == sn || *end != '\0' || N < 2 ||
+        N > (1ULL << 20) || (N & (N - 1)) != 0)
+        return false;
+    unsigned long long r = strtoul(sr, &end, 10);
+    if (end == sr || *end != '\0' || r == 0 || r > 32)
+        return false;
+    unsigned long long p = strtoul(sp, &end, 10);
+    if (end == sp || *end != '\0' || p == 0 || p > 16)
+        return false;
+
+    unsigned char salt[64], expected[64];
+    size_t saltlen = 0, hashlen = 0;
+    if (!hex_decode(shex, salt, sizeof(salt), &saltlen) || saltlen < 8)
+        return false;
+    if (!hex_decode(hhex, expected, sizeof(expected), &hashlen) || hashlen < 16)
+        return false;
+
+    unsigned char derived[64];
+    if (hashlen > sizeof(derived))
+        return false;
+    if (EVP_PBE_scrypt(passwd, strlen(passwd), salt, saltlen, N, r, p,
+                       64 * 1024 * 1024, derived, hashlen) != 1)
+        return false;
+    return CRYPTO_memcmp(derived, expected, hashlen) == 0;
+}
+
 bool check_passwd(const char *passwd, const char *salt)
 {
     if (!passwd || !salt)
         return false;
+    if (strncmp(salt, "$scrypt$", 8) == 0)
+        return check_scrypt(passwd, salt);
 #if defined(__APPLE__)
     /*
      * macOS provides no crypt_r(): crypt() writes its result in a static
@@ -174,7 +330,7 @@ bool check_passwd(const char *passwd, const char *salt)
 #endif
     if (!hashed)
         return false;
-    return STREQ(hashed, salt, strlen(salt));
+    return constant_time_eq(hashed, salt);
 }
 
 long get_fh_soft_limit(void)

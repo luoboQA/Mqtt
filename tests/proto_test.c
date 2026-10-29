@@ -40,6 +40,8 @@ int main(void)
         result = topic_match_test();
     if (!result)
         result = config_test();
+    if (!result)
+        result = util_test();
 
     if (result)
         printf(" %s\n", result);

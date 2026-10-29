@@ -1,10 +1,15 @@
 #!/bin/sh
 #
 # Generate the self signed certificates the TLS tests (and any manual TLS
-# run) need: a small certificate authority and a server certificate signed by
+# run) need: a small certificate authority, a server certificate signed by
 # it, with a subject alternative name for 127.0.0.1 so that a client
 # connecting to the loopback address can verify the hostname instead of being
-# told to trust anything.
+# told to trust anything, and a client certificate signed by the same
+# authority for the mutual TLS tests.
+#
+# A second, unrelated authority signs a "rogue" client certificate: the
+# broker must refuse it, which is what proves require_client_cert actually
+# verifies the chain instead of accepting any certificate.
 #
 # The files land in certs/, which is ignored by git: they are test material,
 # not something a repository should carry.
@@ -14,8 +19,10 @@ cd "$(dirname "$0")/.."
 mkdir -p certs
 cd certs
 
-if [ -f ca.crt ] && [ -f server.crt ] && [ -f server.key ]; then
-    echo "certs/ already holds a certificate authority and a server certificate"
+if [ -f ca.crt ] && [ -f server.crt ] && [ -f server.key ] && \
+   [ -f client.crt ] && [ -f client.key ] && [ -f rogue.crt ] && \
+   [ -f rogue.key ]; then
+    echo "certs/ already holds the test certificates"
     exit 0
 fi
 
@@ -33,4 +40,20 @@ openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
     -out server.crt -days 3650 -extfile server.ext >/dev/null 2>&1
 rm -f server.csr server.ext
 
-echo "wrote certs/ca.crt, certs/server.crt and certs/server.key"
+# Client certificate, signed by the same authority: accepted by a broker
+# configured with require_client_cert
+openssl req -newkey rsa:2048 -nodes -keyout client.key -out client.csr \
+    -subj "/CN=sol test client" >/dev/null 2>&1
+openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+    -out client.crt -days 3650 >/dev/null 2>&1
+rm -f client.csr
+
+# A second authority and a client certificate it signs: the broker does not
+# trust this chain and has to refuse the handshake
+openssl req -x509 -newkey rsa:2048 -nodes -keyout rogue_ca.key \
+    -out rogue_ca.crt -days 3650 -subj "/CN=sol rogue CA" >/dev/null 2>&1
+openssl req -newkey rsa:2048 -nodes -keyout rogue.key -out rogue.csr \
+    -subj "/CN=sol rogue client" >/dev/null 2>&1
+openssl x509 -req -in rogue.csr -CA rogue_ca.crt -CAkey rogue_ca.key \
+    -CAcreateserial -out rogue.crt -days 3650 >/dev/null 2>&1
+rm -f rogue.csr rogue_ca.srl ca.srl

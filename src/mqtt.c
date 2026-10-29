@@ -202,10 +202,10 @@ static u8 *copy_bytes(const u8 *src, usize len)
  */
 static bool valid_will_topic(const u8 *topic, u16 len)
 {
-    if (len == 0)
+    if (len == 0 || !utf8_valid(topic, len))
         return false;
     for (u16 i = 0; i < len; ++i)
-        if (topic[i] == '\0' || topic[i] == '+' || topic[i] == '#')
+        if (topic[i] == '+' || topic[i] == '#')
             return false;
     return true;
 }
@@ -335,6 +335,9 @@ static int unpack_mqtt_connect(u8 *buf, struct mqtt_packet *pkt, usize len)
     if (cid_len > 0) {
         memcpy(pkt->connect.payload.client_id, buf, cid_len);
         pkt->connect.payload.client_id[cid_len] = '\0';
+        /* §1.5.3: a client id is a UTF-8 string, well formed and NUL free */
+        if (!utf8_valid((const u8 *)pkt->connect.payload.client_id, cid_len))
+            return -MQTT_ERR;
         buf += cid_len;
         avail -= cid_len;
     }
@@ -365,8 +368,10 @@ static int unpack_mqtt_connect(u8 *buf, struct mqtt_packet *pkt, usize len)
 
     /* Read the username if username flag is set */
     if (pkt->connect.bits.username == 1) {
-        unpack_string16(&buf, &avail, &pkt->connect.payload.username);
-        if (!pkt->connect.payload.username)
+        u16 ulen = unpack_string16(&buf, &avail,
+                                   &pkt->connect.payload.username);
+        if (!pkt->connect.payload.username ||
+            !utf8_valid(pkt->connect.payload.username, ulen))
             return -MQTT_ERR;
     }
 
@@ -451,13 +456,16 @@ static int unpack_mqtt_publish(u8 *buf, struct mqtt_packet *pkt, usize len)
 
     /*
      * MQTT v3.1.1 §3.3.2-2: the topic name of a PUBLISH must not contain
-     * wildcard characters, and §3.1.3 forbids U+0000 in UTF-8 strings (the
-     * broker would otherwise truncate it at the NUL when building the
-     * topic key). Both are protocol errors: the connection is dropped
+     * wildcard characters, and §1.5.3 requires a well formed UTF-8 string
+     * with no U+0000 (the broker would otherwise truncate it at the NUL when
+     * building the topic key). Both are protocol errors: the connection is
+     * dropped
      */
+    if (!utf8_valid(pkt->publish.topic, pkt->publish.topiclen))
+        goto err;
     for (u16 i = 0; i < pkt->publish.topiclen; ++i) {
         u8 ch = pkt->publish.topic[i];
-        if (ch == '\0' || ch == '+' || ch == '#')
+        if (ch == '+' || ch == '#')
             goto err;
     }
 
@@ -739,6 +747,16 @@ int mqtt_unpack(u8 *buf, struct mqtt_packet *pkt, u8 byte, usize len)
         return -MQTT_ERR;
 
     rc = unpack_handlers[type](buf, pkt, len);
+
+    /*
+     * A failed unpack may still have allocated the fields read before the
+     * offending one (a CONNECT with a bad username owns the client id copy
+     * and the username string). Release them here so every caller can rely
+     * on the same contract: mqtt_unpack() leaves nothing behind on failure
+     * and the packet is destroyed by the caller only when it succeeded
+     */
+    if (rc != MQTT_OK)
+        mqtt_packet_destroy(pkt);
 
     return rc;
 }

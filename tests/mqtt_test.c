@@ -154,6 +154,59 @@ static char *test_reject_server_packet_type(void)
     return 0;
 }
 
+static char *test_reject_invalid_utf8_topic(void)
+{
+    /* The topic is 0xC3 0x28: a two byte lead followed by a byte that is not
+     * a continuation, i.e. not a well formed UTF-8 string (§1.5.3) */
+    u8 wire[] = {0x30, 0x06, 0x00, 0x02, 0xC3, 0x28, 'h', 'i'};
+    struct mqtt_packet pkt = {0};
+    ASSERT("mqtt::reject_invalid_utf8_topic...FAIL",
+           mqtt_unpack(wire + 2, &pkt, wire[0], 6) != MQTT_OK);
+    printf("mqtt::reject_invalid_utf8_topic...OK\n");
+    return 0;
+}
+
+static char *test_reject_invalid_utf8_client_id(void)
+{
+    /* Client id 0xC0 0xAF is an overlong encoding of '/', forbidden */
+    u8 wire[] = {0x10, 0x0E, 0x00, 0x04, 'M', 'Q', 'T', 'T', 0x04,
+                 0x02, 0x00, 0x3C, 0x00, 0x02, 0xC0, 0xAF};
+    struct mqtt_packet pkt = {0};
+    ASSERT("mqtt::reject_invalid_utf8_client_id...FAIL",
+           mqtt_unpack(wire + 2, &pkt, wire[0], 0x0E) != MQTT_OK);
+    printf("mqtt::reject_invalid_utf8_client_id...OK\n");
+    return 0;
+}
+
+static char *test_reject_invalid_utf8_username(void)
+{
+    /* Username is a single continuation byte, not a valid string */
+    u8 wire[] = {0x10, 0x11, 0x00, 0x04, 'M', 'Q', 'T', 'T', 0x04,
+                 0x82, 0x00, 0x3C, 0x00, 0x02, 'c', '1', 0x00, 0x01,
+                 0x80};
+    struct mqtt_packet pkt = {0};
+    ASSERT("mqtt::reject_invalid_utf8_username...FAIL",
+           mqtt_unpack(wire + 2, &pkt, wire[0], 0x11) != MQTT_OK);
+    printf("mqtt::reject_invalid_utf8_username...OK\n");
+    return 0;
+}
+
+static char *test_accept_valid_utf8_client_id(void)
+{
+    /* "café" is a legal UTF-8 client id: the validator must not reject it */
+    u8 wire[] = {0x10, 0x11, 0x00, 0x04, 'M', 'Q', 'T', 'T', 0x04,
+                 0x02, 0x00, 0x3C, 0x00, 0x05, 'c', 'a', 'f', 0xC3,
+                 0xA9};
+    struct mqtt_packet pkt = {0};
+    int rc = mqtt_unpack(wire + 2, &pkt, wire[0], 0x11);
+    ASSERT("mqtt::accept_valid_utf8_client_id...FAIL", rc == MQTT_OK);
+    ASSERT("mqtt::accept_valid_utf8_client_id id...FAIL",
+           strcmp((char *)pkt.connect.payload.client_id, "caf\xc3\xa9") == 0);
+    mqtt_packet_destroy(&pkt);
+    printf("mqtt::accept_valid_utf8_client_id...OK\n");
+    return 0;
+}
+
 char *mqtt_test(void)
 {
     RUN_TEST(test_unpack_publish_qos0);
@@ -164,5 +217,9 @@ char *mqtt_test(void)
     RUN_TEST(test_reject_qos3);
     RUN_TEST(test_reject_pingreq_with_body);
     RUN_TEST(test_reject_server_packet_type);
+    RUN_TEST(test_reject_invalid_utf8_topic);
+    RUN_TEST(test_reject_invalid_utf8_client_id);
+    RUN_TEST(test_reject_invalid_utf8_username);
+    RUN_TEST(test_accept_valid_utf8_client_id);
     return 0;
 }

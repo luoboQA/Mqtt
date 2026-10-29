@@ -125,10 +125,16 @@
 
 | 能力 | 状态 | 实现 | 测试 |
 |---|---|---|---|
-| 用户名/密码（`crypt(3)` 哈希，`passwd.py` 生成） | 完整 | `util.c:check_passwd` | `it:test_acl*`、`passwd.py` |
+| 用户名/密码（默认 scrypt，兼容 `crypt(3)`） | 完整 | `util.c:check_passwd` | `proto:util::check_passwd_scrypt`、`it:test_acl*`、`passwd.py` |
+| 密码比较常数时间 | 完整 | `util.c:constant_time_eq` | `proto:util::constant_time_eq` |
 | 主题级 ACL（读/写/遗嘱） | 完整 | `acl.c` | `it:test_acl.py` |
 | TLS（1.2/1.3） | 完整 | `network.c`、`server.c` | `it:test_tls.py` |
+| 双向 TLS（`require_client_cert`） | 完整 | `network.c:load_certificates` | `it:test_tls.py::TestMutualTls` |
 | 匿名开关 | 完整 | `allow_anonymous` | 配置测试 |
+| UTF-8 校验（client id/username/主题/遗嘱/过滤器） | 完整 | `util.c:utf8_valid` | `proto:util::utf8_valid`、`proto:mqtt::reject_invalid_utf8_*`、`it:test_invalid_utf8_*` |
+| 每会话 inflight 窗口 | 完整 | `max_inflight` | `it:test_inflight_window_bounds_the_offline_queue` |
+| 每客户端发布限流 | 完整 | `max_publish_rate` | `it:test_publish_rate_limit_acks_but_drops` |
+| 每 IP 连接数上限 | 完整 | `max_connections_per_ip` | `it:test_max_connections_per_ip` |
 | 守护进程 | 完整 | `daemonize()` | `it:test_daemon.py` |
 | 统计主题 `$SOL` | 完整 | `publish_stats()` | `it:test_stats_topic` |
 
@@ -137,6 +143,6 @@
 - MQTT 5.0（属性、原因码、共享订阅、主题别名等）。
 - 集群、桥接、共享订阅。
 - WebSocket 传输。
-- 服务端主动限速（当前只有 `max_request_size` 和内存上限）。
-- 每会话出站 inflight 窗口上限（当前受 `max_request_size` 与内存总量间接约束，
-  见 `docs/design.md`）。
+- 按 IP 的失败认证限流（连接数由 `max_connections_per_ip` 限制，但没有
+  单独的“每秒失败登录”配额）。
+- 令牌桶按秒刷新，没有更平滑的速率整形；QoS 0 超限同样丢弃。

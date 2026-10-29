@@ -91,6 +91,7 @@
 #define DEFAULT_PERSISTENCE_INTERVAL "30s"
 #define DEFAULT_RECLAIM_INTERVAL "60s"
 #define DEFAULT_RETRANSMIT       "20s"
+#define DEFAULT_MAX_INFLIGHT     20
 #ifdef TLS1_3_VERSION
 #define DEFAULT_TLS_PROTOCOLS (SOL_TLSv1_2 | SOL_TLSv1_3)
 #else
@@ -178,6 +179,33 @@ struct config {
      * always pass the same configuration
      */
     char pid_file[0xFFF];
+    /*
+     * Maximum number of QoS 1/2 messages a session may have in flight (sent
+     * and awaiting an acknowledgement, or queued while the client is away).
+     * Once the window is full new messages for that session are dropped, the
+     * way a server resource limit is allowed to behave, instead of letting a
+     * single slow subscriber grow the queue without bound. 0 disables the
+     * cap and keeps the old behaviour
+     */
+    unsigned max_inflight;
+    /*
+     * Maximum number of PUBLISH packets per second accepted from one client,
+     * as a token bucket refilled every second. Over the rate the packet is
+     * dropped, but the QoS 1/2 acknowledgement still flows so the client is
+     * not left retransmitting it. 0 (the default) disables the limit
+     */
+    unsigned max_publish_rate;
+    /*
+     * Maximum number of simultaneous connections from one peer address. Over
+     * the limit the new connection is closed right after accept. 0 (the
+     * default) disables the limit
+     */
+    unsigned max_connections_per_ip;
+    /*
+     * Ask every TLS client for a certificate signed by `cafile` and refuse
+     * the handshake when it does not present a valid one (mutual TLS)
+     */
+    bool require_client_cert;
 };
 
 extern struct config *conf;

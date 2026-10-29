@@ -112,6 +112,10 @@ static char *test_config_rejects_bad_values(void)
         "log_level LOUD\n",
         "tls_protocols tlsv9\n",
         "stats_publish_interval 0\n",
+        "max_inflight -1\n",
+        "max_publish_rate 1.5\n",
+        "max_connections_per_ip x\n",
+        "require_client_cert maybe\n",
     };
 
     for (size_t i = 0; i < sizeof(bad) / sizeof(*bad); ++i) {
@@ -153,11 +157,61 @@ static char *test_config_check_rejects_bad_port(void)
     return 0;
 }
 
+static char *test_config_limits(void)
+{
+    char path[] = "/tmp/sol_cfg_test_XXXXXX";
+    const char *content = "max_inflight 100\n"
+                          "max_publish_rate 25\n"
+                          "max_connections_per_ip 4\n";
+    ASSERT("config::limits::mkstemp...FAIL", write_conf(path, content) == 0);
+
+    config_set_default();
+    ASSERT("config::limits::load...FAIL", config_load(path) == true);
+    ASSERT("config::limits::inflight...FAIL", conf->max_inflight == 100);
+    ASSERT("config::limits::rate...FAIL", conf->max_publish_rate == 25);
+    ASSERT("config::limits::per_ip...FAIL",
+           conf->max_connections_per_ip == 4);
+    unlink(path);
+    close_run_fd();
+    printf("config::limits...OK\n");
+    return 0;
+}
+
+static char *test_config_check_cross_field(void)
+{
+    char path[] = "/tmp/sol_cfg_test_XXXXXX";
+
+    /* max_inflight cannot exceed the 16 bit packet identifier space */
+    ASSERT("config::cross::mkstemp...FAIL",
+           write_conf(path, "max_inflight 70000\n") == 0);
+    config_set_default();
+    ASSERT("config::cross::load...FAIL", config_load(path) == true);
+    ASSERT("config::cross::inflight...FAIL", config_check() == false);
+    unlink(path);
+    close_run_fd();
+
+    /* Mutual TLS needs a TLS listener: there is no certificate to ask for
+     * otherwise */
+    char path2[] = "/tmp/sol_cfg_test_XXXXXX";
+    ASSERT("config::cross2::mkstemp...FAIL",
+           write_conf(path2, "require_client_cert true\n") == 0);
+    config_set_default();
+    ASSERT("config::cross2::load...FAIL", config_load(path2) == true);
+    ASSERT("config::cross2::tls...FAIL", config_check() == false);
+    unlink(path2);
+    close_run_fd();
+
+    printf("config::check_cross_field...OK\n");
+    return 0;
+}
+
 char *config_test(void)
 {
     RUN_TEST(test_config_load);
     RUN_TEST(test_config_rejects_unknown_key);
     RUN_TEST(test_config_rejects_bad_values);
     RUN_TEST(test_config_check_rejects_bad_port);
+    RUN_TEST(test_config_limits);
+    RUN_TEST(test_config_check_cross_field);
     return 0;
 }
