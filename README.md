@@ -53,8 +53,10 @@ integration suite rather than by eye.
 - Support for QoS messages 0, 1 and 2
 - Retained messages per topic
 - On disk persistence of the retained messages and of the persistent sessions
-  (their subscriptions and the messages queued for their disconnected
-  clients), snapshotted periodically and on a clean shutdown
+  (their subscriptions, the messages queued for their disconnected clients and
+  the in-flight QoS 1/2 state of their connections), snapshotted periodically
+  and on a clean shutdown, with an fsync'd write-ahead log replayed between
+  two snapshots
 - `max_memory` enforcement: unused topics are reclaimed, the oldest queued
   messages are dropped under pressure and new connections are refused when
   nothing is left to give back (`reclaim_interval` sets the idle interval)
@@ -78,16 +80,14 @@ integration suite rather than by eye.
 
 ### To be implemented
 
-The two entries that used to sit here (persistence of the state of a
-disconnected client, and enforcing `max_memory`) are done. What a deployment
-beyond a trusted network still wants, in the order it usually starts to hurt:
+The entries that used to sit here (persistence of the state of a disconnected
+client, enforcing `max_memory`, the write-ahead log) are done. What a
+deployment beyond a trusted network still wants, in the order it usually
+starts to hurt:
 
-- a write ahead log (or an fsync'd append) for the persistence, which is a
-  periodic snapshot today: a hard crash costs up to one interval;
 - operability: a pid file, log rotation, a configuration reload, metrics
   beyond the `$SOL` feed;
-- the scale limits stay what they are: one process, and roughly 2MB of tables
-  pre-allocated per session.
+- the scale limits stay what they are: one process, no clustering.
 
 ### Maybe
 
@@ -99,21 +99,19 @@ beyond a trusted network still wants, in the order it usually starts to hurt:
 
 为了代码好读，broker 有意做了几处简化。做实验时不要把下面这些当成 MQTT 规范：
 
-- **主题名统一补末尾的 `/`**：内部所有主题都归一化成 `foo/bar/`，所以 `a` 和 `a/`
-  会被当成同一个主题；按规范它们是两个不同的主题名（后者多一个空层级）。
-- **`$` 开头的主题可以发布**：`$SOL/...` 只是命名约定，broker 不拦客户端发布。订阅侧
-  已按 §4.7.2 处理：`#`/`+` 开头的过滤器不匹配 `$` 开头的主题，必须显式订阅
-  `$SOL/#`（见 `examples/stats_demo.py`）。
+- **`$` 是 broker 保留的命名空间**：客户端向 `$` 开头的主题 PUBLISH 会被丢弃（QoS
+  握手仍然完成，避免客户端无限重传），带 `$` 遗嘱的 CONNECT 会被拒绝。订阅侧按
+  §4.7.2 处理：`#`/`+` 开头的过滤器不匹配 `$` 开头的主题，必须显式订阅 `$SOL/#`
+  （见 `examples/stats_demo.py`）。
 - **`max_memory` 是三级策略而不是硬上限**：超限时依次"回收空主题 → 丢弃最旧的离线
-  队列消息 → 拒绝新连接"，每一步都会打日志。低于进程基线（约 50MB，主要是客户端
-  内存池与每条连接 2×`max_request_size` 的缓冲）的限额会让 broker 一开始就拒收连接，
-  启动时会有一条 warning。
-- **每个会话固定预分配 65536 项的在途表**（`i_msgs`/`i_acks`，约 2MB/会话），
-  会话数量很大时内存增长很快。
-- **持久化只覆盖"存储"状态**：保留消息、持久会话的订阅和离线队列会落盘
-  （`persistence_file`），但**不包含**快照那一刻仍在线连接的在途 QoS 1/2 状态、
-  入站 QoS 2 去重集合和遗嘱——这些只对"重启已经拆掉的那条连接"有意义。
-  另外快照是周期性的，硬崩溃（kill -9 / 断电）最多丢一个 `persistence_interval`。
+  队列消息 → 拒绝新连接"，每一步都会打日志。低于进程基线（不到 1MB，客户端内存池
+  只预分配 1024 个槽位，连接缓冲区按需从几 KB 增长）的限额会让 broker 一开始就
+  拒收连接，启动时会有一条 warning。
+- **持久化覆盖会话状态，但不含遗嘱**：保留消息、持久会话的订阅、离线队列、连接上
+  仍在途的 QoS 1/2 消息、PUBREL 阶段和入站 QoS 2 去重集合都会落盘
+  （`persistence_file` 及其 `.wal`），遗嘱属于某一条网络连接，不随会话恢复。
+  快照之间由预写日志兜底，每条记录都会 fsync，硬崩溃（kill -9 / 断电）最多丢最后
+  一条记录，而不是整个 `persistence_interval`。
 
 ## Build
 
@@ -218,8 +216,10 @@ max_memory 2GB
 # reclaim_interval 60s
 
 # State that must survive a restart: retained messages and persistent sessions
-# are snapshotted here, every persistence_interval seconds when something
-# changed and once more on a clean shutdown. Unset keeps everything in memory
+# (with their in-flight QoS 1/2 state) are snapshotted here, every
+# persistence_interval seconds when something changed and once more on a clean
+# shutdown. Mutations between snapshots go to <file>.wal and are fsynced
+# before the broker moves on. Unset keeps everything in memory
 # persistence_file /tmp/sol.db
 # persistence_interval 30s
 

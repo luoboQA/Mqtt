@@ -31,6 +31,36 @@ class TestDelivery(base_testcase.BaseTestcase):
         conn, _ = self.connect('alive-check')
         conn.close()
 
+    def read_publish(self, conn, buf=b''):
+        """Next PUBLISH of the stream, carrying over what was read already:
+        the broker may pack several packets into a single segment"""
+        conn.settimeout(5)
+        while True:
+            while len(buf) < 2:
+                chunk = conn.recv(2048)
+                self.assertTrue(chunk, 'the broker closed while a message '
+                                'was due')
+                buf += chunk
+            # Walk the Remaining Length field, reading more if it is split
+            mult, remaining, pos = 1, 0, 1
+            while True:
+                if len(buf) <= pos:
+                    buf += conn.recv(2048)
+                    continue
+                byte = buf[pos]
+                remaining += (byte & 127) * mult
+                mult *= 128
+                pos += 1
+                if not byte & 128:
+                    break
+            total = pos + remaining
+            if len(buf) >= total:
+                return sol_test.read_publish(buf[:total]), buf[total:]
+            chunk = conn.recv(2048)
+            self.assertTrue(chunk, 'the broker closed while a message was '
+                            'due')
+            buf += chunk
+
     def test_wildcard_subscribe_after_exact(self):
         """"a" and "a/#" live on the very same node of the topic tree:
         subscribing the bare topic first used to silently drop the wildcard
@@ -390,6 +420,114 @@ class TestDelivery(base_testcase.BaseTestcase):
                 sub.recv(100)
         finally:
             sub.close()
+        self.assert_broker_alive()
+
+    def test_exact_topic_distinguishes_trailing_slash(self):
+        """"slash/a" and "slash/a/" are two different topic names (§4.7):
+        an exact subscription to the first must never receive a message
+        published to the second"""
+        sub, _ = self.connect('slash-sub')
+        try:
+            self.subscribe(sub, 1, {'slash/a': 0})
+            pub, _ = self.connect('slash-pub')
+            try:
+                pub.sendall(sol_test.create_publish('slash/a/', 'wrong'))
+                pub.sendall(sol_test.create_publish('slash/a', 'right'))
+            finally:
+                pub.close()
+            # If the empty level matched, "wrong" would be the first packet
+            _, topic, payload, _ = sol_test.read_publish(sub.recv(100))
+            self.assertEqual(topic, 'slash/a')
+            self.assertEqual(payload, b'right')
+            sub.settimeout(2)
+            with self.assertRaises(socket.timeout):
+                sub.recv(100)
+        finally:
+            sub.close()
+        self.assert_broker_alive()
+
+    def test_exact_topic_with_trailing_slash_is_not_the_parent(self):
+        """The mirror case: subscribing to "slash/b/" must receive the empty
+        final level and not the bare parent "slash/b" """
+        sub, _ = self.connect('slash2-sub')
+        try:
+            self.subscribe(sub, 1, {'slash/b/': 0})
+            pub, _ = self.connect('slash2-pub')
+            try:
+                pub.sendall(sol_test.create_publish('slash/b', 'parent'))
+                pub.sendall(sol_test.create_publish('slash/b/', 'child'))
+            finally:
+                pub.close()
+            _, topic, payload, _ = sol_test.read_publish(sub.recv(100))
+            self.assertEqual(topic, 'slash/b/')
+            self.assertEqual(payload, b'child')
+            sub.settimeout(2)
+            with self.assertRaises(socket.timeout):
+                sub.recv(100)
+        finally:
+            sub.close()
+        self.assert_broker_alive()
+
+    def test_multilevel_wildcard_covers_the_empty_level(self):
+        """"w/#" covers the parent "w", the empty level "w/" and everything
+        below "w/": the three are distinct names and all three are matched"""
+        sub, _ = self.connect('multilevel-sub')
+        try:
+            self.subscribe(sub, 1, {'w/#': 0})
+            pub, _ = self.connect('multilevel-pub')
+            try:
+                for topic in ('w', 'w/', 'w/x'):
+                    pub.sendall(sol_test.create_publish(topic, topic))
+            finally:
+                pub.close()
+            got = []
+            buf = b''
+            for _ in range(3):
+                publish, buf = self.read_publish(sub, buf)
+                got.append(publish[1])
+            self.assertEqual(got, ['w', 'w/', 'w/x'])
+        finally:
+            sub.close()
+        self.assert_broker_alive()
+
+    def test_publish_to_reserved_topic_is_dropped(self):
+        """A client must not inject messages into the broker's '$' namespace
+        (§4.7.2): the PUBLISH is dropped, but the QoS handshake completes so
+        the publisher does not retransmit it forever"""
+        sub, _ = self.connect('dollar-sub')
+        try:
+            self.subscribe(sub, 1, {'$OTHER/#': 0})
+            pub, _ = self.connect('dollar-pub')
+            try:
+                pub.sendall(sol_test.create_publish('$OTHER/hack', 'nope',
+                                                    qos=1, mid=5))
+                ack = pub.recv(100)
+                self.assertEqual(ack[0], 0x40)  # PUBACK
+                self.assertEqual(ack[2:4], b'\x00\x05')
+            finally:
+                pub.close()
+            sub.settimeout(2)
+            with self.assertRaises(socket.timeout):
+                sub.recv(100)
+        finally:
+            sub.close()
+        self.assert_broker_alive()
+
+    def test_will_on_reserved_topic_is_refused(self):
+        """A will is a PUBLISH the broker sends on behalf of the client: a
+        will topic in the '$' namespace is refused at CONNECT instead of
+        being silently dropped later (§3.1.4)"""
+        conn = self.get_connection()
+        conn.settimeout(3)
+        try:
+            conn.sendall(sol_test.create_connect('dollar-will',
+                                                 will_topic='$OTHER/will',
+                                                 will_payload=b'boom'))
+            connack, rc = sol_test.read_connack(conn.recv(100))
+            self.assertEqual(connack, 32)
+            self.assertEqual(rc, 0x05)  # not authorized
+        finally:
+            conn.close()
         self.assert_broker_alive()
 
     def test_persistent_session_offline_queue(self):

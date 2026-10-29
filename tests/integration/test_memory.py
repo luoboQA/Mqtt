@@ -112,6 +112,20 @@ class TestMemory(unittest.TestCase):
         self.watcher = conn
         return conn
 
+    def drain_stats(self):
+        """Discard the statistics already queued on the watcher, so the next
+        read waits for a tick published after the caller's workload"""
+        self.watcher.settimeout(0)
+        try:
+            while True:
+                try:
+                    if not self.watcher.recv(65536):
+                        return
+                except (BlockingIOError, TimeoutError):
+                    return
+        finally:
+            self.watcher.settimeout(5)
+
     def memory_used(self):
         """Next $SOL/broker/memory/used/ payload published after the call"""
         if not self.watcher:
@@ -140,6 +154,69 @@ class TestMemory(unittest.TestCase):
             buf += chunk
 
     # -- tests --------------------------------------------------------
+
+    def test_idle_connections_do_not_allocate_full_buffers(self):
+        """The read and write buffers grow on demand from a few KB: 40 idle
+        connections must not cost two max_request_size blocks each (128KB
+        here), which is what preallocating them per accepted socket did"""
+        self.write_conf()
+        self.start_broker()
+        self.watcher_connection()
+        time.sleep(1.2)
+        self.drain_stats()
+        before = self.memory_used()
+
+        conns = []
+        try:
+            for _ in range(40):
+                conns.append(socket.create_connection((HOST, PORT),
+                                                      timeout=5))
+            # The accept callback allocates the buffers before any byte is
+            # read: no CONNECT is needed to make them show up
+            time.sleep(1.2)
+            self.drain_stats()
+            grown = self.memory_used()
+        finally:
+            for conn in conns:
+                conn.close()
+
+        self.assertGreater(grown, before, 'the connections cost nothing')
+        # 8KB of buffers plus the pool bookkeeping per connection, against
+        # the 128KB the eager allocation used to cost
+        self.assertLess(grown - before, 40 * 24 * 1024,
+                        'the buffers were allocated in full on accept')
+
+    def test_inflight_state_is_sparse(self):
+        """A session only pays for the messages it actually has in flight:
+        the old tables were two arrays of 65536 slots (~1MB) allocated for
+        every session, empty or not. 200 queued QoS 1 messages must stay far
+        below that, payloads included"""
+        self.write_conf()
+        self.start_broker()
+        self.watcher_connection()
+        sub, _ = self.connect('sparse-sub', clean_session=False)
+        self.subscribe(sub, 1, {'sparse/topic': 1})
+        sub.close()
+        time.sleep(0.3)
+
+        pub, _ = self.connect('sparse-pub')
+        time.sleep(1.2)
+        self.drain_stats()
+        before = self.memory_used()
+        try:
+            for mid in range(1, 201):
+                pub.sendall(sol_test.create_publish('sparse/topic', b'x' * 16,
+                                                    qos=1, mid=mid))
+                pub.recv(100)  # PUBACK
+        finally:
+            pub.close()
+        time.sleep(1.2)
+        self.drain_stats()
+        grown = self.memory_used()
+
+        self.assertGreater(grown, before, 'the queue did not grow the heap')
+        self.assertLess(grown - before, 512 * 1024,
+                        'the in-flight tables were allocated in full')
 
     def test_unused_topics_are_reclaimed(self):
         """Every topic ever published to stays in the store forever: the
@@ -182,11 +259,21 @@ class TestMemory(unittest.TestCase):
             pub.close()
             sub.close()
 
-        time.sleep(3)
-        after = self.memory_used()
-        self.assertLess(after, grown, 'the unused topics were never released')
-        self.assertLess(after - before, 8192,
-                        'the store did not come back to its baseline')
+        # The reclamation runs on its own tick, and the statistics message
+        # the watcher reads may have been published just before it: poll
+        # until a fresh one reflects the released memory instead of assuming
+        # a fixed delay is enough on every machine
+        deadline = time.time() + 10
+        while True:
+            after = self.memory_used()
+            if after - before < 8192:
+                break
+            if time.time() > deadline:
+                self.assertLess(after, grown,
+                                'the unused topics were never released')
+                self.assertLess(after - before, 8192,
+                                'the store did not come back to its baseline')
+            time.sleep(0.5)
 
     def test_memory_pressure_drops_the_oldest_queued_messages(self):
         """Over the limit and with nothing reclaimable left, the broker gives
@@ -279,7 +366,21 @@ class TestMemory(unittest.TestCase):
         """A limit the broker cannot honour even after reclaiming everything
         (here: below the memory the process starts with) makes it refuse new
         connections, and say so once, instead of pretending to work"""
-        self.write_conf('max_memory 1MB')
+        # The startup baseline is measured on this machine rather than
+        # assumed: it used to be ~56MB (the client pool was preallocated in
+        # full), it is under a megabyte now, and a fixed limit would silently
+        # stop testing the refusal the day it grew past that number.
+        #
+        # The measurement comes from a connection of our own, whose buffers
+        # and session die with the broker, so the number read here is above
+        # what the next start really holds: a fraction of it is safely below
+        # that baseline without hardcoding a byte count
+        self.write_conf()
+        self.start_broker()
+        baseline = self.memory_used()
+        self.stop_broker()
+
+        self.write_conf('max_memory %d' % max(1, baseline // 8))
         self.start_broker()
         time.sleep(1.5)  # let a memory check run and set the flag
 

@@ -29,11 +29,15 @@
 #define PERSISTENCE_H
 
 #include <stdbool.h>
+#include <time.h>
 
 /*
  * On disk persistence of the state a broker restart must not lose: the
  * retained message of every topic and the persistent sessions, with their
- * subscriptions and the messages queued while their client was away.
+ * subscriptions, the messages queued while their client was away and the
+ * in flight state of their connections (a stored PUBLISH awaiting its
+ * acknowledgement, the PUBREL half of a QoS 2 flow and the inbound QoS 2
+ * deduplication set).
  *
  * A snapshot is written periodically (and once more on a clean shutdown) to
  * the file named by the `persistence_file` configuration key: the whole state
@@ -41,10 +45,14 @@
  * a crash in the middle of a write can never leave a truncated file behind
  * for the next start to read.
  *
- * What is *not* persisted, deliberately (see the README): the in flight state
- * of the connections that are online at the time of the snapshot, the inbound
- * QoS 2 deduplication set and the wills, all of which only make sense for a
- * connection that a restart has already torn down.
+ * Between two snapshots every mutation is appended to a write-ahead log
+ * (`<persistence_file>.wal`), fsynced before the broker moves on: a crash
+ * loses at most the last append, not the whole interval since the previous
+ * snapshot. The log is replayed on top of the snapshot at startup and
+ * truncated once a fresh snapshot has replaced the old one.
+ *
+ * What is *not* persisted, deliberately (see the README): the wills, which
+ * belong to the network connection of a client rather than to its session.
  */
 
 /*
@@ -56,6 +64,43 @@ void persistence_mark_dirty(void);
 
 /* True when the state changed since the last save */
 bool persistence_is_dirty(void);
+
+/*
+ * Write-ahead log. Every mutation covered by the snapshot appends one record
+ * to `<persistence_file>.wal` before the in-memory state is used again; the
+ * snapshot becomes the compaction point, after which the log is truncated.
+ * A crash between two snapshots therefore loses at most the records the
+ * kernel did not accept, not the whole interval. All the calls below are
+ * no-ops when persistence is disabled, during the initial load, and for the
+ * state of a clean session (which the snapshot never keeps).
+ */
+struct client_session;
+struct inflight_msg;
+
+void persistence_wal_retained(const char *topic, const unsigned char *payload,
+                              size_t len, unsigned char qos);
+void persistence_wal_retained_clear(const char *topic);
+void persistence_wal_session(const char *session_id);
+void persistence_wal_session_del(const char *session_id);
+void persistence_wal_sub(const char *session_id, const char *filter,
+                         unsigned char qos, bool multilevel);
+void persistence_wal_unsub(const char *session_id, const char *filter,
+                           bool multilevel);
+void persistence_wal_queued(const char *session_id, const char *topic,
+                            unsigned char qos, unsigned short mid,
+                            const unsigned char *payload, size_t len);
+void persistence_wal_dropped(const char *session_id, unsigned short mid);
+void persistence_wal_flush(const char *session_id, unsigned long count);
+void persistence_wal_inflight(struct client_session *session,
+                              struct inflight_msg *imsg);
+void persistence_wal_inflight_del(const char *session_id, unsigned short mid);
+void persistence_wal_ack(const char *session_id, unsigned short mid,
+                         time_t ack_sent);
+void persistence_wal_q2(const char *session_id, unsigned short mid);
+void persistence_wal_q2_del(const char *session_id, unsigned short mid);
+
+/* Truncate the log after a successful snapshot (compaction) */
+void persistence_wal_compact(void);
 
 /*
  * Write the state to `path`. A NULL or empty path disables persistence

@@ -71,6 +71,13 @@
 #define MAX_INFLIGHT_MSGS 65536
 
 /*
+ * Read and write buffers start this small and double on demand, up to
+ * max_request_size. An idle connection that only exchanges CONNECT/PINGREQ
+ * costs a few KB instead of two full max_request_size blocks
+ */
+#define INITIAL_BUFFER_SIZE 4096
+
+/*
  * An MQTT topic is composed by a name which identify it, a retained message
  * which must be forwarded to all subscribing clients and a map of subscribers,
  * the handle is a struct subscriber pointer which have to be initialized at
@@ -158,9 +165,18 @@ struct subscription {
  */
 struct inflight_msg {
     time_t seen; /* Timestamp of the last time we have seen this msg */
+    /*
+     * When a QoS 2 PUBREC has acknowledged the PUBLISH, the stored packet is
+     * released and only the PUBREL is retransmitted until the PUBCOMP lands:
+     * this is the timestamp of the last PUBREL. Zero while the PUBLISH itself
+     * is still the thing awaiting an acknowledgement
+     */
+    time_t ack_sent;
     struct mqtt_packet
         *packet;       /* The payload to be written out in case of timeout */
     unsigned char qos; /* The QoS at the time of the publish */
+    unsigned short mid; /* The packet identifier this entry belongs to */
+    UT_hash_handle hh; /* UTHASH handle, keyed by mid */
 };
 
 /*
@@ -175,6 +191,10 @@ struct inflight_msg {
 struct queued_msg {
     struct mqtt_packet *packet;
     u16 mid;
+    /* The QoS granted to this subscriber: the packet is shared with every
+       other subscriber of the same publish and its header carries whichever
+       level was written last, so the queue entry has to keep its own */
+    unsigned char qos;
 };
 
 /*
@@ -229,9 +249,13 @@ struct client {
     volatile atomic_size_t
         toread;                   /* The number of bytes that have to be read */
     unsigned char *rbuf;          /* The reading buffer */
+    size_t rbuf_cap;              /* Bytes allocated for rbuf, grown on
+                                     demand up to max_request_size */
     volatile atomic_size_t wrote; /* The number of bytes already written */
     volatile atomic_size_t towrite; /* The number of bytes we have to write */
     unsigned char *wbuf;            /* The writing buffer */
+    size_t wbuf_cap;                /* Bytes allocated for wbuf, grown on
+                                       demand up to max_request_size */
     char client_id[MQTT_CLIENT_ID_LEN]; /* The client ID according to MQTT specs
                                          */
     char username[MQTT_CLIENT_ID_LEN]; /* The username the CONNECT carried,
@@ -277,9 +301,10 @@ struct client {
  * Every client has a session which track his subscriptions, possible missed
  * messages during disconnection time (that iff clean_session is set to false),
  * inflight messages and the message ID for each one.
- * A maximum of 65535 mid can be used at the same time according to MQTT specs,
- * so i_acks, i_msgs, thus being allocated on the heap during the init, will be
- * of 65535 length each.
+ * The identifier space is 65535 entries per MQTT, but only the ones actually
+ * awaiting an acknowledgement are stored: i_msgs is a hash keyed by mid, so a
+ * session with ten messages in flight pays for ten entries instead of the
+ * 2MB two fixed arrays of 65536 slots used to take.
  *
  * It's a hashable struct that will be tracked during the entire lifetime of
  * the application, governed by the clean_session flag on connection from
@@ -298,9 +323,13 @@ struct client_session {
                                           */
     struct mqtt_packet
         lwt_msg;    /* A possibly NULL LWT message, will be set on connection */
-    time_t *i_acks; /* Inflight ACKs that must be cleared */
-    struct inflight_msg *
-        i_msgs; /* Inflight MSGs that must be sent out DUP in case of timeout */
+    /*
+     * Inflight messages, keyed by packet identifier: entries awaiting a
+     * PUBACK/PUBCOMP hold the packet to retransmit with DUP set, entries
+     * awaiting a PUBCOMP after the PUBREC hold only the PUBREL timestamp.
+     * Sparse on purpose, NULL until the first QoS > 0 delivery
+     */
+    struct inflight_msg *i_msgs;
     /*
      * Packet identifiers currently awaiting an acknowledgement, kept as a
      * small dynamic array so that the periodic retransmission scan (and the
@@ -459,7 +488,7 @@ void topic_store_add_wildcard(struct topic_store *, struct subscription *);
 /*
  * Remove a wildcard by id key from the topic_store struct
  */
-void topic_store_remove_wildcard(struct topic_store *, char *);
+void topic_store_remove_wildcard(struct topic_store *, const char *);
 
 /*
  * Remove the subscriptions registered for one specific filter by a given
@@ -493,9 +522,9 @@ typedef void (*wildcard_cb)(struct subscription *, void *);
 
 /*
  * Invoke the callback for every wildcard subscription matching the given
- * topic, the topic must be normalized to end with a trailing '/' as the rest
- * of the codebase does. Only the levels of the topic are walked, so the cost
- * is O(levels) rather than O(registered wildcard subscriptions)
+ * topic, keyed exactly as published ("a" and "a/" are distinct). Only the
+ * levels of the topic are walked, so the cost is O(levels) rather than
+ * O(registered wildcard subscriptions)
  */
 void topic_store_match_wildcards(struct topic_store *, const char *,
                                  wildcard_cb, void *);
@@ -528,8 +557,8 @@ void topic_store_wildcards_foreach(struct topic_store *, const char *client_id,
 
 /*
  * Track/drop a packet identifier awaiting PUBACK/PUBCOMP in the session
- * pending list, keeping it consistent with the i_msgs/i_acks tables. Both
- * are idempotent: untracking an identifier that is not pending is a no-op
+ * pending list, keeping it consistent with the i_msgs hash. Both are
+ * idempotent: untracking an identifier that is not pending is a no-op
  * (a duplicate PUBACK for a retained flush is valid)
  */
 void inflight_track_mid(struct client_session *, unsigned short);

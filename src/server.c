@@ -166,9 +166,9 @@ static void client_shutdown(struct ev_ctx *ctx, struct client *c, int rc)
     log_error("Closing connection with %s (%s): %s", c->client_id,
               c->conn.ip, solerr(rc));
     /*
-     * Deliver the LWT, if any: publish_lwt() runs the same normalized
-     * path a normal PUBLISH takes (trailing '/' topic key, wildcard
-     * subscriber attach) and takes the locks it needs itself. Doing the
+     * Deliver the LWT, if any: publish_lwt() runs the same path a normal
+     * PUBLISH takes (exact topic key, wildcard subscriber attach) and
+     * takes the locks it needs itself. Doing the
      * lookup while holding the global mutex and then calling
      * publish_message(), which acquires that same non-recursive mutex
      * on entry, would deadlock this very thread and freeze the broker
@@ -460,8 +460,10 @@ static void inflight_msg_check(struct ev_ctx *ctx, void *data)
         bool dirty = false;
         for (unsigned i = 0; i < s->pending_len; ++i) {
             unsigned short mid = s->pending_mids[i];
+            struct inflight_msg *imsg = session_inflight(s, mid);
+            if (!imsg)
+                continue;
             // Messages: re-send with the DUP flag set
-            struct inflight_msg *imsg = &s->i_msgs[mid];
             if (imsg->packet &&
                 (now - imsg->seen) > (time_t)conf->retransmit_interval) {
                 struct mqtt_packet *p = imsg->packet;
@@ -476,7 +478,7 @@ static void inflight_msg_check(struct ev_ctx *ctx, void *data)
                 // Set DUP flag to 1
                 mqtt_set_dup(p);
                 size = mqtt_size(p, NULL);
-                if (c->towrite + size > conf->max_request_size) {
+                if (!outgoing_reserve(c, size)) {
                     /*
                      * The subscriber is not draining its buffer yet, keep
                      * the original timestamp so the message is retried on
@@ -499,8 +501,8 @@ static void inflight_msg_check(struct ev_ctx *ctx, void *data)
                 imsg->seen = now;
             }
             // Acks: re-send the PUBREL still awaiting a PUBCOMP
-            if (s->i_acks[mid] > 0 &&
-                (now - s->i_acks[mid]) > (time_t)conf->retransmit_interval) {
+            if (imsg->ack_sent > 0 &&
+                (now - imsg->ack_sent) > (time_t)conf->retransmit_interval) {
                 /*
                  * A well formed PUBREL: the fixed header byte must be set
                  * explicitly (mqtt_ack() only fills the packet identifier)
@@ -512,7 +514,7 @@ static void inflight_msg_check(struct ev_ctx *ctx, void *data)
                     .header = (union mqtt_header){.byte = PUBREL_B}};
                 mqtt_ack(&ack, mid);
                 size = mqtt_size(&ack, NULL);
-                if (c->towrite + size > conf->max_request_size)
+                if (!outgoing_reserve(c, size))
                     continue;
                 log_debug("Re-sending ack to %s", c->client_id);
                 // Serialize the packet and send it out again
@@ -522,7 +524,7 @@ static void inflight_msg_check(struct ev_ctx *ctx, void *data)
                 // Update information stats
                 info.messages_sent++;
                 /* Same as above: wait another interval before re-sending */
-                s->i_acks[mid] = now;
+                imsg->ack_sent = now;
             }
         }
         /*
@@ -737,14 +739,28 @@ static void client_init(struct client *client)
     client->rpos          = ATOMIC_VAR_INIT(0);
     client->read          = ATOMIC_VAR_INIT(0);
     client->toread        = ATOMIC_VAR_INIT(0);
-    if (!client->rbuf)
-        client->rbuf =
-            try_calloc(conf->max_request_size, sizeof(unsigned char));
+    /*
+     * The buffers start at INITIAL_BUFFER_SIZE and grow on demand (see
+     * recv_reserve() and outgoing_reserve()): an idle connection costs a few
+     * KB instead of two full max_request_size blocks, which at the 2MB of the
+     * shipped configuration was 4MB per accepted socket. A pool slot reused
+     * after a previous connection keeps whatever it grew to, so a busy
+     * subscriber does not pay the realloc again
+     */
+    if (!client->rbuf) {
+        client->rbuf_cap = conf->max_request_size < INITIAL_BUFFER_SIZE
+                               ? conf->max_request_size
+                               : INITIAL_BUFFER_SIZE;
+        client->rbuf = try_calloc(client->rbuf_cap, sizeof(unsigned char));
+    }
     client->wrote   = ATOMIC_VAR_INIT(0);
     client->towrite = ATOMIC_VAR_INIT(0);
-    if (!client->wbuf)
-        client->wbuf =
-            try_calloc(conf->max_request_size, sizeof(unsigned char));
+    if (!client->wbuf) {
+        client->wbuf_cap = conf->max_request_size < INITIAL_BUFFER_SIZE
+                               ? conf->max_request_size
+                               : INITIAL_BUFFER_SIZE;
+        client->wbuf = try_calloc(client->wbuf_cap, sizeof(unsigned char));
+    }
     client->last_seen = time(NULL);
     client->keepalive = 0;
     client->has_lwt   = false;
@@ -799,16 +815,11 @@ static bool client_deactivate_locked(struct client *client)
     if (client->connected == true)
         HASH_DEL(server.clients_map, client);
 
-    if (client->clean_session == true) {
-        if (client->session) {
-            topic_store_remove_wildcard(server.store, client->client_id);
-            list_foreach(item, client->session->subscriptions)
-            {
-                topic_del_subscriber(item->data, client);
-            }
-            HASH_DEL(server.sessions, client->session);
-            DECREF(client->session, struct client_session);
-        }
+    if (client->clean_session == true && client->session) {
+        /* The same teardown a CONNECT with clean_session over a persistent
+           session performs, and the one the log records as session-del */
+        session_delete(client->client_id);
+        client->session = NULL;
     }
     /*
      * All accesses to the client must happen before the pool can recycle
@@ -964,6 +975,28 @@ void server_kick_duplicate(const char *client_id, const struct client *keep,
 }
 
 /*
+ * Make room for `len` bytes in the read buffer, growing it by doubling up to
+ * max_request_size. False when the request does not fit the configured limit,
+ * which the caller reports as -ERRMAXREQSIZE exactly like the old fixed-size
+ * buffer did
+ */
+static bool recv_reserve(struct client *c, size_t len)
+{
+    if (len > conf->max_request_size)
+        return false;
+    if (len <= c->rbuf_cap)
+        return true;
+    size_t cap = c->rbuf_cap ? c->rbuf_cap : INITIAL_BUFFER_SIZE;
+    while (cap < len)
+        cap *= 2;
+    if (cap > conf->max_request_size)
+        cap = conf->max_request_size;
+    c->rbuf     = try_realloc(c->rbuf, cap);
+    c->rbuf_cap = cap;
+    return true;
+}
+
+/*
  * Parse packet header, it is required at least the Fixed Header of each
  * packed, which is contained in the first 2 bytes in order to read packet
  * type and total length that we need to recv to complete the packet.
@@ -984,6 +1017,14 @@ static ssize_t recv_packet(struct client *c)
     ssize_t nread   = 0;
     unsigned opcode = 0, pos = 0;
     usize pktlen    = 0;
+
+    /*
+     * The fixed header alone needs up to five bytes (type + four Remaining
+     * Length bytes), and the whole packet is later checked against
+     * max_request_size before its size is used
+     */
+    if (!recv_reserve(c, MQTT_MAX_LEN_BYTES + 1))
+        return -ERRMAXREQSIZE;
 
     // Base status, we have read 0 to 2 bytes
     if (c->status == WAITING_HEADER) {
@@ -1114,6 +1155,9 @@ static ssize_t recv_packet(struct client *c)
          */
         c->rpos   = pos + 1;
         c->toread = pktlen + pos + 1; // pos = bytes used to store length
+        /* The whole packet has to fit the read buffer at once */
+        if (!recv_reserve(c, c->toread))
+            return -ERRMAXREQSIZE;
 
         /*
          * Looks like we got a packet of 4 bytes or less (ACKs, PINGREQ,
@@ -1481,7 +1525,7 @@ static void process_message(struct ev_ctx *ctx, struct client *c)
         pthread_mutex_lock(&c->mutex);
 #endif
         /* Never let a refusal overflow the write buffer */
-        if (c->towrite + MQTT_ACK_LEN <= conf->max_request_size) {
+        if (outgoing_reserve(c, MQTT_ACK_LEN)) {
             mqtt_pack(&connack, c->wbuf + c->towrite);
             c->towrite += MQTT_ACK_LEN;
         }
@@ -1664,6 +1708,8 @@ int start_server(const char *addr, const char *port)
     if (!server.pool)
         log_fatal("Failed to allocate %d sized memory pool for clients",
                   BASE_CLIENTS_NUM);
+    log_info("Client pool: %d blocks of %zu bytes, grown on demand",
+             BASE_CLIENTS_NUM, sizeof(struct client));
     server.clients_map = NULL;
     server.sessions    = NULL;
     server.over_memory = false;

@@ -30,11 +30,27 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <time.h>
 
 struct topic;
 struct mqtt_packet;
 struct io_event;
+struct client;
 struct client_session;
+
+/*
+ * Make room for `len` bytes in the client write buffer, growing it on demand
+ * up to max_request_size. False when the reply would exceed the configured
+ * limit: the caller drops the reply, the sender retransmits
+ */
+bool outgoing_reserve(struct client *, size_t);
+
+/*
+ * The inflight entry of `mid`, NULL when the identifier is free. The table
+ * only holds the messages actually awaiting an acknowledgement
+ */
+struct inflight_msg *session_inflight(struct client_session *,
+                                      unsigned short);
 
 int publish_message(struct mqtt_packet *, const struct topic *);
 
@@ -64,6 +80,41 @@ void session_queue_message(struct client_session *, const char *topic,
                            size_t len);
 
 /*
+ * Same as session_queue_message(), but with the packet identifier read back
+ * from the file: the persistence loader needs it to keep the offline queue
+ * and the inflight table of a restored session consistent, so that a later
+ * `dropped` or `flush` record names the very same entry. The caller must
+ * hold the global mutex (or be the startup loader)
+ */
+void session_restore_queued(struct client_session *, const char *topic,
+                            unsigned char qos, unsigned short mid,
+                            const unsigned char *payload, size_t len);
+
+/*
+ * Rebuild one inflight entry (a stored PUBLISH awaiting its PUBACK/PUBREC)
+ * or the PUBREL half of a QoS 2 flow (`ack_sent`), and the inbound QoS 2
+ * deduplication set. Restored entries are due immediately: their `seen`
+ * timestamp is zero, so the first retransmission scan after a reconnect
+ * sends them again
+ */
+void session_restore_inflight(struct client_session *, const char *topic,
+                              unsigned char qos, unsigned short mid,
+                              const unsigned char *payload, size_t len);
+void session_restore_ack(struct client_session *, unsigned short mid,
+                         time_t ack_sent);
+void session_restore_q2(struct client_session *, unsigned short mid);
+void session_restore_q2_del(struct client_session *, unsigned short mid);
+
+/* Drop only the inflight entry of `mid`, leaving the offline queue alone */
+void session_restore_inflight_del(struct client_session *, unsigned short mid);
+
+/* Remove the queued message named by `mid` (and its inflight entry) */
+void session_restore_dropped(struct client_session *, unsigned short mid);
+
+/* Forget the first `count` queued messages, keeping their inflight entries */
+void session_flush_queue(struct client_session *, unsigned long count);
+
+/*
  * Drop the oldest message queued for a disconnected session, releasing the
  * packet, its inflight entry and the queue slot: what the max_memory policy
  * does to give memory back. Returns false when the queue is already empty
@@ -71,9 +122,22 @@ void session_queue_message(struct client_session *, const char *topic,
 bool session_drop_oldest_queued(struct client_session *);
 
 /*
- * Deliver an LWT message through the same normalized path a normal PUBLISH
- * takes (trailing '/', wildcard subscriber attach): acquires the locks it
- * needs itself
+ * Remove a session from the map and detach every subscription it still
+ * holds, exactly like the teardown of a clean session does. Used by the
+ * persistence loader to replay a `session-del` record
+ */
+void session_delete(const char *session_id);
+
+/*
+ * Remove one filter from a session, the body of an UNSUBSCRIBE tuple shared
+ * with the persistence loader. Returns false when the filter is malformed
+ */
+bool session_unsubscribe(struct client_session *, const char *filter);
+
+/*
+ * Deliver an LWT message through the same path a normal PUBLISH takes
+ * (exact topic key, wildcard subscriber attach): acquires the locks it needs
+ * itself
  */
 void publish_lwt(struct mqtt_packet *);
 

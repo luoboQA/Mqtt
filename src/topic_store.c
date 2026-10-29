@@ -159,20 +159,20 @@ static void wild_level_destroy(struct wild_level *level)
 }
 
 /*
- * Extract the next '/' separated level of a normalized topic or filter, both
- * end with a trailing '/' so a trailing empty segment is not a level: "a/b/"
- * holds "a" then "b". Returns NULL when there's no level left.
+ * Extract the next '/' separated level of a topic or filter. An empty level
+ * is a level of its own: "a/" holds "a" then "", which is exactly what keeps
+ * it distinct from "a". `*p` is set to NULL after the last level, so the
+ * caller's loop terminates even when the last level is empty.
  */
 static const char *wild_next_level(const char **p, size_t *len)
 {
-    const char *start = *p, *slash;
-
-    if (*start == '\0')
+    const char *start = *p;
+    if (!start)
         return NULL;
 
-    slash = strchr(start, '/');
-    *len  = slash ? (size_t)(slash - start) : strlen(start);
-    *p    = start + *len + (slash ? 1 : 0);
+    const char *slash = strchr(start, '/');
+    *len              = slash ? (size_t)(slash - start) : strlen(start);
+    *p                = slash ? slash + 1 : NULL;
 
     return start;
 }
@@ -549,7 +549,7 @@ void topic_store_add_wildcard(struct topic_store *store, struct subscription *s)
  * Remove every wildcard subscription belonging to the given client id from
  * the index, called on client deactivation
  */
-void topic_store_remove_wildcard(struct topic_store *store, char *id)
+void topic_store_remove_wildcard(struct topic_store *store, const char *id)
 {
     wild_index_remove_client(store->wildcards, id);
 }

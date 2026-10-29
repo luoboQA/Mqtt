@@ -45,10 +45,13 @@
 #define EVENTLOOP_MAX_EVENTS 1024
 #define EVENTLOOP_TIMEOUT    -1
 
-/* Initial memory allocation for clients on server start-up, it should be
- * equal to ~40 MB, read and write buffers are initialized lazily
+/* Initial chunk of client blocks allocated at start-up. The pool appends a
+ * new chunk of the same size whenever the free list runs dry (see
+ * memorypool_alloc()), so the broker no longer pays for the worst case it
+ * will never reach: the old fixed 128K-block chunk cost ~56MB before a
+ * single client connected, which is what made max_memory meaningless
  */
-#define BASE_CLIENTS_NUM     1024 * 128
+#define BASE_CLIENTS_NUM     1024
 
 /*
  * IO event structure, the argument handed to the command handlers. It pairs
