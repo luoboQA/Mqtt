@@ -92,7 +92,7 @@ jobs:
       - name: Report
         run: |
           lcov --capture --directory build-cov --output-file coverage.info \
-               --ignore-errors mismatch,gcov,source
+               --ignore-errors mismatch,gcov,source,negative
           lcov --remove coverage.info '/usr/*' '*/tests/*' \
                --output-file coverage.info --ignore-errors unused
           lcov --list coverage.info
