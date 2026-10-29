@@ -27,6 +27,7 @@
 
 #include "logging.h"
 #include <assert.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -36,16 +37,43 @@
 
 static FILE *fh          = NULL;
 static int logging_level = DEBUG;
+/* Path sol_log_init() opened, kept so SIGHUP can reopen the same file */
+static char logpath[0xFFF];
+/* Set from the signal handler, consumed by sol_log_maybe_reopen() */
+static volatile sig_atomic_t reopen_requested;
 
 void sol_log_init(const char *file, int level)
 {
+    logging_level = level;
+    logpath[0]    = '\0';
     if (!file)
         return;
-    fh            = fopen(file, "a+");
-    logging_level = level;
+    snprintf(logpath, sizeof(logpath), "%s", file);
+    if (!logpath[0])
+        return;
+    fh = fopen(logpath, "a+");
     if (!fh)
         printf("%lu * WARNING: Unable to open file %s\n",
                (unsigned long)time(NULL), file);
+}
+
+void sol_log_request_reopen(void)
+{
+    reopen_requested = 1;
+}
+
+void sol_log_maybe_reopen(void)
+{
+    if (!reopen_requested)
+        return;
+    reopen_requested = 0;
+    if (!logpath[0])
+        return;
+    if (fh) {
+        fflush(fh);
+        fclose(fh);
+    }
+    fh = fopen(logpath, "a+");
 }
 
 void sol_log_close(void)
@@ -53,6 +81,7 @@ void sol_log_close(void)
     if (fh) {
         fflush(fh);
         fclose(fh);
+        fh = NULL;
     }
 }
 

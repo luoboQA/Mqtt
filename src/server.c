@@ -230,7 +230,7 @@ static void publish_stats(struct ev_ctx *, void *);
  * Statistics topics, published every N seconds defined by configuration
  * interval
  */
-#define SYS_TOPICS 11
+#define SYS_TOPICS 18
 
 /*
  * Utility struct for information topics. Just the name of the topic and his
@@ -266,7 +266,14 @@ static const struct sys_topic sys_topics[SYS_TOPICS] = {
     SYS_T("$SOL/broker/bytes/received/"),
     SYS_T("$SOL/broker/messages/sent/"),
     SYS_T("$SOL/broker/messages/received/"),
-    SYS_T("$SOL/broker/memory/used/")};
+    SYS_T("$SOL/broker/memory/used/"),
+    SYS_T("$SOL/broker/sessions/"),
+    SYS_T("$SOL/broker/topics/"),
+    SYS_T("$SOL/broker/subscriptions/"),
+    SYS_T("$SOL/broker/messages/inflight/"),
+    SYS_T("$SOL/broker/messages/retained/"),
+    SYS_T("$SOL/broker/messages/dropped/"),
+    SYS_T("$SOL/broker/memory/limit/")};
 
 /* Simple error_code to string function, to be refined */
 static const char *solerr(int rc)
@@ -329,6 +336,23 @@ static struct topic *stats_topic(const char *name)
     return t;
 }
 
+/* Topic store counters, collected in one walk under the global mutex */
+struct store_stats {
+    size_t topics;
+    size_t retained;
+};
+
+static void collect_store_stats(struct trie_node *node, void *arg)
+{
+    struct topic *t        = node->data;
+    struct store_stats *st = arg;
+    if (!t)
+        return;
+    st->topics++;
+    if (t->retained)
+        st->retained++;
+}
+
 static void publish_stats(struct ev_ctx *ctx, void *data)
 {
     (void)data;
@@ -386,6 +410,38 @@ static void publish_stats(struct ev_ctx *ctx, void *data)
     snprintf(mem, 21, "%lld", memory);
 
     /*
+     * Store and session counters: one pass over the session map and one over
+     * the topic trie, both under the global mutex, so the numbers describe a
+     * single instant. They are only refreshed at stats_publish_interval,
+     * which is why a full walk is affordable here
+     */
+    size_t sessions = 0, subscriptions = 0, inflight = 0;
+    struct store_stats st = {0, 0};
+#if THREADSNR > 0
+    pthread_mutex_lock(&mutex);
+#endif
+    for (struct client_session *s = server.sessions; s; s = s->hh.next) {
+        sessions++;
+        subscriptions += list_size(s->subscriptions);
+        inflight += s->inflights;
+    }
+    topic_store_map(server.store, NULL, collect_store_stats, &st);
+#if THREADSNR > 0
+    pthread_mutex_unlock(&mutex);
+#endif
+
+    char csessions[21], ctopics[21], csubs[21], cinflight[21], cretained[21],
+        cdropped[21], climit[21];
+    snprintf(csessions, 21, "%lu", (unsigned long)sessions);
+    snprintf(ctopics, 21, "%lu", (unsigned long)st.topics);
+    snprintf(csubs, 21, "%lu", (unsigned long)subscriptions);
+    snprintf(cinflight, 21, "%lu", (unsigned long)inflight);
+    snprintf(cretained, 21, "%lu", (unsigned long)st.retained);
+    snprintf(cdropped, 21, "%lu",
+             (unsigned long)info.messages_dropped);
+    snprintf(climit, 21, "%lu", (unsigned long)conf->max_memory);
+
+    /*
      * One single packet reused for every statistics topic: the broker always
      * publishes them at QoS 0 (header 0x30, pkt_id 0), so no subscriber ever
      * keeps a reference to it and its contents can safely be swapped between
@@ -420,6 +476,13 @@ static void publish_stats(struct ev_ctx *ctx, void *data)
     PUBLISH_STAT(8, sent);     /* $SOL/broker/messages/sent/     */
     PUBLISH_STAT(9, recv);     /* $SOL/broker/messages/received/ */
     PUBLISH_STAT(10, mem);     /* $SOL/broker/memory/used/       */
+    PUBLISH_STAT(11, csessions);  /* $SOL/broker/sessions/          */
+    PUBLISH_STAT(12, ctopics);    /* $SOL/broker/topics/            */
+    PUBLISH_STAT(13, csubs);      /* $SOL/broker/subscriptions/     */
+    PUBLISH_STAT(14, cinflight);  /* $SOL/broker/messages/inflight/ */
+    PUBLISH_STAT(15, cretained);  /* $SOL/broker/messages/retained/ */
+    PUBLISH_STAT(16, cdropped);   /* $SOL/broker/messages/dropped/  */
+    PUBLISH_STAT(17, climit);     /* $SOL/broker/memory/limit/      */
 
 #undef PUBLISH_STAT
 }
@@ -573,6 +636,11 @@ static void keepalive_timeout_callback(struct ev_ctx *ctx, void *arg)
 static void keepalive_check(struct ev_ctx *ctx, void *data)
 {
     (void)data;
+    /*
+     * The one second tick is also where a SIGHUP requested log reopen is
+     * serviced: the signal handler cannot call fopen() itself
+     */
+    sol_log_maybe_reopen();
     time_t now      = time(NULL);
     struct client *c, *tmp;
 #if THREADSNR > 0

@@ -171,6 +171,13 @@ struct config {
      * the reclamation runs on every memory check instead)
      */
     size_t reclaim_interval;
+    /*
+     * File the daemon writes its PID to once it has detached, and removes on
+     * a clean shutdown. Empty (the default) writes no PID file. Only
+     * meaningful with -d, but accepted without it for service managers that
+     * always pass the same configuration
+     */
+    char pid_file[0xFFF];
 };
 
 extern struct config *conf;
@@ -201,6 +208,12 @@ struct authentication {
 void config_set_default(void);
 void config_print(void);
 int config_load(const char *);
+/*
+ * Cross field and file checks (port range, TLS files, password/ACL files).
+ * config_load() only parses; this is what --check-config and the startup
+ * path call once the command line overrides are applied.
+ */
+bool config_check(void);
 bool config_read_passwd_file(const char *, struct authentication **);
 char *time_to_string(size_t);
 char *memory_to_string(size_t);

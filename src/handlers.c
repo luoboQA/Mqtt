@@ -740,6 +740,7 @@ bool session_drop_oldest_queued(struct client_session *s)
        identifier in one record */
     persistence_wal_dropped(s->session_id, mid);
     persistence_mark_dirty();
+    info.messages_dropped++;
     return true;
 }
 

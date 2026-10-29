@@ -1,0 +1,34 @@
+[Unit]
+Description=Sol MQTT broker
+Documentation=https://github.com/codepr/sol
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The binary installed by `cmake --install`; override with a drop-in if it
+# lives somewhere else
+ExecStart=/usr/local/bin/sol -c /etc/sol/sol.conf
+# SIGHUP reopens the log file after logrotate has renamed it
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+
+# State (persistence_file) and logs belong here; the sample configuration
+# keeps the log on stdout, which journald captures
+StateDirectory=sol
+LogsDirectory=sol
+
+User=sol
+Group=sol
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/sol /var/log/sol
+# 1883 is the plain port, 8883 the TLS one in the shipped configuration
+AmbientCapabilities=
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+build
+build-*
+certs
+.git
+.vscode
+*.o
+sol
+sol_test
+sol_proto_test

@@ -598,3 +598,31 @@ class TestDelivery(base_testcase.BaseTestcase):
         finally:
             sub.close()
         self.assert_broker_alive()
+
+    def test_stats_cover_sessions_topics_and_memory(self):
+        """The extended feed reports the store and session counters, not
+        just the byte and message totals: one publish per topic on every
+        interval, all of them under $SOL/broker/"""
+        expected = {
+            '$SOL/broker/sessions/',
+            '$SOL/broker/topics/',
+            '$SOL/broker/subscriptions/',
+            '$SOL/broker/messages/inflight/',
+            '$SOL/broker/messages/retained/',
+            '$SOL/broker/messages/dropped/',
+            '$SOL/broker/memory/limit/',
+        }
+        sub, _ = self.connect('stats-extended')
+        try:
+            self.subscribe(sub, 1, {'$SOL/broker/#': 0})
+            seen = set()
+            buf = b''
+            deadline = time.time() + 10
+            while time.time() < deadline and not expected <= seen:
+                (_, topic, _, _), buf = self.read_publish(sub, buf)
+                seen.add(topic)
+            self.assertTrue(expected <= seen,
+                            'missing stats topics: %s' % (expected - seen))
+        finally:
+            sub.close()
+        self.assert_broker_alive()

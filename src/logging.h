@@ -32,6 +32,14 @@ enum log_level { DEBUG, INFORMATION, WARNING, ERROR, FATAL };
 
 void sol_log_init(const char *, int);
 void sol_log_close(void);
+/*
+ * Ask for the log file to be reopened on the next tick. SIGHUP is not an
+ * async-signal-safe context, so the handler only sets a flag through
+ * sol_log_request_reopen() and the event loop calls sol_log_maybe_reopen()
+ * once a second: that is what logrotate needs after renaming the old file.
+ */
+void sol_log_request_reopen(void);
+void sol_log_maybe_reopen(void);
 void sol_log(int, const char *, ...);
 
 #define log(...)         sol_log(__VA_ARGS__)

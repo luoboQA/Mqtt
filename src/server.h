@@ -85,6 +85,8 @@ struct sol_info {
     atomic_size_t bytes_recv;
     /* Total number of bytes sent out */
     atomic_size_t bytes_sent;
+    /* Messages dropped by the memory policy (oldest offline queue entries) */
+    atomic_size_t messages_dropped;
 };
 
 #define INIT_INFO                                                              \
@@ -97,6 +99,7 @@ struct sol_info {
         info.uptime             = ATOMIC_VAR_INIT(0);                          \
         info.bytes_sent         = ATOMIC_VAR_INIT(0);                          \
         info.bytes_recv         = ATOMIC_VAR_INIT(0);                          \
+        info.messages_dropped   = ATOMIC_VAR_INIT(0);                          \
     } while (0)
 
 /*

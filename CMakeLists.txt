@@ -164,3 +164,5 @@ add_test(NAME integration
 include(GNUInstallDirs)
 install(TARGETS sol RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES etc/conf/sol.conf DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/sol)
+install(FILES etc/systemd/sol.service
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/systemd/system)

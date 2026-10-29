@@ -91,12 +91,14 @@ integration suite rather than by eye.
 ### To be implemented
 
 The entries that used to sit here (persistence of the state of a disconnected
-client, enforcing `max_memory`, the write-ahead log) are done. What a
-deployment beyond a trusted network still wants, in the order it usually
-starts to hurt:
+client, enforcing `max_memory`, the write-ahead log, the pid file, log
+rotation) are done. What a deployment beyond a trusted network still wants, in
+the order it usually starts to hurt:
 
-- operability: a pid file, log rotation, a configuration reload, metrics
-  beyond the `$SOL` feed;
+- hot reload of the whole configuration (SIGHUP reopens the log file today,
+  it does not re-read the file);
+- per-session quotas (inflight window, publish rate) so one client cannot
+  consume the global memory budget;
 - the scale limits stay what they are: one process, no clustering.
 
 ### Maybe
@@ -215,6 +217,64 @@ Both sanitizers are meant to be exercised through the integration suite: run
 it with `SOL_BIN=build-asan/sol python3 tests/integration/run.py`. The
 ThreadSanitizer one needs the address space randomization disabled (it refuses
 to start otherwise on recent kernels), which `tests/run_tsan.sh` takes care of.
+
+## Operations
+
+`sol --check-config -c /etc/sol/sol.conf` parses the file, applies the same
+cross checks the broker runs at startup (port range, TLS files, password and
+ACL files) and exits non zero on the first problem, listing every error it
+found. A file named with `-c` that cannot be opened or parsed is fatal at
+startup too; the built in path may be absent and the broker then runs on its
+defaults, as before.
+
+```sh
+$ sol --version                    # Sol v0.18.5 MQTT broker 3.1.1
+$ sol --check-config -c conf       # Configuration OK: conf
+$ sol -d -c /etc/sol/sol.conf      # daemonize
+```
+
+When `pid_file` is set, the daemon writes its PID after detaching and removes
+it on a clean shutdown. `SIGHUP` reopens `log_path` (what logrotate needs
+after renaming the old file); it is serviced on the next one second tick, not
+inside the signal handler. `SIGTERM`/`SIGINT` stop the broker after a final
+persistence snapshot.
+
+`cmake --install build` installs the binary, the sample configuration and a
+systemd unit (`lib/systemd/system/sol.service`). The unit runs as the `sol`
+user with `StateDirectory=sol` and `LogsDirectory=sol`; adjust `ExecStart` and
+the configuration to match your prefix. A `Dockerfile` is at the root of the
+repository:
+
+```sh
+$ docker build -t sol .
+$ docker run -p 1883:1883 -v sol-data:/var/lib/sol sol
+```
+
+The image listens on `0.0.0.0:1883`; the mounted volume is where
+`persistence_file` should point if you enable persistence.
+
+### Metrics
+
+The `$SOL/broker/` feed is published every `stats_publish_interval` seconds
+and only matches an explicit subscription (a filter starting with a wildcard
+never matches `$` topics):
+
+| Topic | Meaning |
+|---|---|
+| `$SOL/broker/clients/` | connections accepted since start |
+| `$SOL/broker/clients/connected/` | currently connected |
+| `$SOL/broker/clients/disconnected/` | accepted and then dropped |
+| `$SOL/broker/messages/` | received + sent |
+| `$SOL/broker/messages/received/`, `/sent/` | per direction |
+| `$SOL/broker/messages/inflight/` | QoS 1/2 flows awaiting an ack |
+| `$SOL/broker/messages/retained/` | retained messages in the store |
+| `$SOL/broker/messages/dropped/` | dropped by the memory policy |
+| `$SOL/broker/sessions/` | sessions (persistent ones included) |
+| `$SOL/broker/subscriptions/` | subscriptions across all sessions |
+| `$SOL/broker/topics/` | topics in the store |
+| `$SOL/broker/bytes/sent/`, `/received/` | byte counters |
+| `$SOL/broker/memory/used/`, `/limit/` | accounted memory and the cap |
+| `$SOL/broker/uptime/`, `/uptime/sol/` | seconds, and uptime in sols (one sol = 88775.24 s) |
 
 ## Quickstart play
 

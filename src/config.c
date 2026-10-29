@@ -27,10 +27,12 @@
 
 #include <assert.h>
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
+#include <strings.h>
+#include <unistd.h>
 #ifdef __linux__
 #include <sys/eventfd.h>
-#else
-#include <unistd.h>
 #endif
 #include "config.h"
 #include "logging.h"
@@ -41,6 +43,17 @@
 /* The main configuration structure */
 static struct config config;
 struct config *conf;
+
+/*
+ * Number of problems found by the last config_load(): an unknown key, an
+ * unparsable value, an out of range number. The parser keeps going so the
+ * operator sees every mistake in one run, but the caller refuses to start
+ * (or --check-config exits non zero) when this is not zero
+ */
+static unsigned config_errors;
+
+/* Smallest request size that can hold a CONNECT with an empty client id */
+#define MQTT_MIN_REQUEST_SIZE 16
 
 struct llevel {
     const char *lname;
@@ -125,6 +138,100 @@ static size_t read_time_with_mul(const char *time_string)
     }
 
     return num * mul;
+}
+
+/*
+ * Strict counterparts of the two helpers above, for values read from the
+ * configuration file: the lenient versions return 0 on garbage ("abc",
+ * "10xb", "-1"), which used to turn a typo into a disabled feature or a
+ * zero sized buffer without a single warning. These reject anything that is
+ * not a number followed by one of the accepted suffixes and report it.
+ */
+static bool parse_memory(const char *s, size_t *out)
+{
+    if (!s || !isdigit((unsigned char)*s))
+        return false;
+
+    errno                  = 0;
+    char *end              = NULL;
+    unsigned long long num = strtoull(s, &end, 10);
+    if (errno == ERANGE || end == s)
+        return false;
+
+    size_t mul = 1;
+    if (*end != '\0') {
+        if (strcasecmp(end, "kb") == 0)
+            mul = 1024;
+        else if (strcasecmp(end, "mb") == 0)
+            mul = 1024 * 1024;
+        else if (strcasecmp(end, "gb") == 0)
+            mul = 1024 * 1024 * 1024;
+        else
+            return false;
+    }
+    if (num > SIZE_MAX / mul)
+        return false;
+    *out = (size_t)num * mul;
+    return true;
+}
+
+/*
+ * Seconds, with the same suffixes read_time_with_mul() accepts (ms, s, m, h,
+ * d). A bare number is seconds. Zero is accepted here: keepalive 0 has a
+ * meaning (no cap), the caller decides whether it makes sense for its key.
+ */
+static bool parse_interval(const char *s, size_t *out)
+{
+    if (!s || !isdigit((unsigned char)*s))
+        return false;
+
+    errno                  = 0;
+    char *end              = NULL;
+    unsigned long long num = strtoull(s, &end, 10);
+    if (errno == ERANGE || end == s)
+        return false;
+
+    size_t mul = 1;
+    if (*end != '\0') {
+        if (strcasecmp(end, "ms") == 0) {
+            /* Sub-second periods are rounded up to one second, as the
+             * lenient parser does: rounding down to 0 would silently turn a
+             * periodic task off */
+            if (num > 0 && num < 1000)
+                num = 1;
+            else
+                num = (num + 999) / 1000;
+        } else if (strcasecmp(end, "s") == 0) {
+            mul = 1;
+        } else if (strcasecmp(end, "m") == 0) {
+            mul = 60;
+        } else if (strcasecmp(end, "h") == 0) {
+            mul = 60 * 60;
+        } else if (strcasecmp(end, "d") == 0) {
+            mul = 60 * 60 * 24;
+        } else {
+            return false;
+        }
+    }
+    if (num > SIZE_MAX / mul)
+        return false;
+    *out = (size_t)num * mul;
+    return true;
+}
+
+/* A TCP port: decimal, 1..65535, nothing else */
+static bool parse_port(const char *s, unsigned *out)
+{
+    if (!s || !isdigit((unsigned char)*s))
+        return false;
+    errno             = 0;
+    char *end         = NULL;
+    unsigned long num = strtoul(s, &end, 10);
+    if (errno == ERANGE || end == s || *end != '\0' || num == 0 ||
+        num > 65535)
+        return false;
+    *out = (unsigned)num;
+    return true;
 }
 
 /* Format a memory in bytes to a more human-readable form, e.g. 64b or 18Kb
@@ -223,100 +330,182 @@ static int parse_config_tls_protocols(char *token)
    configuration on disk */
 
 /*
+ * Record one configuration problem: every caller keeps parsing so a single
+ * run lists all of them, and config_load() returns false at the end. The
+ * message names the key and the offending value, which is what the operator
+ * needs to fix the file.
+ */
+static void config_error(const char *key, const char *value, const char *why)
+{
+    log_error("Configuration error: %s = '%s': %s", key, value, why);
+    config_errors++;
+}
+
+/*
  * Copy a configuration value into a fixed size field, rejecting (with a
  * warning naming the key) a value that would not fit: a silent truncation
  * would leave a hostname or a port that was never asked for, and a blind
  * strcpy could overflow the field with a long conf line
  */
-static void set_config_str(const char *key, char *dest, size_t destsz,
+static bool set_config_str(const char *key, char *dest, size_t destsz,
                            const char *value)
 {
     size_t len = strlen(value);
     if (len >= destsz) {
-        log_warning("Ignoring configuration %s: value of %zu bytes does not "
-                    "fit in %zu",
-                    key, len, destsz);
-        return;
+        log_error("Ignoring configuration %s: value of %zu bytes does not "
+                  "fit in %zu",
+                  key, len, destsz);
+        config_errors++;
+        return false;
     }
     memcpy(dest, value, len + 1);
+    return true;
 }
 
-static void add_config_value(const char *key, const char *value)
+static bool add_config_value(const char *key, const char *value)
 {
 
     size_t klen = strlen(key);
     size_t vlen = strlen(value);
+    size_t num  = 0;
 
     if (STREQ("log_level", key, klen) == true) {
         /* lmap holds 5 levels: stopping at 3 silently dropped INFO and
          * INFORMATION, which the parser used to ignore without warning */
         for (size_t i = 0; i < sizeof(lmap) / sizeof(*lmap); i++) {
-            if (STREQ(lmap[i].lname, value, vlen) == true)
+            if (STREQ(lmap[i].lname, value, vlen) == true) {
                 config.loglevel = lmap[i].loglevel;
-        }
-    } else if (STREQ("log_path", key, klen) == true) {
-        set_config_str(key, config.logpath, sizeof(config.logpath), value);
-    } else if (STREQ("unix_socket", key, klen) == true) {
-        config.socket_family = UNIX;
-        set_config_str(key, config.hostname, sizeof(config.hostname), value);
-    } else if (STREQ("ip_address", key, klen) == true) {
-        config.socket_family = INET;
-        set_config_str(key, config.hostname, sizeof(config.hostname), value);
-    } else if (STREQ("ip_port", key, klen) == true) {
-        set_config_str(key, config.port, sizeof(config.port), value);
-    } else if (STREQ("max_memory", key, klen) == true) {
-        config.max_memory = read_memory_with_mul(value);
-    } else if (STREQ("max_request_size", key, klen) == true) {
-        config.max_request_size = read_memory_with_mul(value);
-    } else if (STREQ("tcp_backlog", key, klen) == true) {
-        int tcp_backlog    = parse_int(value);
-        config.tcp_backlog = tcp_backlog <= SOMAXCONN ? tcp_backlog : SOMAXCONN;
-    } else if (STREQ("stats_publish_interval", key, klen) == true) {
-        config.stats_pub_interval = read_time_with_mul(value);
-    } else if (STREQ("keepalive", key, klen) == true) {
-        config.keepalive = read_time_with_mul(value);
-    } else if (STREQ("retransmit_interval", key, klen) == true) {
-        config.retransmit_interval = read_time_with_mul(value);
-    } else if (STREQ("cafile", key, klen) == true) {
-        config.tls = true;
-        set_config_str(key, config.cafile, sizeof(config.cafile), value);
-    } else if (STREQ("certfile", key, klen) == true) {
-        set_config_str(key, config.certfile, sizeof(config.certfile), value);
-    } else if (STREQ("keyfile", key, klen) == true) {
-        set_config_str(key, config.keyfile, sizeof(config.keyfile), value);
-    } else if (STREQ("allow_anonymous", key, klen) == true) {
-        // TODO add strict checks
-        if (STREQ(value, "false", 5) == true)
-            config.allow_anonymous = false;
-        else
-            config.allow_anonymous = true;
-    } else if (STREQ("acl_file", key, klen) == true) {
-        set_config_str(key, config.acl_file, sizeof(config.acl_file), value);
-    } else if (STREQ("persistence_file", key, klen) == true) {
-        set_config_str(key, config.persistence_file,
-                       sizeof(config.persistence_file), value);
-    } else if (STREQ("persistence_interval", key, klen) == true) {
-        config.persistence_interval = read_time_with_mul(value);
-    } else if (STREQ("reclaim_interval", key, klen) == true) {
-        config.reclaim_interval = read_time_with_mul(value);
-    } else if (STREQ("password_file", key, klen) == true) {
-        set_config_str(key, config.password_file, sizeof(config.password_file),
-                       value);
-    } else if (STREQ("tls_protocols", key, klen) == true) {
-        if (vlen == 0)
-            return;
-        config.tls_protocols = 0;
-        char *token          = strtok((char *)value, ",");
-        if (!token) {
-            config.tls_protocols = parse_config_tls_protocols((char *)value);
-        } else {
-            while (token) {
-                config.tls_protocols |=
-                    parse_config_tls_protocols((char *)token);
-                token = strtok(NULL, ",");
+                return true;
             }
         }
+        config_error(key, value, "unknown log level");
+        return false;
+    } else if (STREQ("log_path", key, klen) == true) {
+        return set_config_str(key, config.logpath, sizeof(config.logpath),
+                              value);
+    } else if (STREQ("unix_socket", key, klen) == true) {
+        config.socket_family = UNIX;
+        return set_config_str(key, config.hostname, sizeof(config.hostname),
+                              value);
+    } else if (STREQ("ip_address", key, klen) == true) {
+        config.socket_family = INET;
+        return set_config_str(key, config.hostname, sizeof(config.hostname),
+                              value);
+    } else if (STREQ("ip_port", key, klen) == true) {
+        unsigned port = 0;
+        if (!parse_port(value, &port)) {
+            config_error(key, value, "not a TCP port between 1 and 65535");
+            return false;
+        }
+        return set_config_str(key, config.port, sizeof(config.port), value);
+    } else if (STREQ("max_memory", key, klen) == true) {
+        if (!parse_memory(value, &num) || num == 0) {
+            config_error(key, value, "expected a positive size, e.g. 512MB");
+            return false;
+        }
+        config.max_memory = num;
+    } else if (STREQ("max_request_size", key, klen) == true) {
+        if (!parse_memory(value, &num) || num < MQTT_MIN_REQUEST_SIZE) {
+            config_error(key, value,
+                         "expected a size of at least 16 bytes, e.g. 512KB");
+            return false;
+        }
+        config.max_request_size = num;
+    } else if (STREQ("tcp_backlog", key, klen) == true) {
+        unsigned backlog = 0;
+        if (!parse_port(value, &backlog)) {
+            config_error(key, value, "expected a positive number");
+            return false;
+        }
+        config.tcp_backlog =
+            (int)(backlog <= SOMAXCONN ? backlog : SOMAXCONN);
+    } else if (STREQ("stats_publish_interval", key, klen) == true) {
+        if (!parse_interval(value, &num) || num == 0) {
+            config_error(key, value, "expected a positive interval, e.g. 10s");
+            return false;
+        }
+        config.stats_pub_interval = num;
+    } else if (STREQ("keepalive", key, klen) == true) {
+        /* 0 is a valid value here: it disables the configured cap */
+        if (!parse_interval(value, &num)) {
+            config_error(key, value, "expected an interval, e.g. 60s or 0");
+            return false;
+        }
+        config.keepalive = num;
+    } else if (STREQ("retransmit_interval", key, klen) == true) {
+        if (!parse_interval(value, &num) || num == 0) {
+            config_error(key, value, "expected a positive interval, e.g. 20s");
+            return false;
+        }
+        config.retransmit_interval = num;
+    } else if (STREQ("cafile", key, klen) == true) {
+        config.tls = true;
+        return set_config_str(key, config.cafile, sizeof(config.cafile),
+                              value);
+    } else if (STREQ("certfile", key, klen) == true) {
+        return set_config_str(key, config.certfile, sizeof(config.certfile),
+                              value);
+    } else if (STREQ("keyfile", key, klen) == true) {
+        return set_config_str(key, config.keyfile, sizeof(config.keyfile),
+                              value);
+    } else if (STREQ("allow_anonymous", key, klen) == true) {
+        if (strcasecmp(value, "true") == 0)
+            config.allow_anonymous = true;
+        else if (strcasecmp(value, "false") == 0)
+            config.allow_anonymous = false;
+        else {
+            config_error(key, value, "expected true or false");
+            return false;
+        }
+    } else if (STREQ("acl_file", key, klen) == true) {
+        return set_config_str(key, config.acl_file, sizeof(config.acl_file),
+                              value);
+    } else if (STREQ("persistence_file", key, klen) == true) {
+        return set_config_str(key, config.persistence_file,
+                              sizeof(config.persistence_file), value);
+    } else if (STREQ("persistence_interval", key, klen) == true) {
+        if (!parse_interval(value, &num) || num == 0) {
+            config_error(key, value, "expected a positive interval, e.g. 30s");
+            return false;
+        }
+        config.persistence_interval = num;
+    } else if (STREQ("reclaim_interval", key, klen) == true) {
+        if (!parse_interval(value, &num) || num == 0) {
+            config_error(key, value, "expected a positive interval, e.g. 60s");
+            return false;
+        }
+        config.reclaim_interval = num;
+    } else if (STREQ("password_file", key, klen) == true) {
+        return set_config_str(key, config.password_file,
+                              sizeof(config.password_file), value);
+    } else if (STREQ("pid_file", key, klen) == true) {
+        return set_config_str(key, config.pid_file, sizeof(config.pid_file),
+                              value);
+    } else if (STREQ("tls_protocols", key, klen) == true) {
+        if (vlen == 0) {
+            config_error(key, value, "expected at least one protocol");
+            return false;
+        }
+        int protocols        = 0;
+        char buf[0xFFF]      = {0};
+        snprintf(buf, sizeof(buf), "%s", value);
+        char *saveptr        = NULL;
+        char *token          = strtok_r(buf, ",", &saveptr);
+        while (token) {
+            int parsed = parse_config_tls_protocols(token);
+            if (parsed == 0) {
+                config_error(key, token, "unknown TLS protocol");
+                return false;
+            }
+            protocols |= parsed;
+            token = strtok_r(NULL, ",", &saveptr);
+        }
+        config.tls_protocols = protocols;
+    } else {
+        config_error(key, value, "unknown configuration key");
+        return false;
     }
+    return true;
 }
 
 /*
@@ -345,6 +534,8 @@ int config_load(const char *configpath)
 {
 
     assert(configpath);
+
+    config_errors = 0;
 
     FILE *fh = fopen(configpath, "r");
 
@@ -401,7 +592,63 @@ int config_load(const char *configpath)
     }
 
     fclose(fh);
+    if (config_errors > 0) {
+        log_error("%u configuration error%s in %s", config_errors,
+                  config_errors == 1 ? "" : "s", configpath);
+        return false;
+    }
     return true;
+}
+
+/*
+ * Cross field checks, run after the command line overrides so that a bad -p
+ * is caught as well. Returns false and logs every problem found.
+ */
+bool config_check(void)
+{
+    unsigned before = config_errors;
+
+    if (config.socket_family == INET) {
+        unsigned port = 0;
+        if (!parse_port(config.port, &port))
+            config_error("ip_port", config.port,
+                         "not a TCP port between 1 and 65535");
+    }
+
+    /*
+     * TLS needs all three files: load_certificates() calls
+     * SSL_CTX_load_verify_locations(), use_certificate_chain_file() and
+     * use_PrivateKey_file() unconditionally. Failing here gives the operator
+     * one clear message instead of three OpenSSL errors followed by exit()
+     * from inside start_server()
+     */
+    if (config.tls) {
+        const char *files[] = {config.cafile, config.certfile,
+                               config.keyfile};
+        const char *keys[]  = {"cafile", "certfile", "keyfile"};
+        for (size_t i = 0; i < sizeof(files) / sizeof(*files); i++) {
+            if (files[i][0] == '\0') {
+                config_error(keys[i], "", "required when TLS is enabled");
+                continue;
+            }
+            if (access(files[i], R_OK) != 0)
+                config_error(keys[i], files[i], "file is not readable");
+        }
+    }
+
+    if (config.allow_anonymous == false) {
+        if (config.password_file[0] == '\0')
+            config_error("password_file", "",
+                         "required when allow_anonymous is false");
+        else if (access(config.password_file, R_OK) != 0)
+            config_error("password_file", config.password_file,
+                         "file is not readable");
+    }
+
+    if (config.acl_file[0] != '\0' && access(config.acl_file, R_OK) != 0)
+        config_error("acl_file", config.acl_file, "file is not readable");
+
+    return config_errors == before;
 }
 
 void config_set_default(void)
@@ -428,6 +675,7 @@ void config_set_default(void)
     config.stats_pub_interval = read_time_with_mul(DEFAULT_STATS_INTERVAL);
     memset(config.acl_file, 0x00, sizeof(config.acl_file));
     memset(config.persistence_file, 0x00, sizeof(config.persistence_file));
+    memset(config.pid_file, 0x00, sizeof(config.pid_file));
     config.persistence_interval =
         read_time_with_mul(DEFAULT_PERSISTENCE_INTERVAL);
     config.reclaim_interval = read_time_with_mul(DEFAULT_RECLAIM_INTERVAL);
