@@ -155,6 +155,7 @@ if (FUZZ)
         src/memory.c)
     target_compile_options(sol_fuzz PRIVATE -fsanitize=fuzzer,address -g -O1)
     target_link_options(sol_fuzz PRIVATE -fsanitize=fuzzer,address)
+    target_link_libraries(sol_fuzz PRIVATE ${CRYPT_LIBS})
 endif ()
 
 # CTest: the two unit suites plus the integration suite, which starts its own
