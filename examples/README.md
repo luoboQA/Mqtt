@@ -6,9 +6,10 @@
 ## 准备
 
 ```sh
-# 1. 编译并启动 broker (监听 127.0.0.1:8883, 见 etc/conf/sol.conf)
-cmake . && make sol
-./sol -c etc/conf/sol.conf -v
+# 1. 编译并启动 broker (默认监听 1883)
+cmake -S . -B build
+cmake --build build -j
+./build/sol -c etc/conf/sol.conf -v
 
 # 2. 安装客户端依赖
 pip install paho-mqtt
@@ -35,10 +36,11 @@ python3 examples/stats_demo.py            # 等一轮统计约 10s (见 stats_pu
 ## 对照阅读
 
 - 报文字节格式：`src/mqtt.c`（CONNECT/SUBSCRIBE/PUBLISH 的编解码）
-- 各命令的业务逻辑：`src/handlers.c`
+- 各命令的业务逻辑：`src/connect.c`、`src/subscribe.c`、`src/publish.c`、
+  `src/session.c`；`src/handlers.c` 负责分发
 - 订阅存哪、如何匹配：`src/topic_store.c`、`src/trie.c`、`match_subscription()`
-- 本 broker 故意做的简化（主题归一化、`max_memory` 不生效等）：`README.md`
-  的 “教学简化 / Known simplifications”
+- 已知限制和协议偏差：`docs/limitations.md`；源码走读见
+  `docs/architecture.md` 和 `docs/conformance.md`
 
 一次完整的 QoS 1 交互：`CONNECT → CONNACK → SUBSCRIBE → SUBACK → PUBLISH → PUBACK`，
 QoS 2 再多两趟 `PUBREC → PUBREL → PUBCOMP`。

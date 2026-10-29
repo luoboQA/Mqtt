@@ -26,8 +26,8 @@
  */
 
 #include "proto_test.h"
-#include "unit.h"
-#include "../src/util.h"
+#include "../unit/unit.h"
+#include "../../src/util.h"
 #include <stdio.h>
 #include <string.h>
 

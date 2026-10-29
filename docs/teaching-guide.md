@@ -28,11 +28,11 @@ ctest --test-dir build --output-on-failure
 **目标**：分清 TCP 字节流、MQTT 固定头、Remaining Length、事件回调与命令分发。
 
 **阅读**：`src/client.c` 的 `recv_packet()`、`read_callback()`、`process_message()`；
-`src/mqtt.c` 的 `mqtt_unpack()`；`src/handlers.c` 的命令表。
+`src/mqtt.c` 的 `mqtt_unpack()`；`src/handlers.c` 的命令分发表。
 
 **实验**：运行 `ctest --test-dir build -R integration --output-on-failure`，关注
-`test_malformed.py`。在 `tests/fuzz_corpus/` 选一个报文，解释首字节、Remaining
-Length 和控制报文类型；再用 `tests/fuzz_unpack.c` 构建 fuzz 目标，观察解析器如何
+`test_malformed.py`。在 `tests/fuzz/corpus/` 选一个报文，解释首字节、Remaining
+Length 和控制报文类型；再用 `tests/fuzz/fuzz_unpack.c` 构建 fuzz 目标，观察解析器如何
 拒绝畸形输入。
 
 **讨论**：一次 `recv()` 为什么不等于一个 MQTT 包？包长度上限在哪些层起作用？
@@ -42,7 +42,7 @@ Length 和控制报文类型；再用 `tests/fuzz_unpack.c` 构建 fuzz 目标�
 **目标**：理解主题名和订阅过滤器的区别、`+` / `#` 匹配、空层以及 `$` 规则。
 
 **阅读**：`src/topic_match.c`、`src/topic_store.c`、
-`tests/topic_match_test.c`、`tests/integration/test_subscribe.py`。
+`tests/protocol/topic_match_test.c`、`tests/integration/test_subscribe.py`。
 
 **实验**：先运行 `build/sol_proto_test` 查看匹配表；添加一组自己设计的边界用例，覆盖
 `a`、`a/`、`a/+`、`a/#` 和 `$SOL/#`，再观察 `topic_store` 如何使用索引。
@@ -99,7 +99,7 @@ PUBLISH/PUBACK 与 PUBLISH/PUBREC/PUBREL/PUBCOMP 时序；修改测试中的确�
 `src/server.h`、`src/server_internal.h`。
 
 **实验**：用 `-DEVENTLOOP=poll` 或 `-DEVENTLOOP=select` 新建构建目录并跑 CTest；
-再运行 `./tests/run_tsan.sh` 观察线程检查覆盖哪些路径。
+再运行 `./tests/tools/run_tsan.sh` 观察线程检查覆盖哪些路径。
 
 **讨论**：为什么一个 client 的 socket 读写固定在所属 loop？跨线程唤醒如何工作？
 

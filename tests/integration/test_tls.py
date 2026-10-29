@@ -15,7 +15,7 @@ CA = 'certs/ca.crt'
 
 def ensure_certs():
     if not os.path.exists(CA):
-        subprocess.run(['tests/gen_certs.sh'], check=True,
+        subprocess.run(['tests/tools/gen_certs.sh'], check=True,
                        stdout=subprocess.DEVNULL)
 
 

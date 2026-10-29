@@ -31,6 +31,8 @@ hidden behind a promise the code does not keep.
   security.
 - [`docs/teaching-guide.md`](docs/teaching-guide.md) — a suggested lesson path
   with code-reading checkpoints and hands-on experiments.
+- [`docs/limitations.md`](docs/limitations.md) — known defects, their effects,
+  and the intended scope of the teaching broker.
 
                     ┌─────────────────────────────┐
                     │         sol.c (main)        │
@@ -117,9 +119,10 @@ the order it usually starts to hurt:
 - Porting for BSD/MAC osx
 - Scaling (feeling brave?)
 
-### 教学简化 / Known simplifications
+### 教学简化 / Known limitations
 
 为了代码好读，broker 有意做了几处简化。做实验时不要把下面这些当成 MQTT 规范：
+完整缺陷清单及使用建议见 [docs/limitations.md](docs/limitations.md)。
 
 - **`$` 是 broker 保留的命名空间**：客户端向 `$` 开头的主题 PUBLISH 会被丢弃（QoS
   握手仍然完成，避免客户端无限重传），带 `$` 遗嘱的 CONNECT 会被拒绝。订阅侧按
@@ -155,6 +158,9 @@ $ cmake --build build -j
 $ ctest --test-dir build --output-on-failure
 ```
 
+Tests are grouped by scope and execution mode; see the
+[`tests/README.md`](tests/README.md) directory index.
+
 Three suites make up the run:
 
 - `unit` (`build/sol_test`) — the data structures: list, BST, trie.
@@ -165,7 +171,7 @@ Three suites make up the run:
   MQTT to them: raw packets, delivery paths, sessions, persistence, the memory
   policy, the access control list, TLS and daemon mode. Each module starts a
   broker of its own where it needs a specific configuration;
-  `tests/gen_certs.sh` prepares the certificates the TLS tests use (they are
+  `tests/tools/gen_certs.sh` prepares the certificates the TLS tests use (they are
   not part of the repository). CTest passes the freshly built binary through
   `SOL_BIN`, so no `./sol` symlink is needed. To run it by hand:
 
@@ -176,19 +182,19 @@ Three suites make up the run:
 Two more tools are meant to be run by hand:
 
 ```sh
-$ python3 tests/stress.py [--help]     # load generator, N clients fanning out
-$ ./tests/run_tsan.sh                  # the suite against a TSan build
+$ python3 tests/tools/stress.py [--help]     # load generator, N clients fanning out
+$ ./tests/tools/run_tsan.sh                  # the suite against a TSan build
 ```
 
 ### Fuzzing
 
-The parser has a libFuzzer entry point (`tests/fuzz_unpack.c`). It needs
+The parser has a libFuzzer entry point (`tests/fuzz/fuzz_unpack.c`). It needs
 clang:
 
 ```sh
 $ cmake -S . -B build-fuzz -DFUZZ=ON -DCMAKE_C_COMPILER=clang
 $ cmake --build build-fuzz --target sol_fuzz
-$ ./build-fuzz/sol_fuzz -max_total_time=60 tests/fuzz_corpus
+$ ./build-fuzz/sol_fuzz -max_total_time=60 tests/fuzz/corpus
 ```
 
 The first byte of every input is the fixed header, the rest is what the event
@@ -226,7 +232,7 @@ $ cmake -S . -B build-tsan -DTSAN=ON && cmake --build build-tsan -j   # TSan
 Both sanitizers are meant to be exercised through the integration suite: run
 it with `SOL_BIN=build-asan/sol python3 tests/integration/run.py`. The
 ThreadSanitizer one needs the address space randomization disabled (it refuses
-to start otherwise on recent kernels), which `tests/run_tsan.sh` takes care of.
+to start otherwise on recent kernels), which `tests/tools/run_tsan.sh` takes care of.
 
 ## Operations
 
@@ -473,13 +479,13 @@ What that costs in practice, and what the code does about it:
   monitored descriptor array), and the loops that cannot nudge a blocking wait
   by themselves (poll, select) watch a wakeup descriptor for that purpose;
 - the whole integration suite is run under ThreadSanitizer
-  (`tests/run_tsan.sh`), which is what found and closed the races listed in the
+  (`tests/tools/run_tsan.sh`), which is what found and closed the races listed in the
   commit history rather than leaving them to be discovered under load.
 
 ## Benchmarks
 
 > The numbers below are the upstream project's, from 2020 and against mosquitto
-> 1.6.8 out of the box. They are kept for context; `tests/stress.py` in this
+> 1.6.8 out of the box. They are kept for context; `tests/tools/stress.py` in this
 > fork is what to use to measure the broker as it is now, on your own machine.
 
 I've run some basic benchmarks comparing Sol and Mosquitto's performance, using
@@ -487,10 +493,12 @@ I've run some basic benchmarks comparing Sol and Mosquitto's performance, using
 concurrent connections and different loads of traffic on my laptop, an
 Intel(R) I5-8265U (8) @ 3.900 GHz CPUs and 8 GB RAM.
 
-To be minded that currently Sol skips some checks like UTF-8 strings for topics
-and the memory footprint is also much greater than Mosquitto's one; moreover
-this benchmarks doesn't take into account real publish on multiple subscribers,
-just the publish traffic load on multiple clients with different QoS levels.
+These historical upstream results predate several changes in this fork,
+including UTF-8 validation. They are not a benchmark of the current tree. The
+test does not model publishing to multiple subscribers, and the upstream
+comparison used a default Mosquitto 1.6.8 build. Use `tests/tools/stress.py`
+for a local, current-tree measurement; its results are not directly comparable
+to the historical chart.
 
 ![MQTT mosquitto vs sol comparison](MQTTcomparison.png)
 

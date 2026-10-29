@@ -26,8 +26,8 @@
  */
 
 #include "proto_test.h"
-#include "unit.h"
-#include "../src/topic_match.h"
+#include "../unit/unit.h"
+#include "../../src/topic_match.h"
 #include <stdio.h>
 
 struct match_case {

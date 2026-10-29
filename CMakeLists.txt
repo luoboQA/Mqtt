@@ -58,7 +58,7 @@ set(SOURCES
     src/trie.c
     src/util.c)
 
-# The structure tests only need the containers and their helpers
+# The small unit suite covers the containers and shared low-level helpers.
 set(STRUCT_TEST_SOURCES
     src/bst.c
     src/config.c
@@ -68,8 +68,8 @@ set(STRUCT_TEST_SOURCES
     src/memory.c
     src/trie.c
     src/util.c
-    tests/sol_test.c
-    tests/structures_test.c)
+    tests/unit/sol_test.c
+    tests/unit/structures_test.c)
 
 # The protocol tests are pure: mqtt_unpack(), the topic matcher and the
 # configuration parser. No server, no event loop, no sockets.
@@ -81,11 +81,11 @@ set(PROTO_TEST_SOURCES
     src/pack.c
     src/topic_match.c
     src/util.c
-    tests/proto_test.c
-    tests/mqtt_test.c
-    tests/topic_match_test.c
-    tests/config_test.c
-    tests/util_test.c)
+    tests/protocol/proto_test.c
+    tests/protocol/mqtt_test.c
+    tests/protocol/topic_match_test.c
+    tests/protocol/config_test.c
+    tests/protocol/util_test.c)
 
 set(AUTHOR "Andrea Giacomo Baldan")
 set(LICENSE "BSD2 license")
@@ -147,7 +147,7 @@ if (FUZZ)
         message(FATAL_ERROR "FUZZ=ON requires clang (libFuzzer)")
     endif ()
     add_executable(sol_fuzz
-        tests/fuzz_unpack.c
+        tests/fuzz/fuzz_unpack.c
         src/mqtt.c
         src/pack.c
         src/util.c

@@ -19,8 +19,8 @@ MQTT 3.1.1 要求持久会话保存断线期间匹配订阅的 QoS 1/2 消息；
 或资源原因丢弃会话状态时，其效果是终止会话。因此这些限制不能作为可靠投递的
 符合性示例。参见规范 §3.1.2.4、§4.1。
 
-测试列中 `proto:` 指 `tests/mqtt_test.c` / `tests/topic_match_test.c` /
-`tests/config_test.c`，`it:` 指 `tests/integration/` 下的用例。
+测试列中 `proto:` 指 `tests/protocol/` 下的协议单测，`it:` 指
+`tests/integration/` 下的用例。
 
 ## 1. 固定头与通用规则
 

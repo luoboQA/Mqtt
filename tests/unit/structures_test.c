@@ -27,11 +27,11 @@
  */
 
 #include "structures_test.h"
-#include "../src/iterator.h"
-#include "../src/list.h"
-#include "../src/memory.h"
-#include "../src/bst.h"
-#include "../src/trie.h"
+#include "../../src/iterator.h"
+#include "../../src/list.h"
+#include "../../src/memory.h"
+#include "../../src/bst.h"
+#include "../../src/trie.h"
 #include "unit.h"
 #include <stdlib.h>
 #include <string.h>

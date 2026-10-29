@@ -26,9 +26,9 @@
  */
 
 #include "proto_test.h"
-#include "unit.h"
-#include "../src/memory.h"
-#include "../src/mqtt.h"
+#include "../unit/unit.h"
+#include "../../src/memory.h"
+#include "../../src/mqtt.h"
 #include <stdio.h>
 #include <string.h>
 

@@ -5,10 +5,10 @@ shared topic and publishing M messages on it, so every message is delivered
 to every subscriber. Meant to be run by hand (it is not part of the
 integration suite, which should stay fast):
 
-    python3 tests/stress.py                      # 100 clients, 10 messages each
-    python3 tests/stress.py -n 300 -m 20         # heavier
-    python3 tests/stress.py --payload 300000     # close to max_request_size
-    python3 tests/stress.py --slow               # subscribers that never read
+    python3 tests/tools/stress.py                      # 100 clients, 10 messages each
+    python3 tests/tools/stress.py -n 300 -m 20         # heavier
+    python3 tests/tools/stress.py --payload 300000     # close to max_request_size
+    python3 tests/tools/stress.py --slow               # subscribers that never read
 
 It reports what it managed to do and, at the end, checks that the broker is
 still serving clients. `--slow` deliberately leaves the subscribers' sockets
@@ -24,7 +24,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                'integration'))
+                                '..', 'integration'))
 import sol_test  # noqa: E402
 
 TOPIC = 'bench/topic'

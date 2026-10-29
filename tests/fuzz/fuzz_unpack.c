@@ -30,7 +30,7 @@
  *
  *   cmake -S . -B build-fuzz -DFUZZ=ON -DCMAKE_C_COMPILER=clang
  *   cmake --build build-fuzz --target sol_fuzz
- *   ./build-fuzz/sol_fuzz -max_total_time=60 tests/fuzz_corpus
+ *   ./build-fuzz/sol_fuzz -max_total_time=60 tests/fuzz/corpus
  *
  * The first byte is the fixed header, the rest is what the caller hands to
  * mqtt_unpack() after reading the Remaining Length: the fuzzer feeds the same

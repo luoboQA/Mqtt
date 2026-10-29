@@ -198,8 +198,8 @@ publish_handler
 
 | 想做的事 | 主要文件 |
 |---|---|
-| 新增/修改 MQTT 包字段 | `mqtt.c`、`mqtt.h`、`tests/mqtt_test.c` |
-| 改主题匹配规则 | `topic_match.c`、`tests/topic_match_test.c` |
+| 新增/修改 MQTT 包字段 | `mqtt.c`、`mqtt.h`、`tests/protocol/mqtt_test.c` |
+| 改主题匹配规则 | `topic_match.c`、`tests/protocol/topic_match_test.c` |
 | 改订阅索引 | `topic_store.c`、`trie.c` |
 | 改 QoS/会话行为 | `session.c`、`publish.c`、`sol_internal.h` |
 | 改 CONNECT/遗嘱 | `connect.c` |
@@ -208,7 +208,7 @@ publish_handler
 | 改事件循环/监听启停 | `server.c`、`ev.c`、`network.c` |
 | 改定时任务 | `cron.c`、`server_internal.h` |
 | 改持久化格式 | `persistence.c`、`tests/integration/test_persistence.py` |
-| 改配置项 | `config.c`、`config.h`、`etc/conf/sol.conf`、`tests/config_test.c` |
+| 改配置项 | `config.c`、`config.h`、`etc/conf/sol.conf`、`tests/protocol/config_test.c` |
 | 改 ACL | `acl.c`、`tests/integration/test_acl.py` |
 | 改内存策略 | `memory.c`、`cron.c:cron_memory_check()` |
 

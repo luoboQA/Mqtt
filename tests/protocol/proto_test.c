@@ -26,7 +26,7 @@
  */
 
 #include "proto_test.h"
-#include "unit.h"
+#include "../unit/unit.h"
 #include <stdio.h>
 
 int tests_run = 0;

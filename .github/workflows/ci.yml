@@ -57,9 +57,9 @@ jobs:
 
       # TSan refuses to start on kernels randomizing the address space with
       # more than 28 bits, which GitHub runners do: disable it for the broker
-      # only, through the wrapper tests/run_tsan.sh installs as ./sol
+      # only, through the wrapper tests/tools/run_tsan.sh installs as ./sol
       - name: Test
-        run: sudo sysctl vm.mmap_rnd_bits=28 && ./tests/run_tsan.sh
+        run: sudo sysctl vm.mmap_rnd_bits=28 && ./tests/tools/run_tsan.sh
 
       - name: Upload report
         if: always()
@@ -123,7 +123,7 @@ jobs:
       - name: Fuzz
         run: |
           mkdir -p corpus
-          cp tests/fuzz_corpus/* corpus/
+          cp tests/fuzz/corpus/* corpus/
           ./build-fuzz/sol_fuzz -max_total_time=120 -rss_limit_mb=2048 corpus
 
       - name: Upload crash
