@@ -1,0 +1,135 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    name: Build and test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: debug
+            cmake: -DDEBUG=ON
+          - name: poll
+            cmake: -DEVENTLOOP=poll
+          - name: select
+            cmake: -DEVENTLOOP=select
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev libcrypt-dev python3-pip
+          pip3 install paho-mqtt
+
+      - name: Configure
+        run: cmake -S . -B build ${{ matrix.cmake }}
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  tsan:
+    name: ThreadSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev libcrypt-dev python3-pip
+          pip3 install paho-mqtt
+
+      - name: Build
+        run: |
+          cmake -S . -B build-tsan -DTSAN=ON
+          cmake --build build-tsan -j"$(nproc)"
+
+      # TSan refuses to start on kernels randomizing the address space with
+      # more than 28 bits, which GitHub runners do: disable it for the broker
+      # only, through the wrapper tests/run_tsan.sh installs as ./sol
+      - name: Test
+        run: sudo sysctl vm.mmap_rnd_bits=28 && ./tests/run_tsan.sh
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsan-report
+          path: /tmp/sol-tsan.log
+          if-no-files-found: ignore
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev libcrypt-dev lcov python3-pip
+          pip3 install paho-mqtt
+
+      - name: Build
+        run: |
+          cmake -S . -B build-cov -DCOVERAGE=ON
+          cmake --build build-cov -j"$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build-cov --output-on-failure
+
+      - name: Report
+        run: |
+          lcov --capture --directory build-cov --output-file coverage.info \
+               --ignore-errors mismatch,gcov,source
+          lcov --remove coverage.info '/usr/*' '*/tests/*' \
+               --output-file coverage.info --ignore-errors unused
+          lcov --list coverage.info
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.info
+
+  fuzz:
+    name: Fuzz (clang)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang libssl-dev libcrypt-dev
+
+      - name: Build
+        run: |
+          cmake -S . -B build-fuzz -DFUZZ=ON \
+                -DCMAKE_C_COMPILER=clang -DCMAKE_C_FLAGS=-O1
+          cmake --build build-fuzz --target sol_fuzz -j"$(nproc)"
+
+      - name: Fuzz
+        run: |
+          mkdir -p corpus
+          cp tests/fuzz_corpus/* corpus/
+          ./build-fuzz/sol_fuzz -max_total_time=120 -rss_limit_mb=2048 corpus
+
+      - name: Upload crash
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash
+          path: crash-*
+          if-no-files-found: ignore

@@ -116,24 +116,40 @@ starts to hurt:
 ## Build
 
 ```sh
-$ cmake .
-$ make
+$ cmake -S . -B build
+$ cmake --build build -j
 ```
+
+The binary lands in `build/sol`; `cmake --install build` puts it in
+`${CMAKE_INSTALL_PREFIX}/bin` together with the sample configuration.
 
 ## Testing
 
-The unit tests run as part of the build (`sol_test`), and the integration
-suite comes with the repository:
+Everything runs through CTest, from a fresh build directory:
 
 ```sh
-$ python3 tests/integration/run.py     # starts its own broker, 63 tests
+$ cmake -S . -B build -DDEBUG=ON
+$ cmake --build build -j
+$ ctest --test-dir build --output-on-failure
 ```
 
-It covers the protocol (raw packets), the delivery paths, the sessions, the
-persistence, the memory policy, the access control list, TLS and daemon mode,
-each module starting a broker of its own where it needs a specific
-configuration. `tests/gen_certs.sh` prepares the certificates the TLS tests
-use (they are not part of the repository).
+Three suites make up the run:
+
+- `unit` (`build/sol_test`) — the data structures: list, BST, trie.
+- `proto` (`build/sol_proto_test`) — the pure protocol pieces: PUBLISH
+  unpacking and packing, malformed packet rejection, the §4.7 topic matching
+  table and the configuration parser. No broker, no sockets.
+- `integration` (`tests/integration/run.py`) — starts real brokers and speaks
+  MQTT to them: raw packets, delivery paths, sessions, persistence, the memory
+  policy, the access control list, TLS and daemon mode. Each module starts a
+  broker of its own where it needs a specific configuration;
+  `tests/gen_certs.sh` prepares the certificates the TLS tests use (they are
+  not part of the repository). CTest passes the freshly built binary through
+  `SOL_BIN`, so no `./sol` symlink is needed. To run it by hand:
+
+  ```sh
+  $ python3 tests/integration/run.py
+  ```
 
 Two more tools are meant to be run by hand:
 
@@ -141,6 +157,35 @@ Two more tools are meant to be run by hand:
 $ python3 tests/stress.py [--help]     # load generator, N clients fanning out
 $ ./tests/run_tsan.sh                  # the suite against a TSan build
 ```
+
+### Fuzzing
+
+The parser has a libFuzzer entry point (`tests/fuzz_unpack.c`). It needs
+clang:
+
+```sh
+$ cmake -S . -B build-fuzz -DFUZZ=ON -DCMAKE_C_COMPILER=clang
+$ cmake --build build-fuzz --target sol_fuzz
+$ ./build-fuzz/sol_fuzz -max_total_time=60 tests/fuzz_corpus
+```
+
+The first byte of every input is the fixed header, the rest is what the event
+loop hands to `mqtt_unpack()`, so anything the fuzzer finds is something a
+client can send.
+
+### Coverage
+
+```sh
+$ cmake -S . -B build-cov -DCOVERAGE=ON
+$ cmake --build build-cov -j
+$ ctest --test-dir build-cov --output-on-failure
+$ lcov --capture --directory build-cov --output-file coverage.info
+$ lcov --remove coverage.info '/usr/*' '*/tests/*' --output-file coverage.info
+$ genhtml coverage.info --output-directory coverage
+```
+
+The `coverage` job in `.github/workflows/ci.yml` runs exactly this and keeps
+`coverage.info` as an artifact.
 
 ### Event loop backends
 
@@ -152,14 +197,14 @@ the same machine: `cmake -S . -B build-poll -DEVENTLOOP=poll` (or `select`,
 ### Sanitizer builds
 
 ```sh
-$ cmake -S . -B build-asan -DDEBUG=ON && make -C build-asan sol   # ASan + UBSan
-$ cmake -S . -B build-tsan -DTSAN=ON && make -C build-tsan sol   # TSan
+$ cmake -S . -B build-asan -DDEBUG=ON && cmake --build build-asan -j   # ASan + UBSan
+$ cmake -S . -B build-tsan -DTSAN=ON && cmake --build build-tsan -j   # TSan
 ```
 
-Both sanitizers are meant to be exercised through the integration suite: run it
-with the sanitized binary in place of `./sol`. The ThreadSanitizer one needs
-the address space randomization disabled (it refuses to start otherwise on
-recent kernels), which `tests/run_tsan.sh` takes care of.
+Both sanitizers are meant to be exercised through the integration suite: run
+it with `SOL_BIN=build-asan/sol python3 tests/integration/run.py`. The
+ThreadSanitizer one needs the address space randomization disabled (it refuses
+to start otherwise on recent kernels), which `tests/run_tsan.sh` takes care of.
 
 ## Quickstart play
 
