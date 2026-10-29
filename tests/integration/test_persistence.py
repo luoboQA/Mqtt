@@ -496,6 +496,59 @@ class TestPersistence(unittest.TestCase):
         finally:
             again.close()
 
+    def test_v1_snapshot_is_migrated(self):
+        """A v1 file must still be readable after the format change: v1
+        appended an artificial '/' to every subscription filter (and dropped
+        the '#' of a multilevel one), while a queued record had no packet
+        identifier. The loader has to rebuild the exact topic, register the
+        migrated subscription and give the queued message a fresh mid"""
+        # The running broker would overwrite the crafted file on shutdown
+        self.stop_broker()
+
+        def h(data):
+            return data.hex()
+
+        with open(DB, 'wb') as fh:
+            fh.write(b'# sol persistence v1\n'
+                     b'retained ' + h(b'v1/a').encode() + b' 0 '
+                     + h(b'hello').encode() + b'\n'
+                     b'session ' + h(b'v1-sess').encode() + b'\n'
+                     b'sub ' + h(b'v1-sess').encode() + b' '
+                     + h(b'v1/a/').encode() + b' 1 0\n'
+                     b'queued ' + h(b'v1-sess').encode() + b' '
+                     + h(b'v1/a').encode() + b' 1 '
+                     + h(b'queued').encode() + b'\n')
+        self.start_broker()
+
+        again, leftover = self.connect('v1-sess', clean_session=False)
+        try:
+            connack, rc = sol_test.read_connack(leftover[:4])
+            self.assertEqual(rc, 0)
+            self.assertTrue(leftover[2] & 0x01,
+                            'the v1 session was not restored')
+            publish, leftover = self.read_publish(again, leftover[4:])
+            # The v1 filter "v1/a/" is the exact topic "v1/a" in v2, and the
+            # queued message was given a fresh identifier
+            self.assertEqual(publish[1], 'v1/a')
+            self.assertEqual(publish[2], b'queued')
+            self.assertNotEqual(publish[3], 0)
+            again.sendall(sol_test.create_puback(publish[3]))
+
+            pub, _ = self.connect('v1-pub')
+            try:
+                pub.sendall(sol_test.create_publish('v1/a', b'fresh'))
+                pub.sendall(sol_test.create_publish('v1/a/', b'wrong'))
+            finally:
+                pub.close()
+            publish, leftover = self.read_publish(again, leftover)
+            self.assertEqual(publish[1], 'v1/a')
+            self.assertEqual(publish[2], b'fresh')
+            again.settimeout(2)
+            with self.assertRaises(socket.timeout):
+                again.recv(100)
+        finally:
+            again.close()
+
     def test_empty_persistence_file_is_not_fatal(self):
         """A configuration pointing at a file that does not exist (or holds
         garbage) must start an empty broker, not crash it"""
