@@ -18,6 +18,16 @@ specification are spelled out under [Known
 simplifications](#教学简化--known-simplifications), and none of them is
 hidden behind a promise the code does not keep.
 
+### Documentation
+
+- [`docs/architecture.md`](docs/architecture.md) — a walk through the code
+  following one byte from the socket to another client, and a map of which
+  file to touch for each kind of change.
+- [`docs/conformance.md`](docs/conformance.md) — the MQTT 3.1.1 conformance
+  matrix: every requirement, where it is implemented, which test covers it.
+- [`docs/design.md`](docs/design.md) — the design trade-offs: event loop and
+  threads, global state, topic indexes, persistence, memory policy, security.
+
                     ┌─────────────────────────────┐
                     │         sol.c (main)        │
                     │  解析命令行 / 加载配置 / 启动   │
