@@ -25,6 +25,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+/* Socket callbacks and the lifecycle of an accepted client connection. */
 #include "server_internal.h"
 #include "acl.h"
 #include "config.h"
@@ -714,22 +715,13 @@ exit:
 static inline int read_data(struct client *c)
 {
 
-    /*
-     * We must read all incoming bytes till an entire packet is received. This
-     * is achieved by following the MQTT protocol specifications, which
-     * send the size of the remaining packet as the second byte. By knowing it
-     * we know if the packet is ready to be deserialized and used.
+    /* recv_packet() buffers a full MQTT packet using its variable-length
+     * Remaining Length field before the parser is called.
      */
     int err = recv_packet(c);
 
-    /*
-     * Looks like we got a client disconnection or If a not correct packet
-     * received, we must free the buffer and reset the handler to the request
-     * again, setting EPOLL to EPOLLIN
-     *
-     * TODO: Set a error_handler for ERRMAXREQSIZE instead of dropping client
-     *       connection, explicitly returning an informative error code to the
-     *       client connected.
+    /* A disconnect, malformed packet, or oversized packet is handled by the
+     * caller; incomplete packets return EAGAIN and stay buffered.
      */
     if (err < 0)
         goto err;
@@ -740,8 +732,6 @@ static inline int read_data(struct client *c)
     info.bytes_recv += c->read;
 
     return SOL_OK;
-
-    // Disconnect packet received
 
 err:
 
@@ -981,20 +971,11 @@ static void read_callback(struct ev_ctx *ctx, void *data)
     struct client *c = data;
     if (c->status == SENDING_DATA)
         return;
-    /*
-     * Received a bunch of data from a client, after the creation
-     * of an IO event we need to read the bytes and encoding the
-     * content according to the protocol
-     */
+    /* Read until a full packet is buffered, then dispatch it for processing. */
     int rc = read_data(c);
     switch (rc) {
     case SOL_OK:
-        /*
-         * All is ok, raise an event to the worker poll EPOLL and
-         * link it with the IO event containing the decode payload
-         * ready to be processed
-         */
-        /* Record last action as of now */
+        /* Refresh keepalive state before processing the packet. */
         c->last_seen = time(NULL);
         c->status    = SENDING_DATA;
         process_message(ctx, c);
@@ -1003,11 +984,10 @@ static void read_callback(struct ev_ctx *ctx, void *data)
     case -ERRSOCKETERR:
     case -ERRPACKETERR:
     case -ERRMAXREQSIZE:
-        // TODO move to default branch
         /*
-         * We got an unexpected error or a disconnection from the
-         * client side: deliver the will and release the connection,
-         * the LWT/close sequence is shared with the keepalive timeout
+         * Close on I/O, malformed-packet or size-limit errors. The protocol
+         * has no response code for an oversized packet; client_shutdown()
+         * handles the will and connection cleanup.
          */
         client_shutdown(ctx, c, rc);
         break;

@@ -40,10 +40,7 @@ struct config;
  */
 #define THREADSNR            2
 
-/*
- * Epoll default settings for concurrent events monitored and timeout, -1
- * means no timeout at all, blocking undefinitely
- */
+/* Initial event batch size; the backend uses an indefinite wait by default. */
 #define EVENTLOOP_MAX_EVENTS 1024
 #define EVENTLOOP_TIMEOUT    -1
 
@@ -72,7 +69,7 @@ struct io_event {
     struct mqtt_packet data;
 };
 
-/* Global informations statistics structure */
+/* Process-wide counters published periodically on the $SOL topics. */
 struct sol_info {
     /* Number of clients currently connected */
     atomic_size_t active_connections;
@@ -108,17 +105,13 @@ struct sol_info {
     } while (0)
 
 /*
- * General informations of the broker, all fields will be published
- * periodically to internal topics
+ * Broker counters exposed on internal $SOL topics.
  */
 extern struct sol_info info;
 
 /*
- * Main structure, a global instance will be instantiated at start, tracking
- * topics, connected clients and registered closures.
- *
- * pending_msgs and pendings_acks are two arrays used to track remaining
- * messages to push out and acks respectively.
+ * Per-process broker state. main() owns the instance and passes its address
+ * through connections, sessions and event-loop callback data.
  */
 struct server {
     /*
@@ -142,7 +135,7 @@ struct server {
     /*
      * Set while the broker is over its max_memory and has nothing left to
      * give back: new connections are refused until it drops again. Written
-     * by the memory_check() periodic task, read on every accept
+     * by cron_memory_check(), read on every accept
      */
     volatile atomic_bool over_memory;
     // Application TLS context
@@ -150,12 +143,7 @@ struct server {
 };
 
 
-/*
- * Main entry point for the server, to be called with an address and a port
- * to start listening. The function may fail only in the case of Out of memory
- * error occurs or listen call fails, on the other cases it should just log
- * unexpected errors.
- */
+/* Start the listener and event loops using the supplied broker context. */
 int start_server(struct server *, const char *, const char *);
 
 /*
@@ -165,13 +153,6 @@ int start_server(struct server *, const char *, const char *);
  */
 void enqueue_event_write(const struct client *);
 
-/*
- * Disconnect any live connection registered under the given client id: MQTT
- * v3.1.1 §3.1.4 requires the server to drop the older connection when a new
- * CONNECT carries an id already in use. The caller must hold the global
- * server mutex, `keep` is the connection taking the id over (skipped if it
- * somehow matches the registered one)
- */
 /*
  * Disconnect the client currently holding `client_id`, if any, as MQTT
  * v3.1.1 §3.1.4-2 requires when a second connection takes that id over.

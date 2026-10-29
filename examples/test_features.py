@@ -3,7 +3,7 @@
 协议特性验证: 裸 '#' 订阅 / 通配符订阅下发保留消息 / 会话保持.
 
 先启动 broker:
-    ./sol -c etc/conf/sol.conf -v
+    ./build/sol -c etc/conf/sol.conf -v
 
 运行:
     python3 examples/test_features.py

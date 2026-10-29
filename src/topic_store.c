@@ -393,9 +393,7 @@ static void wild_index_remove_client(struct wild_index *index, const char *id)
 }
 
 /*
- * Allocate a new store structure on the heap and return it after its
- * initialization, also allocating the wildcard subscriptions index, the
- * function may gracefully crash as the memory allocation may fail.
+ * Create the exact-topic trie and the separate wildcard subscription index.
  */
 struct topic_store *topic_store_new(void)
 {
@@ -455,11 +453,7 @@ struct topic *topic_store_get(const struct topic_store *store, const char *name)
 }
 
 /*
- * Return a topic associated to a topic name from the store, if no topic is
- * insert it into the store before returning it. Like topic_store_get but
- * cannot return NULL.
- * The function may fail as in case of no topic found it tries to allocate
- * space on the heap for the new inserted topic.
+ * Return the named topic, creating and inserting it when absent.
  */
 struct topic *topic_store_get_or_put(struct topic_store *store,
                                      const char *name)

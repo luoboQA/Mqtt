@@ -9,7 +9,7 @@ option(TSAN "Build with ThreadSanitizer" OFF)
 option(COVERAGE "Build with gcov instrumentation" OFF)
 option(FUZZ "Build the libFuzzer target for mqtt_unpack (requires clang)" OFF)
 set(EVENTLOOP "default" CACHE STRING
-    "Event loop backend: default, epoll, poll or select (Linux only)")
+    "Event loop backend: default, epoll, poll or select (explicit backends are Linux-only)")
 
 add_definitions("-D_DEFAULT_SOURCE")
 

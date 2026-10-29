@@ -52,8 +52,8 @@ enum ev_type {
 struct ev_ctx;
 
 /*
- * Event struture used as the main carrier of clients informations, it will be
- * tracked by an array in every context created
+ * Event record for one monitored descriptor. Each event context stores its
+ * records in an array indexed by descriptor or backend slot.
  */
 struct ev {
     int fd;

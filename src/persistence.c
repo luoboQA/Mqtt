@@ -25,6 +25,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+/* Snapshot and replay broker state; append each mutation to the WAL first. */
 #include "persistence.h"
 #include "config.h"
 #include "handlers.h"

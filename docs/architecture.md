@@ -179,7 +179,7 @@ publish_handler
 
 - `struct sol_info info`：连接数、收发消息数、字节数、启动时间/uptime，全部
   原子类型。
-- `cron_publish_stats()` 每 `stats_pub_interval` 秒向 `$SOL/...` 发布统计；这些
+- `cron_publish_stats()` 每 `stats_publish_interval` 秒向 `$SOL/...` 发布统计；这些
   主题对以通配符开头的订阅不可见（§4.7.2），只能显式订阅。
 - 日志在 `logging.c`，级别由 `log_level` 控制，`-v` 打开 DEBUG；支持
   `logpath` 写文件。
@@ -212,11 +212,9 @@ publish_handler
 | 改 ACL | `acl.c`、`tests/integration/test_acl.py` |
 | 改内存策略 | `memory.c`、`cron.c:cron_memory_check()` |
 
-## 11. 已知边界
+## 11. 边界
 
-- 单进程、单机；没有集群、共享订阅、桥接。
-- 事件循环线程数由 `THREADSNR` 编译期决定，运行期不可调。
-- 配置和 broker 状态由 `main()` 持有并显式传递；`topic_match`、`mqtt`、
-  `config`、`util` 这些纯模块不依赖 `struct server`，可以直接单测，但
-  `handlers` / `server` / `persistence` 仍需要完整的 broker 上下文才能跑。
-- 持久化是“整份快照 + 增量 WAL”，不是 LSM/数据库；状态越大快照越慢。
+协议偏差和部署限制见[已知限制](limitations.md)。实现边界主要有两点：
+事件循环线程数由 `THREADSNR` 编译期决定；持久化会定期重写整份快照，状态
+越大写入越慢。纯模块（`topic_match`、`mqtt`、`config`、`util`）可独立测试，
+而 `handlers`、`server` 和 `persistence` 需要 broker 上下文。

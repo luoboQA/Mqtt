@@ -34,9 +34,10 @@
 #include <stddef.h>
 
 /*
- * Prototypes shared by the modules the command handling used to live in
- * (handlers.c, session.c, connect.c, subscribe.c, publish.c). Everything here
- * is internal to the broker: the public entry points stay in handlers.h
+ * Prototypes shared by the command modules (handlers.c, session.c, connect.c,
+ * subscribe.c, publish.c). The command handlers stay internal here; broker
+ * services shared with persistence and server modules are declared in
+ * handlers.h.
  */
 
 struct client;

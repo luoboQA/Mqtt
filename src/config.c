@@ -635,8 +635,7 @@ int config_load(struct config *c, const char *configpath)
         pval = value;
         unpack_bytes(&pline, pval, sizeof(value));
 
-        // At this point we have key -> value ready to be ingested on the
-        // global configuration object
+        // Apply the parsed key/value pair to the caller-owned configuration.
         add_config_value(c, key, value);
     }
 

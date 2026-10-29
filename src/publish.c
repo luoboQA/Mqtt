@@ -25,6 +25,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+/* PUBLISH routing, retained state, and inbound/outbound QoS acknowledgements. */
 #include "handlers.h"
 #include "handlers_internal.h"
 #include "acl.h"

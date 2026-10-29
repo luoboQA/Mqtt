@@ -25,6 +25,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+/* SUBSCRIBE/UNSUBSCRIBE state changes and retained-message delivery. */
 #include "handlers.h"
 #include "handlers_internal.h"
 #include "acl.h"

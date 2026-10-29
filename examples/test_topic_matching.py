@@ -3,7 +3,7 @@
 主题匹配(通配符)行为验证, 每个用例使用一个全新的订阅者, 避免订阅互相污染.
 
 先启动 broker:
-    ./sol -c etc/conf/sol.conf -v
+    ./build/sol -c etc/conf/sol.conf -v
 
 运行:
     python3 examples/test_topic_matching.py

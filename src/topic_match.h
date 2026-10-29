@@ -33,7 +33,7 @@
 /*
  * Match a topic name against a subscription filter, following the MQTT
  * v3.1.1 §4.7 rules: '+' consumes exactly one level, '#' the rest of the
- * filter, and "a" and "a/" are distinct names (a trailing '/' introduces a
+ * topic name, and "a" and "a/" are distinct names (a trailing '/' introduces a
  * final empty level). A filter starting with a wildcard never matches a '$'
  * topic (§4.7.2). `multilevel` is a hint for a filter whose '#' was stored
  * as a bare prefix by a v1 persistence record.

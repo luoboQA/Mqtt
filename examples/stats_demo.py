@@ -3,7 +3,7 @@
 $SOL 统计主题 + '$' 前缀规则演示.
 
 先启动 broker:
-    ./sol -c etc/conf/sol.conf -v
+    ./build/sol -c etc/conf/sol.conf -v
 
 运行:
     python3 examples/stats_demo.py

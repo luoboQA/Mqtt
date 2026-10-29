@@ -41,6 +41,7 @@
 #include <pthread.h>
 #include <unistd.h>
 
+/* Protects broker maps shared by event-loop threads. */
 pthread_mutex_t mutex;
 
 /*
@@ -78,57 +79,7 @@ static struct ev_ctx *loops[THREADSNR + 1];
 struct sol_info info;
 
 /*
- * TCP server, based on I/O multiplexing abstraction called ev_ctx. Each thread
- * (if any) should have his own ev_ctx and thus being responsible of a subset
- * of clients.
- * At the init of the server, the ev_ctx will be instructed to run some
- * periodic tasks and to run a callback on accept on new connections. From now
- * on start a simple juggling of callbacks to be scheduled on the event loop,
- * typically after being accepted a connection his handle (fd) will be added to
- * the backend of the loop (this case we're using EPOLL as a backend but also
- * KQUEUE or SELECT/POLL should be easy to plug-in) and read_callback will be
- * run every time there's new data incoming. If a complete packet is received
- * and correctly parsed it will be processed by calling the right handler from
- * the handler module, based on the command it carries and a response will be
- * fired back.
- *
- *                             MAIN THREAD
- *                              [EV_CTX]
- *
- *    ACCEPT_CALLBACK         READ_CALLBACK         WRITE_CALLBACK
- *  -------------------    ------------------    --------------------
- *        |                        |                       |
- *      ACCEPT                     |                       |
- *        | ---------------------> |                       |
- *        |                  READ AND DECODE               |
- *        |                        |                       |
- *        |                        |                       |
- *        |                     PROCESS                    |
- *        |                        |                       |
- *        |                        |                       |
- *        |                        | --------------------> |
- *        |                        |                     WRITE
- *      ACCEPT                     |                       |
- *        | ---------------------> | <-------------------- |
- *        |                        |                       |
- *
- * The whole method could be easily distributed across a threadpool, by paying
- * attention to the shared critical parts on handler module.
- * The access to shared data strucures could be guarded by a mutex or a
- * spinlock, and being generally fast operations it shouldn't suffer high
- * contentions by the threads and thus being really fast.
- * The drawback of this approach is that the concurrency is not equally
- * distributed across all threads, each thread has it's own eventloop and thus
- * is responsible for a subset of connections, without any possibility of
- * cooperation from other threads. This should be mitigated by the fact that
- * this application mainly deals with short-lived connections so there's
- * frequent turnover of monitored FDs, increasing the number of connections
- * for each different thread.
- */
-
-/*
- * Eventloop stop callback, will be triggered by an EV_CLOSEFD event and stop
- * the running loop, unblocking the call.
+ * Stop callback used during shutdown to wake and exit a running event loop.
  */
 static void stop_handler(struct ev_ctx *ctx, void *arg)
 {
@@ -137,10 +88,8 @@ static void stop_handler(struct ev_ctx *ctx, void *arg)
 }
 
 /*
- * IO worker function, wait for events on a dedicated epoll descriptor owned
- * by this thread, following the normal EPOLL semantic, EPOLLIN for incoming
- * bytes to be unpacked and processed by a worker thread, EPOLLOUT for bytes
- * incoming from a worker thread, ready to be delivered out.
+ * Start one event loop. Each loop owns its accepted clients; periodic jobs are
+ * registered only on loop zero to avoid running the same maintenance twice.
  */
 static void eventloop_start(void *args)
 {
@@ -198,19 +147,14 @@ static void eventloop_start(void *args)
  * ===================
  */
 
-/*
- * Main entry point for the server, to be called with an address and a port
- * to start listening. The function may fail only in the case of Out of memory
- * error occurs or listen call fails, on the other cases it should just log
- * unexpected errors.
- */
+/* Start broker state, the listener, and its event-loop threads. */
 int start_server(struct server *server, const char *addr, const char *port)
 {
     struct config *conf = server->conf;
 
     INIT_INFO;
 
-    /* Initialize global Sol instance */
+    /* Initialize state owned by this broker context. */
     server->store = topic_store_new();
     server->auths = NULL;
     server->pool  = memorypool_new(BASE_CLIENTS_NUM, sizeof(struct client));

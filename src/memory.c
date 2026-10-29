@@ -72,11 +72,8 @@ void *try_alloc(size_t size)
 }
 
 /*
- * Same as xmalloc, but with calloc, creating chunk o zero'ed memory.
- * TODO: still a suboptimal solution
- *
- * This function can fail if not memory is available, interrupting the
- * execution of the program and exiting, hence the prefix "try".
+ * Allocate and zero a tracked block. Allocation failure is fatal, like
+ * try_alloc().
  */
 void *try_calloc(size_t len, size_t size)
 {

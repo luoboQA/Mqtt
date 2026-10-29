@@ -1,12 +1,12 @@
 # MQTT 示例脚本
 
-用 Python + [paho-mqtt](https://pypi.org/project/paho-mqtt/) 验证本 broker 的行为，
-边看脚本边对照 broker 日志（`/tmp/sol.log`）是理解 MQTT 协议最快的方式。
+用 Python + [paho-mqtt](https://pypi.org/project/paho-mqtt/) 验证 broker 行为，
+并对照日志与对应的源码路径。
 
 ## 准备
 
 ```sh
-# 1. 编译并启动 broker (默认监听 1883)
+# 1. 编译并启动 broker (示例配置监听 127.0.0.1:8883)
 cmake -S . -B build
 cmake --build build -j
 ./build/sol -c etc/conf/sol.conf -v

@@ -285,9 +285,9 @@ static inline struct ev *ev_api_fetch_event(const struct ev_ctx *ctx, int idx,
  * of pollfd structures associated. This number must be adjusted everytime a
  * client disconnect or a new connection have an fd > nfds to avoid iterating
  * over closed fds everytime a new event is triggered.
- * As select, poll iterate linearly over all the triggered events, without the
- * hard limit of 1024 connections. It's the second best option available if no
- * epoll or kqueue for Mac OSX are not present.
+ * poll scans the monitored descriptors linearly and grows its descriptor
+ * array as needed. It avoids select's FD_SETSIZE limit at the cost of a scan
+ * on each wait.
  */
 
 #include <poll.h>
@@ -656,10 +656,8 @@ static inline struct ev *ev_api_fetch_event(const struct ev_ctx *ctx, int idx,
  *  Kqueue backend functions
  * ==========================
  *
- * The Epoll counterpart on BSD systems, including Mac OSX, it's the older of
- * the two Mux IO implementations and on par in terms of performances, a bit
- * more versatile as it's possible to schedule timers directly as events
- * instead of relying on support mechanisms like `timerfd` on linux.
+ * kqueue is the BSD/macOS event backend. It supports descriptor and timer
+ * events through one kernel queue; Linux uses epoll plus timerfd instead.
  */
 
 #include <sys/event.h>

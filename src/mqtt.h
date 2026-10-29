@@ -315,7 +315,7 @@ int mqtt_unpack(u8 *, struct mqtt_packet *, u8, usize);
 /*
  * MQTT Build helpers
  *
- * They receive a pointer to a struct mqtt_packet and additional informations
+ * They receive a packet pointer and any additional information
  * to be stored inside. Just plain builder functions.
  */
 void mqtt_ack(struct mqtt_packet *, u16);

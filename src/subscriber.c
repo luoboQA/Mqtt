@@ -30,12 +30,7 @@
 
 static void subscriber_destroy(const struct ref *);
 
-/*
- * Allocate memory on the heap to create and return a pointer to a struct
- * subscriber, assigining the passed in QoS, session pointer, and
- * instantiating a reference counter to 0.
- * It may fail as it needs to allocate some bytes on the heap.
- */
+/* Create an unowned subscriber record for a session and granted QoS. */
 struct subscriber *subscriber_new(struct client_session *s, unsigned char qos)
 {
     struct subscriber *sub = try_alloc(sizeof(*sub));
@@ -52,13 +47,7 @@ struct subscriber *subscriber_new(struct client_session *s, unsigned char qos)
     return sub;
 }
 
-/*
- * Allocate memory on the heap to clone a subscriber pointer, deep copies all
- * fields into the newly allocated pointer except for the reference counter,
- * the new pointer will have its own refcount set to 0. Finally the newly
- * allocated pointer is returned.
- * It may fail as it needs to allocate some bytes on the heap.
- */
+/* Clone subscription metadata with a fresh reference count. */
 struct subscriber *subscriber_clone(const struct subscriber *s)
 {
     struct subscriber *sub = try_alloc(sizeof(*sub));

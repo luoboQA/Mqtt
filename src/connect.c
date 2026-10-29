@@ -25,6 +25,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+/* CONNECT authentication, session selection, CONNACK and will setup. */
 #include "handlers.h"
 #include "handlers_internal.h"
 #include "acl.h"

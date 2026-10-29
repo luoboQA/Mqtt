@@ -25,6 +25,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+/* Map MQTT control packet types to the command-specific handlers. */
 #include "handlers.h"
 #include "handlers_internal.h"
 #include "acl.h"

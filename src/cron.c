@@ -25,6 +25,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+/* Periodic broker jobs: keepalive, retries, stats, persistence, and memory. */
 #include "server_internal.h"
 #include "acl.h"
 #include "config.h"
@@ -111,8 +112,7 @@ void cron_topics_init(struct server *server)
  */
 
 /*
- * Publish statistics periodic task, it will be called once every N config
- * defined seconds, it publishes some informations on predefined topics
+ * Publish statistics once per configured interval on predefined $SOL topics.
  */
 
 /*

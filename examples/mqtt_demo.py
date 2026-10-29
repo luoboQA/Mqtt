@@ -3,7 +3,7 @@
 MQTT 入门演示 —— 连接本地 sol broker (127.0.0.1:8883)
 
 先启动 broker:
-    ./sol -c etc/conf/sol.conf -v
+    ./build/sol -c etc/conf/sol.conf -v
 
 再运行本脚本:
     python3 examples/mqtt_demo.py

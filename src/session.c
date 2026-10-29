@@ -25,6 +25,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+/* Session ownership, offline queues, packet identifiers, and inflight state. */
 #include "handlers.h"
 #include "handlers_internal.h"
 #include "acl.h"

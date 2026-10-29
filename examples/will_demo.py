@@ -3,7 +3,7 @@
 遗嘱 (Will / LWT) 演示 —— 连接时挂号, 掉线时由 broker 代为发布.
 
 先启动 broker:
-    ./sol -c etc/conf/sol.conf -v
+    ./build/sol -c etc/conf/sol.conf -v
 
 运行:
     python3 examples/will_demo.py

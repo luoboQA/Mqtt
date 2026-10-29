@@ -44,9 +44,7 @@ void topic_init(struct topic *t, const char *name)
 }
 
 /*
- * Allocate a new topic struct on the heap, initialize it then return a pointer
- * to it. The function can fail as a memory allocation is requested, if it
- * fails the program execution graceful crash.
+ * Allocate and initialize a topic. Allocation failure is fatal in try_alloc().
  */
 struct topic *topic_new(const char *name)
 {
@@ -81,10 +79,8 @@ void topic_destroy(struct topic *t)
 }
 
 /*
- * Allocate a new subscriber struct on the heap referring to the passed in
- * topic, client_session and QoS, then add it to the topic map.
- * The function can fail as a memory allocation is requested, if it fails the
- * program execution graceful crash.
+ * Add a subscriber for this session, updating its granted QoS if an entry
+ * already exists. New-entry allocation failure is fatal in try_alloc().
  */
 struct subscriber *topic_add_subscriber(struct topic *t,
                                         struct client_session *s,

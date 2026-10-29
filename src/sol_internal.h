@@ -203,7 +203,7 @@ struct queued_msg {
  * - WAITING_HEADER it's the base state, waiting for the next packet to be
  *                  received
  * - WAITING_LENGTH the second state, a packet has arrived but it's not
- *                  complete yet. Accorting to MQTT protocol, after the first
+ *                  complete yet. According to MQTT, after the first
  *                  byte we need to wait 1 to 4 more bytes based on the
  *                  encoded length (use continuation bit to state the number
  *                  of bytes needed, see http://docs.oasis-open.org/mqtt/mqtt/
@@ -222,18 +222,15 @@ enum client_status {
 };
 
 /*
- * Wrapper structure around a connected client, each client can be a publisher
- * or a subscriber, it can be used to track sessions too.
- * As of now, no allocations will be fired, jsut a big pool of memory at the
- * start of the application will serve us a client pool, read and write buffers
- * are initialized lazily.
+ * State for one connected client. Client objects come from a chunked pool
+ * that grows when needed; socket read/write buffers are allocated lazily.
  *
  * It's an hashable struct which will be tracked during the execution of the
  * application, see https://troydhanson.github.io/uthash/userguide.html.
  */
 struct client {
     struct ev_ctx
-        *ctx;   /* An event context refrence mostly used to fire write events */
+        *ctx;   /* Owning event loop; used to schedule reads and writes */
     struct server *server; /* The broker this connection belongs to, the way
                               handlers reach the config and the shared maps
                               without a process wide global */
@@ -378,74 +375,30 @@ extern pthread_mutex_t mutex;
 
 struct server;
 
-/*
- * Checks if a client is subscribed to a topic by trying to fetch the
- * client_session by its ID on the subscribers inner hashmap of the topic.
- */
+/* Look up this session in a topic's subscriber map. */
 bool is_subscribed(const struct topic *, const struct client_session *);
 
-/*
- * Allocate memory on the heap to create and return a pointer to a struct
- * subscriber, assigining the passed in QoS, session pointer, and
- * instantiating a reference counter to 0.
- * It may fail as it needs to allocate some bytes on the heap.
- */
+/* Create or clone a subscriber record with a fresh reference count. */
 struct subscriber *subscriber_new(struct client_session *, unsigned char);
-
-/*
- * Allocate memory on the heap to clone a subscriber pointer, deep copies all
- * fields into the newly allocated pointer except for the reference counter,
- * the new pointer will have its own refcount set to 0. Finally the newly
- * allocated pointer is returned.
- * It may fail as it needs to allocate some bytes on the heap.
- */
 struct subscriber *subscriber_clone(const struct subscriber *);
 
-/*
- * Initialize a struct topic pointer by setting its name, subscribers and
- * retained_msg are set to NULL.
- * The function expects a non-null pointer and can't fail, if a null topic
- * is passed, the function return prematurely.
- */
+/* Initialize the topic name and clear its retained message/subscribers. */
 void topic_init(struct topic *, const char *);
 
-/*
- * Allocate a new topic struct on the heap, initialize it then return a pointer
- * to it. The function can fail as a memory allocation is requested, if it
- * fails the program execution graceful crash.
- */
+/* Create and initialize a topic; allocation failure is fatal in try_alloc(). */
 struct topic *topic_new(const char *);
 
-/*
- * Deallocate the topic name, retained_msg and all its subscribers
- */
+/* Release a topic and the references it owns. */
 void topic_destroy(struct topic *);
 
-/*
- * Allocate a new subscriber struct on the heap referring to the passed in
- * topic, client_session and QoS, then add it to the topic map.
- * The function can fail as a memory allocation is requested, if it fails the
- * program execution graceful crash.
- */
+/* Add a session to a topic, refreshing its QoS if already present. */
 struct subscriber *topic_add_subscriber(struct topic *, struct client_session *,
                                         unsigned char);
 
-/*
- * Remove a subscriber from the topic, the subscriber to be removed refers to
- * the client_id belonging to the client pointer passed in.
- * The subscriber deletion is really a reference count subtraction, DECREF
- * macro takes care of the counter, if it reaches 0 it de-allocates the memory
- * reserved to the struct subscriber.
- * The function can't fail.
- */
+/* Remove the session's topic entry and release its reference. */
 void topic_del_subscriber(struct topic *, struct client *);
 
-/*
- * Allocate a new store structure on the heap and return it after its
- * initialization, also allocating a new list on the heap to keep track of
- * wildcard topics.
- * The function may gracefully crash as the memory allocation may fail.
- */
+/* Create a topic store with its exact-topic trie and wildcard index. */
 struct topic_store *topic_store_new(void);
 
 /*
@@ -460,13 +413,7 @@ void topic_store_destroy(struct topic_store *);
  */
 struct topic *topic_store_get(const struct topic_store *, const char *);
 
-/*
- * Return a topic associated to a topic name from the store, if no topic is
- * insert it into the store before returning it. Like topic_store_get but
- * cannot return NULL.
- * The function may fail as in case of no topic found it tries to allocate
- * space on the heap for the new inserted topic.
- */
+/* Return a topic by name, creating and inserting it when absent. */
 struct topic *topic_store_get_or_put(struct topic_store *, const char *);
 
 /*
