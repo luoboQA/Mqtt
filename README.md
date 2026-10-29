@@ -27,6 +27,9 @@ in the [conformance matrix](docs/conformance.md).
 - [`docs/design.md`](docs/design.md) — the design trade-offs: event loop and
   threads, explicit broker context, topic indexes, persistence, memory policy,
   security.
+- [`docs/distributed-architecture.md`](docs/distributed-architecture.md) —
+  MQTT versus distributed broker architecture, Kafka comparison, cluster state
+  and routing, and a staged design exercise. Sol itself remains single-process.
 - [`docs/teaching-guide.md`](docs/teaching-guide.md) — a suggested lesson path
   with code-reading checkpoints and hands-on experiments.
 - [`docs/limitations.md`](docs/limitations.md) — known defects, their effects,
