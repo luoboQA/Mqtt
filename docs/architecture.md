@@ -44,13 +44,16 @@ persistence/acl → memory/util`。`topic_match.c` 是叶子模块，不依赖�
 
 - `main()` 在 `sol.c`，负责 `getopt`、读配置、`config_set_default()`、
   `daemonize()`（`-d`）、安装 `SIGINT/SIGTERM` 处理，然后调用
-  `start_server()`。
+  `start_server()`。`struct config` 和 `struct server` 都是 `main()` 栈上的
+  局部变量，`server.conf` 指向同一份配置：模块之间只通过显式参数传递，没有
+  进程级 `conf` / `server` 单例。
 - `start_server()` 创建监听 socket，按 `THREADSNR` 启动 1 + N 个
   `eventloop_start()` 线程。每个线程有自己的 `struct ev_ctx`，监听同一个
   socket（`SO_REUSEPORT` 由 `network.c` 决定），accept 到的连接归属该线程。
 - 定时任务只注册在 **index 0** 的 loop 上（`loop_data->cronjobs`），避免 N 个
-  线程同时做重传、统计、持久化。任务本身通过全局 `server` 表和每客户端锁与
-  工作线程交互。
+  线程同时做重传、统计、持久化。每个 loop 在 `ev_ctx.data` 里保存自己的
+  `struct server *`，回调通过它访问共享表和配置，配合每客户端锁与工作线程
+  交互。
 - 没有“每请求一个线程”的模型：`read_callback()` 读到的完整包由同一个 loop
   线程调用 `process_message()` → `handle_command()` → 具体 handler，handler
   把回复直接写进该 client 的写缓冲。这是理解锁范围的关键：**同一个 client 的
@@ -61,7 +64,7 @@ persistence/acl → memory/util`。`topic_match.c` 是叶子模块，不依赖�
 BSD/macOS 上是 kqueue。接口只有 `ev_init/ev_run/ev_watch_fd/ev_register_event/
 ev_register_cron/ev_fire_event/ev_stop`，上层不出现 `epoll_event` 之类的类型。
 `conf->run`（Linux eventfd，其它平台 pipe）是唤醒循环、让 `ev_run` 退出的
-“自唤醒”描述符。
+“自唤醒”描述符；信号处理器只保存这个 fd 的副本，不去解引用配置结构。
 
 ## 3. 一个连接的完整生命周期
 
@@ -198,6 +201,7 @@ publish_handler
 
 - 单进程、单机；没有集群、共享订阅、桥接。
 - 事件循环线程数由 `THREADSNR` 编译期决定，运行期不可调。
-- 全局 `server` / `conf` 仍是单例；测试通过直接构造纯模块绕开它们，
-  完整去全局化是后续重构项。
+- 配置和 broker 状态由 `main()` 持有并显式传递；`topic_match`、`mqtt`、
+  `config`、`util` 这些纯模块不依赖 `struct server`，可以直接单测，但
+  `handlers` / `server` / `persistence` 仍需要完整的 broker 上下文才能跑。
 - 持久化是“整份快照 + 增量 WAL”，不是 LSM/数据库；状态越大快照越慢。

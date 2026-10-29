@@ -112,6 +112,12 @@ struct ev_ctx {
      */
     int wakeup;
     void *api; // opaque pointer to platform defined backends
+    /*
+     * Opaque pointer to whatever the loop owner needs to reach from a
+     * callback. The broker stores its struct server * here, so a callback
+     * never has to fall back on a process wide global
+     */
+    void *data;
 };
 
 int ev_init(struct ev_ctx *, int);

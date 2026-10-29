@@ -50,18 +50,20 @@ static int write_conf(char *path, const char *content)
  * config_set_default() opens the eventfd/pipe the event loop waits on; a
  * test that never starts the loop has to close it or every test leaks one
  */
-static void close_run_fd(void)
+static void close_run_fd(struct config *cfg)
 {
 #ifdef __linux__
-    close(conf->run);
+    close(cfg->run);
 #else
-    close(conf->run[0]);
-    close(conf->run[1]);
+    close(cfg->run[0]);
+    close(cfg->run[1]);
 #endif
 }
 
 static char *test_config_load(void)
 {
+    struct config cfg;
+
     char path[] = "/tmp/sol_cfg_test_XXXXXX";
 
     const char *content = "# a comment\n"
@@ -72,36 +74,40 @@ static char *test_config_load(void)
                           "keepalive 15s\n";
     ASSERT("config::mkstemp...FAIL", write_conf(path, content) == 0);
 
-    config_set_default();
-    ASSERT("config::load...FAIL", config_load(path) == true);
-    ASSERT("config::log_level...FAIL", conf->loglevel == WARNING);
-    ASSERT("config::ip_port...FAIL", strcmp(conf->port, "19999") == 0);
+    config_set_default(&cfg);
+    ASSERT("config::load...FAIL", config_load(&cfg, path) == true);
+    ASSERT("config::log_level...FAIL", cfg.loglevel == WARNING);
+    ASSERT("config::ip_port...FAIL", strcmp(cfg.port, "19999") == 0);
     ASSERT("config::max_request_size...FAIL",
-           conf->max_request_size == 32 * 1024);
-    ASSERT("config::keepalive...FAIL", conf->keepalive == 15);
+           cfg.max_request_size == 32 * 1024);
+    ASSERT("config::keepalive...FAIL", cfg.keepalive == 15);
 
     unlink(path);
-    close_run_fd();
+    close_run_fd(&cfg);
     printf("config::load...OK\n");
     return 0;
 }
 
 static char *test_config_rejects_unknown_key(void)
 {
+    struct config cfg;
+
     char path[] = "/tmp/sol_cfg_test_XXXXXX";
     ASSERT("config::unknown::mkstemp...FAIL",
            write_conf(path, "ip_port 1883\nbogus_key x\n") == 0);
 
-    config_set_default();
-    ASSERT("config::unknown_key...FAIL", config_load(path) == false);
+    config_set_default(&cfg);
+    ASSERT("config::unknown_key...FAIL", config_load(&cfg, path) == false);
     unlink(path);
-    close_run_fd();
+    close_run_fd(&cfg);
     printf("config::unknown_key...OK\n");
     return 0;
 }
 
 static char *test_config_rejects_bad_values(void)
 {
+    struct config cfg;
+
     static const char *bad[] = {
         "ip_port 70000\n",
         "ip_port http\n",
@@ -122,15 +128,15 @@ static char *test_config_rejects_bad_values(void)
         char path[] = "/tmp/sol_cfg_test_XXXXXX";
         ASSERT("config::bad_value::mkstemp...FAIL",
                write_conf(path, bad[i]) == 0);
-        config_set_default();
-        if (config_load(path) != false) {
+        config_set_default(&cfg);
+        if (config_load(&cfg, path) != false) {
             printf("config::bad_value[%zu] (%s)...FAIL\n", i, bad[i]);
             unlink(path);
-            close_run_fd();
+            close_run_fd(&cfg);
             return "config::bad_value...FAIL";
         }
         unlink(path);
-        close_run_fd();
+        close_run_fd(&cfg);
     }
     tests_run++;
     printf("config::bad_value...OK (%zu cases)\n",
@@ -140,66 +146,72 @@ static char *test_config_rejects_bad_values(void)
 
 static char *test_config_check_rejects_bad_port(void)
 {
+    struct config cfg;
+
     char path[] = "/tmp/sol_cfg_test_XXXXXX";
     /* config_load() accepts the string, config_check() is the one that
      * validates the port range after the command line overrides */
     ASSERT("config::check::mkstemp...FAIL",
            write_conf(path, "log_level WARNING\n") == 0);
 
-    config_set_default();
-    ASSERT("config::check::load...FAIL", config_load(path) == true);
-    strcpy(conf->port, "70000");
-    ASSERT("config::check::port...FAIL", config_check() == false);
+    config_set_default(&cfg);
+    ASSERT("config::check::load...FAIL", config_load(&cfg, path) == true);
+    strcpy(cfg.port, "70000");
+    ASSERT("config::check::port...FAIL", config_check(&cfg) == false);
 
     unlink(path);
-    close_run_fd();
+    close_run_fd(&cfg);
     printf("config::check_bad_port...OK\n");
     return 0;
 }
 
 static char *test_config_limits(void)
 {
+    struct config cfg;
+
     char path[] = "/tmp/sol_cfg_test_XXXXXX";
     const char *content = "max_inflight 100\n"
                           "max_publish_rate 25\n"
                           "max_connections_per_ip 4\n";
     ASSERT("config::limits::mkstemp...FAIL", write_conf(path, content) == 0);
 
-    config_set_default();
-    ASSERT("config::limits::load...FAIL", config_load(path) == true);
-    ASSERT("config::limits::inflight...FAIL", conf->max_inflight == 100);
-    ASSERT("config::limits::rate...FAIL", conf->max_publish_rate == 25);
+    config_set_default(&cfg);
+    ASSERT("config::limits::load...FAIL", config_load(&cfg, path) == true);
+    ASSERT("config::limits::inflight...FAIL", cfg.max_inflight == 100);
+    ASSERT("config::limits::rate...FAIL", cfg.max_publish_rate == 25);
     ASSERT("config::limits::per_ip...FAIL",
-           conf->max_connections_per_ip == 4);
+           cfg.max_connections_per_ip == 4);
     unlink(path);
-    close_run_fd();
+    close_run_fd(&cfg);
     printf("config::limits...OK\n");
     return 0;
 }
 
 static char *test_config_check_cross_field(void)
 {
+    struct config cfg;
+
     char path[] = "/tmp/sol_cfg_test_XXXXXX";
 
     /* max_inflight cannot exceed the 16 bit packet identifier space */
     ASSERT("config::cross::mkstemp...FAIL",
            write_conf(path, "max_inflight 70000\n") == 0);
-    config_set_default();
-    ASSERT("config::cross::load...FAIL", config_load(path) == true);
-    ASSERT("config::cross::inflight...FAIL", config_check() == false);
+    config_set_default(&cfg);
+    ASSERT("config::cross::load...FAIL", config_load(&cfg, path) == true);
+    ASSERT("config::cross::inflight...FAIL", config_check(&cfg) == false);
     unlink(path);
-    close_run_fd();
+    close_run_fd(&cfg);
 
     /* Mutual TLS needs a TLS listener: there is no certificate to ask for
      * otherwise */
     char path2[] = "/tmp/sol_cfg_test_XXXXXX";
     ASSERT("config::cross2::mkstemp...FAIL",
            write_conf(path2, "require_client_cert true\n") == 0);
-    config_set_default();
-    ASSERT("config::cross2::load...FAIL", config_load(path2) == true);
-    ASSERT("config::cross2::tls...FAIL", config_check() == false);
+    config_set_default(&cfg);
+    ASSERT("config::cross2::load...FAIL", config_load(&cfg, path2) == true);
+    ASSERT("config::cross2::tls...FAIL", config_check(&cfg) == false);
     unlink(path2);
-    close_run_fd();
+    close_run_fd(&cfg);
 
     printf("config::check_cross_field...OK\n");
     return 0;

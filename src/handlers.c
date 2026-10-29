@@ -71,7 +71,8 @@ static void session_untrack_topic(struct client_session *, struct topic *);
 /* Drop the first nodes of a list without touching the data they point to */
 static void list_drop_prefix(List *, unsigned long);
 
-static struct client_session *client_session_alloc(const char *);
+static struct client_session *client_session_alloc(struct server *,
+                                                   const char *);
 
 static unsigned short next_free_mid(struct client_session *);
 
@@ -92,6 +93,7 @@ static bool inflight_window_full(const struct client_session *);
  */
 bool outgoing_reserve(struct client *c, size_t len)
 {
+    struct config *conf = c->server->conf;
     if (c->towrite + len > conf->max_request_size) {
         log_error("Cannot send reply to %s: write buffer full (towrite = "
                   "%zu, packet = %zu bytes)",
@@ -238,10 +240,12 @@ static void session_init(struct client_session *session, const char *session_id)
     session->refcount = (struct ref){session_free, 0};
 }
 
-static struct client_session *client_session_alloc(const char *session_id)
+static struct client_session *client_session_alloc(struct server *server,
+                                                   const char *session_id)
 {
     struct client_session *session = try_alloc(sizeof(*session));
     session_init(session, session_id);
+    session->server = server;
     return session;
 }
 
@@ -252,12 +256,13 @@ static struct client_session *client_session_alloc(const char *session_id)
  * session starts exactly like the one a clean_session=false CONNECT leaves
  * behind when its client disconnects
  */
-struct client_session *session_restore(const char *session_id)
+struct client_session *session_restore(struct server *server,
+                                       const char *session_id)
 {
-    struct client_session *session = client_session_alloc(session_id);
+    struct client_session *session = client_session_alloc(server, session_id);
     session->clean_session         = false;
     INCREF(session, struct client_session);
-    HASH_ADD_STR(server.sessions, session_id, session);
+    HASH_ADD_STR(server->sessions, session_id, session);
     return session;
 }
 
@@ -269,17 +274,17 @@ struct client_session *session_restore(const char *session_id)
  * never drift apart. The caller must hold the global mutex (or be the
  * startup loader, which runs before the event loops exist)
  */
-void session_delete(const char *session_id)
+void session_delete(struct server *server, const char *session_id)
 {
     if (!session_id || !session_id[0])
         return;
 
     struct client_session *s = NULL;
-    HASH_FIND_STR(server.sessions, session_id, s);
+    HASH_FIND_STR(server->sessions, session_id, s);
     if (!s)
         return;
 
-    topic_store_remove_wildcard(server.store, session_id);
+    topic_store_remove_wildcard(server->store, session_id);
     list_foreach(item, s->subscriptions)
     {
         struct topic *t        = item->data;
@@ -290,11 +295,11 @@ void session_delete(const char *session_id)
             DECREF(sub, struct subscriber);
         }
     }
-    HASH_DEL(server.sessions, s);
+    HASH_DEL(server->sessions, s);
     DECREF(s, struct client_session);
     /* A session that goes away is a record the log and the file must not
        keep. The loader suppresses this while replaying a session-del */
-    persistence_wal_session_del(session_id);
+    persistence_wal_session_del(server, session_id);
     persistence_mark_dirty();
 }
 
@@ -356,6 +361,7 @@ static bool inbound_q2_find(const struct client_session *session,
 
 static void inbound_q2_track(struct client_session *session, unsigned short mid)
 {
+    struct server *server = session->server;
     /* Idempotent: a mid already open must never appear twice in the array */
     if (inbound_q2_find(session, mid))
         return;
@@ -366,18 +372,19 @@ static void inbound_q2_track(struct client_session *session, unsigned short mid)
         session->q2_recv_cap = newcap;
     }
     session->q2_recv_mids[session->q2_recv_len++] = mid;
-    persistence_wal_q2(session->session_id, mid);
+    persistence_wal_q2(server, session->session_id, mid);
 }
 
 static void inbound_q2_untrack(struct client_session *session,
                                unsigned short mid)
 {
+    struct server *server = session->server;
     for (unsigned i = 0; i < session->q2_recv_len; ++i) {
         if (session->q2_recv_mids[i] == mid) {
             /* Swap with the last element: the order is not significant */
             session->q2_recv_mids[i] =
                 session->q2_recv_mids[--session->q2_recv_len];
-            persistence_wal_q2_del(session->session_id, mid);
+            persistence_wal_q2_del(server, session->session_id, mid);
             return;
         }
     }
@@ -445,6 +452,7 @@ static void inflight_msg_init(struct client_session *s, unsigned short mid,
  */
 static void inflight_ack_init(struct client_session *s, unsigned short mid)
 {
+    struct server *server     = s->server;
     time_t now                = time(NULL);
     struct inflight_msg *imsg = session_inflight(s, mid);
     if (imsg) {
@@ -465,7 +473,7 @@ static void inflight_ack_init(struct client_session *s, unsigned short mid)
         ++s->inflights;
     }
     /* The PUBLISH half is gone, only the PUBREL timestamp is left to keep */
-    persistence_wal_ack(s->session_id, mid, now);
+    persistence_wal_ack(server, s->session_id, mid, now);
 }
 
 /*
@@ -475,6 +483,7 @@ static void inflight_ack_init(struct client_session *s, unsigned short mid)
  */
 static void inflight_msg_remove(struct client_session *s, unsigned short mid)
 {
+    struct server *server     = s->server;
     struct inflight_msg *imsg = session_inflight(s, mid);
     if (!imsg)
         return;
@@ -487,7 +496,7 @@ static void inflight_msg_remove(struct client_session *s, unsigned short mid)
     inflight_untrack_mid(s, mid);
     if (s->inflights > 0)
         --s->inflights;
-    persistence_wal_inflight_del(s->session_id, mid);
+    persistence_wal_inflight_del(server, s->session_id, mid);
 }
 
 /*
@@ -500,6 +509,7 @@ static void inflight_msg_remove(struct client_session *s, unsigned short mid)
 static void queue_offline_msg(struct client_session *s, struct mqtt_packet *pkt,
                               u16 mid)
 {
+    struct server *server = s->server;
     struct queued_msg *qm = try_alloc(sizeof(*qm));
     /*
      * The identifier travels with the entry and has to be in the packet too:
@@ -513,9 +523,9 @@ static void queue_offline_msg(struct client_session *s, struct mqtt_packet *pkt,
     /* Appended at the back, drained in order on reconnect */
     list_push_back(s->outgoing_msgs, qm);
     inflight_msg_init(s, mid, pkt);
-    persistence_wal_queued(s->session_id, (const char *)pkt->publish.topic,
-                           qm->qos, mid, pkt->publish.payload,
-                           pkt->publish.payloadlen);
+    persistence_wal_queued(server, s->session_id,
+                           (const char *)pkt->publish.topic, qm->qos, mid,
+                           pkt->publish.payload, pkt->publish.payloadlen);
     persistence_mark_dirty();
 }
 
@@ -716,10 +726,11 @@ void session_restore_dropped(struct client_session *s, unsigned short mid)
  */
 void session_flush_queue(struct client_session *s, unsigned long count)
 {
+    struct server *server = s ? s->server : NULL;
     if (!s || !s->outgoing_msgs)
         return;
     list_drop_prefix(s->outgoing_msgs, count);
-    persistence_wal_flush(s->session_id, count);
+    persistence_wal_flush(server, s->session_id, count);
     persistence_mark_dirty();
 }
 
@@ -733,6 +744,7 @@ void session_flush_queue(struct client_session *s, unsigned long count)
  */
 bool session_drop_oldest_queued(struct client_session *s)
 {
+    struct server *server = s ? s->server : NULL;
     if (!s || !s->outgoing_msgs || !s->outgoing_msgs->head)
         return false;
 
@@ -742,7 +754,7 @@ bool session_drop_oldest_queued(struct client_session *s)
         return false;
     /* The inflight entry is gone too: the log names the queue slot and the
        identifier in one record */
-    persistence_wal_dropped(s->session_id, mid);
+    persistence_wal_dropped(server, s->session_id, mid);
     persistence_mark_dirty();
     info.messages_dropped++;
     return true;
@@ -761,6 +773,8 @@ bool session_drop_oldest_queued(struct client_session *s)
 static void deliver_retained(struct client *c, struct topic *t,
                              unsigned char granted_qos)
 {
+    struct server *server      = c->server;
+    struct config *conf        = server->conf;
     struct mqtt_packet *stored = t->retained;
     struct client_session *s   = c->session;
 
@@ -831,9 +845,10 @@ static void deliver_retained(struct client *c, struct topic *t,
  * Returns the number of publish done or an error code in case of conditions
  * that requires de-allocation of the pkt argument occurs.
  */
-int publish_message(struct mqtt_packet *pkt, const struct topic *t)
+int publish_message(struct server *server, struct mqtt_packet *pkt,
+                    const struct topic *t)
 {
-
+    struct config *conf   = server->conf;
     bool all_at_most_once = true;
     size_t len            = 0;
     unsigned short mid    = 0;
@@ -870,7 +885,7 @@ int publish_message(struct mqtt_packet *pkt, const struct topic *t)
     {
         struct client_session *s = sub->session;
         struct client *sc        = NULL;
-        HASH_FIND_STR(server.clients_map, s->session_id, sc);
+        HASH_FIND_STR(server->clients_map, s->session_id, sc);
         /*
          * Update QoS according to subscriber's one, following MQTT
          * rules: The min between the original QoS and the subscriber
@@ -1059,6 +1074,7 @@ static void list_drop_prefix(List *l, unsigned long n)
 
 static void set_connack(struct client *c, unsigned char rc, unsigned sp)
 {
+    struct config *conf         = c->server->conf;
     unsigned char connect_flags = 0 | (sp & 0x1) << 0;
 
     struct mqtt_packet response = {
@@ -1139,7 +1155,8 @@ static void set_connack(struct client *c, unsigned char rc, unsigned sp)
 
 static int connect_handler(struct io_event *e)
 {
-
+    struct server *server    = e->server;
+    struct config *conf      = server->conf;
     unsigned session_present = 0;
     struct mqtt_connect *c   = &e->data.connect;
     struct client *cc        = e->client;
@@ -1166,7 +1183,7 @@ static int connect_handler(struct io_event *e)
             goto bad_auth;
         else {
             struct authentication *auth = NULL;
-            HASH_FIND_STR(server.auths, (char *)c->payload.username, auth);
+            HASH_FIND_STR(server->auths, (char *)c->payload.username, auth);
             if (!auth || !check_passwd((char *)c->payload.password, auth->salt))
                 goto bad_auth;
         }
@@ -1246,7 +1263,7 @@ static int connect_handler(struct io_event *e)
     server_kick_duplicate(cc->client_id, cc, &kicked_will);
 
     // First we check if a session is present
-    HASH_FIND_STR(server.sessions, cc->client_id, cc->session);
+    HASH_FIND_STR(server->sessions, cc->client_id, cc->session);
     if (cc->session && c->bits.clean_session == true) {
         /*
          * A clean session is requested over a session left by a previous
@@ -1257,7 +1274,7 @@ static int connect_handler(struct io_event *e)
          * subscribers on the topics, routing every message of the fresh
          * session to a dead one
          */
-        session_delete(cc->client_id);
+        session_delete(server, cc->client_id);
         cc->session = NULL;
     } else if (cc->session) {
         session_present = 1;
@@ -1290,9 +1307,9 @@ static int connect_handler(struct io_event *e)
      */
     bool new_session = false;
     if (c->bits.clean_session == true || !cc->session) {
-        cc->session = client_session_alloc(cc->client_id);
+        cc->session = client_session_alloc(server, cc->client_id);
         INCREF(cc->session, struct client_session);
-        HASH_ADD_STR(server.sessions, session_id, cc->session);
+        HASH_ADD_STR(server->sessions, session_id, cc->session);
         new_session = true;
     }
 
@@ -1300,10 +1317,10 @@ static int connect_handler(struct io_event *e)
     /* A persistent session is the unit the snapshot and the log keep: a
        clean one dies with its connection and is never recorded */
     if (new_session && !cc->session->clean_session)
-        persistence_wal_session(cc->client_id);
+        persistence_wal_session(server, cc->client_id);
 
     // Let's track client on the global map to be used on publish
-    HASH_ADD_STR(server.clients_map, client_id, cc);
+    HASH_ADD_STR(server->clients_map, client_id, cc);
 #if THREADSNR > 0
     pthread_mutex_unlock(&mutex);
 #endif
@@ -1318,7 +1335,7 @@ static int connect_handler(struct io_event *e)
     if (kicked_will.publish.topic) {
         log_info("Delivering the will of the taken over connection (%s)",
                  kicked_will.publish.topic);
-        publish_lwt(&kicked_will);
+        publish_lwt(server, &kicked_will);
         /* The packet owns its strings, the struct itself is on this stack */
         mqtt_packet_destroy(&kicked_will);
     }
@@ -1348,7 +1365,7 @@ static int connect_handler(struct io_event *e)
         pthread_mutex_lock(&mutex);
 #endif
         struct topic *t =
-            topic_store_get_or_put(server.store, (const char *)will_topic);
+            topic_store_get_or_put(server->store, (const char *)will_topic);
 #if THREADSNR > 0
         pthread_mutex_unlock(&mutex);
 #endif
@@ -1414,12 +1431,12 @@ static int connect_handler(struct io_event *e)
                  * of storing an empty one (§3.3.1.3) */
                 if (msg_len > 0) {
                     t->retained = mqtt_publish_copy(&cc->session->lwt_msg);
-                    persistence_wal_retained((const char *)will_topic,
+                    persistence_wal_retained(server, (const char *)will_topic,
                                              will_message, msg_len,
                                              c->bits.will_qos);
                 } else {
-                    persistence_wal_retained_clear(
-                        (const char *)will_topic);
+                    persistence_wal_retained_clear(server,
+                                                   (const char *)will_topic);
                 }
                 persistence_mark_dirty();
 #if THREADSNR > 0
@@ -1485,15 +1502,15 @@ static int disconnect_handler(struct io_event *e)
     return -ERRCLIENTDC;
 }
 
-static inline void add_wildcard(const char *topic, struct subscriber *s,
-                                bool wildcard)
+static inline void add_wildcard(struct server *server, const char *topic,
+                                struct subscriber *s, bool wildcard)
 {
     struct subscription *subscription = try_alloc(sizeof(*subscription));
     subscription->subscriber          = s;
     subscription->topic               = try_strdup(topic);
     subscription->multilevel          = wildcard;
     INCREF(s, struct subscriber);
-    topic_store_add_wildcard(server.store, subscription);
+    topic_store_add_wildcard(server->store, subscription);
 }
 
 /*
@@ -1653,6 +1670,7 @@ static struct subscriber *attach_subscriber(struct client_session *session,
 bool session_subscribe(struct client_session *session, const char *filter,
                        unsigned char qos)
 {
+    struct server *server = session ? session->server : NULL;
     if (!session || !valid_topic_filter(filter, strlen(filter)))
         return false;
 
@@ -1670,10 +1688,11 @@ bool session_subscribe(struct client_session *session, const char *filter,
              */
             if (len == 1 && f[0] == '#') {
                 struct subscriber *sub = subscriber_new(session, qos);
-                add_wildcard(f, sub, true);
+                add_wildcard(server, f, sub, true);
                 struct wild_attach_ctx ctx = {sub, true};
-                topic_store_map(server.store, NULL, recursive_sub, &ctx);
-                persistence_wal_sub(session->session_id, filter, qos, true);
+                topic_store_map(server->store, NULL, recursive_sub, &ctx);
+                persistence_wal_sub(server, session->session_id, filter, qos,
+                                    true);
                 persistence_mark_dirty();
                 return true;
             }
@@ -1689,7 +1708,7 @@ bool session_subscribe(struct client_session *session, const char *filter,
             parent[plen] = '\0';
 
             if (plen > 0) {
-                struct topic *t = topic_store_get_or_put(server.store, parent);
+                struct topic *t = topic_store_get_or_put(server->store, parent);
                 struct subscriber *tmp = attach_subscriber(session, t, qos);
                 /*
                  * The parent node is the record of this filter, not an exact
@@ -1698,20 +1717,21 @@ bool session_subscribe(struct client_session *session, const char *filter,
                  */
                 if (!(tmp->origins & SUBSCRIBER_WILD)) {
                     tmp->origins |= SUBSCRIBER_WILD;
-                    add_wildcard(f, tmp, true);
+                    add_wildcard(server, f, tmp, true);
                     char prefix[plen + 2];
                     snprintf(prefix, plen + 2, "%s/", parent);
                     struct wild_attach_ctx ctx = {tmp, false};
-                    topic_store_map(server.store, prefix, recursive_sub, &ctx);
+                    topic_store_map(server->store, prefix, recursive_sub, &ctx);
                 }
             } else {
                 struct subscriber *sub = subscriber_new(session, qos);
-                add_wildcard(f, sub, true);
+                add_wildcard(server, f, sub, true);
                 /* Everything below the empty first level: "/", "/a", ... */
                 struct wild_attach_ctx ctx = {sub, false};
-                topic_store_map(server.store, "/", recursive_sub, &ctx);
+                topic_store_map(server->store, "/", recursive_sub, &ctx);
             }
-            persistence_wal_sub(session->session_id, filter, qos, true);
+            persistence_wal_sub(server, session->session_id, filter, qos,
+                                true);
             persistence_mark_dirty();
             return true;
         }
@@ -1720,10 +1740,10 @@ bool session_subscribe(struct client_session *session, const char *filter,
          * No wildcard at all: the filter names one topic. "a" and "a/" are
          * two different keys, exactly as the spec says
          */
-        struct topic *t = topic_store_get_or_put(server.store, f);
+        struct topic *t = topic_store_get_or_put(server->store, f);
         struct subscriber *tmp = attach_subscriber(session, t, qos);
         tmp->origins |= SUBSCRIBER_EXACT;
-        persistence_wal_sub(session->session_id, filter, qos, false);
+        persistence_wal_sub(server, session->session_id, filter, qos, false);
         persistence_mark_dirty();
         return true;
     }
@@ -1740,14 +1760,14 @@ bool session_subscribe(struct client_session *session, const char *filter,
      * existing entry
      */
     struct subscription *ex = topic_store_find_wildcard_filter(
-        server.store, f, session->session_id);
+        server->store, f, session->session_id);
     if (ex) {
         ex->subscriber->granted_qos = qos;
     } else {
         struct subscriber *sub = subscriber_new(session, qos);
-        add_wildcard(f, sub, wildcard);
+        add_wildcard(server, f, sub, wildcard);
     }
-    persistence_wal_sub(session->session_id, filter, qos, wildcard);
+    persistence_wal_sub(server, session->session_id, filter, qos, wildcard);
     persistence_mark_dirty();
     return true;
 }
@@ -1804,6 +1824,7 @@ static void retained_collect(struct trie_node *node, void *arg)
 
 static int subscribe_handler(struct io_event *e)
 {
+    struct server *server    = e->server;
     struct mqtt_subscribe *s = &e->data.subscribe;
 
     /*
@@ -1930,7 +1951,7 @@ static int subscribe_handler(struct io_event *e)
      * filter, but the cost no longer grows with filters x topics
      */
     struct retained_collection rc = {NULL, 0, 0};
-    topic_store_map(server.store, NULL, retained_collect, &rc);
+    topic_store_map(server->store, NULL, retained_collect, &rc);
     /*
      * A filter set covering the same topic twice ("a/b" and "a/+") must still
      * deliver its retained message once, exactly like the live path does,
@@ -2058,6 +2079,7 @@ static void detach_wild_attached(struct client_session *session,
  */
 bool session_unsubscribe(struct client_session *session, const char *filter)
 {
+    struct server *server = session ? session->server : NULL;
     if (!session || !filter || !valid_topic_filter(filter, strlen(filter)))
         return false;
 
@@ -2074,15 +2096,15 @@ bool session_unsubscribe(struct client_session *session, const char *filter)
          * publish attaches the client to new topics, then stop the
          * deliveries it already drives on the topics attached so far
          */
-        topic_store_remove_wildcard_filter(server.store, f,
+        topic_store_remove_wildcard_filter(server->store, f,
                                            session->session_id);
         detach_wild_attached(session, f, multilevel);
     } else {
-        struct topic *t = topic_store_get(server.store, f);
+        struct topic *t = topic_store_get(server->store, f);
         if (t)
             detach_exact(t, session);
     }
-    persistence_wal_unsub(session->session_id, filter, multilevel);
+    persistence_wal_unsub(server, session->session_id, filter, multilevel);
     persistence_mark_dirty();
     return true;
 }
@@ -2186,7 +2208,7 @@ static void wildcard_match(struct subscription *s, void *arg)
  * will undelivered. The locks are released before the delivery, which
  * acquires the global mutex itself
  */
-void publish_lwt(struct mqtt_packet *will)
+void publish_lwt(struct server *server, struct mqtt_packet *will)
 {
     struct mqtt_publish *p = &will->publish;
 
@@ -2198,15 +2220,15 @@ void publish_lwt(struct mqtt_packet *will)
 #if THREADSNR > 0
     pthread_mutex_lock(&mutex);
 #endif
-    struct topic *t = topic_store_get_or_put(server.store, topic);
-    if (!topic_store_wildcards_empty(server.store))
-        topic_store_match_wildcards(server.store, topic, wildcard_match, t);
+    struct topic *t = topic_store_get_or_put(server->store, topic);
+    if (!topic_store_wildcards_empty(server->store))
+        topic_store_match_wildcards(server->store, topic, wildcard_match, t);
 #if THREADSNR > 0
     pthread_mutex_unlock(&mutex);
 #endif
 
     if (t)
-        publish_message(will, t);
+        publish_message(server, will, t);
 }
 
 /*
@@ -2218,6 +2240,7 @@ void publish_lwt(struct mqtt_packet *will)
  */
 static bool publish_rate_allow(struct client *c)
 {
+    struct config *conf = c->server->conf;
     if (conf->max_publish_rate == 0)
         return true;
 
@@ -2247,12 +2270,14 @@ static bool publish_rate_allow(struct client *c)
  */
 static bool inflight_window_full(const struct client_session *s)
 {
+    const struct config *conf = s->server->conf;
     return conf->max_inflight > 0 && s->inflights >= conf->max_inflight;
 }
 
 static int publish_handler(struct io_event *e)
 {
-
+    struct server *server   = e->server;
+    struct config *conf     = server->conf;
     struct client *c        = e->client;
     union mqtt_header *hdr  = &e->data.header;
     struct mqtt_publish *p  = &e->data.publish;
@@ -2367,15 +2392,15 @@ static int publish_handler(struct io_event *e)
      * Retrieve the topic from the global map, if it wasn't created before,
      * create a new one with the name selected
      */
-    struct topic *t = topic_store_get_or_put(server.store, topic);
+    struct topic *t = topic_store_get_or_put(server->store, topic);
 
     /*
      * Attach to the topic every subscriber of a matching wildcard
      * subscription ('+' or '#'), the index only walks the levels of this
      * topic instead of scanning all the registered filters
      */
-    if (!topic_store_wildcards_empty(server.store))
-        topic_store_match_wildcards(server.store, topic, wildcard_match, t);
+    if (!topic_store_wildcards_empty(server->store))
+        topic_store_match_wildcards(server->store, topic, wildcard_match, t);
 #if THREADSNR > 0
     pthread_mutex_unlock(&c->mutex);
 #endif
@@ -2411,9 +2436,10 @@ static int publish_handler(struct io_event *e)
         }
         if (p->payloadlen > 0) {
             t->retained = mqtt_publish_copy(pkt);
-            persistence_wal_retained(topic, p->payload, p->payloadlen, qos);
+            persistence_wal_retained(server, topic, p->payload,
+                                     p->payloadlen, qos);
         } else {
-            persistence_wal_retained_clear(topic);
+            persistence_wal_retained_clear(server, topic);
         }
         persistence_mark_dirty();
     }
@@ -2421,7 +2447,7 @@ static int publish_handler(struct io_event *e)
     pthread_mutex_unlock(&mutex);
 #endif
 
-    if (publish_message(pkt, t) == 0)
+    if (publish_message(server, pkt, t) == 0)
         DECREF(pkt, struct mqtt_packet);
 
 ack_only:

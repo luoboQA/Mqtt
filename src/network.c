@@ -174,7 +174,8 @@ static int create_and_bind(const char *host, const char *port, int s_family)
  * Create a non-blocking socket and make it listen on the specfied address and
  * port
  */
-int make_listen(const char *host, const char *port, int s_family)
+int make_listen(const char *host, const char *port, int s_family,
+                const struct config *conf)
 {
 
     int sfd;
@@ -215,7 +216,7 @@ int make_listen(const char *host, const char *port, int s_family)
  * Accept a connection and set it NON_BLOCKING and CLOEXEC, optionally also set
  * TCP_NODELAY disabling Nagle's algorithm
  */
-static int accept_conn(int sfd, char *ip)
+static int accept_conn(int sfd, char *ip, int family)
 {
 
     int clientsock;
@@ -230,7 +231,7 @@ static int accept_conn(int sfd, char *ip)
     if ((clientsock = accept(sfd, (struct sockaddr *)&addr, &addrlen)) < 0) {
         /* Retry on a signal, report anything else */
         if (errno == EINTR)
-            return accept_conn(sfd, ip);
+            return accept_conn(sfd, ip, family);
         if (errno != EWOULDBLOCK && errno != EAGAIN)
             perror("accept");
         return -1;
@@ -240,7 +241,7 @@ static int accept_conn(int sfd, char *ip)
     (void)set_cloexec(clientsock);
 
     // Set TCP_NODELAY only for TCP sockets
-    if (conf->socket_family == INET)
+    if (family == INET)
         (void)set_tcpnodelay(clientsock);
 
     char ip_buff[INET6_ADDRSTRLEN];
@@ -349,7 +350,7 @@ void openssl_init(void)
 
 void openssl_cleanup(void) { EVP_cleanup(); }
 
-SSL_CTX *create_ssl_context(void)
+SSL_CTX *create_ssl_context(const struct config *conf)
 {
 
     SSL_CTX *ctx;
@@ -619,7 +620,7 @@ err:
  */
 static int conn_accept(struct connection *c, int fd)
 {
-    int ret = accept_conn(fd, c->ip);
+    int ret = accept_conn(fd, c->ip, c->family);
     c->fd   = ret;
     return ret;
 }
@@ -646,7 +647,7 @@ static void conn_close(struct connection *c)
 // XXX Not so neat, improve later
 static int conn_tls_accept(struct connection *c, int serverfd)
 {
-    int fd = accept_conn(serverfd, c->ip);
+    int fd = accept_conn(serverfd, c->ip, c->family);
     if (fd < 0)
         return fd;
     c->ssl = ssl_accept(c->ctx, fd);
@@ -694,11 +695,13 @@ static void conn_tls_close(struct connection *c)
         perror("close");
 }
 
-void connection_init(struct connection *conn, const SSL_CTX *ssl_ctx)
+void connection_init(struct connection *conn, const SSL_CTX *ssl_ctx,
+                     int family)
 {
-    conn->fd  = -1;
-    conn->ssl = NULL; // Will be filled in case of TLS connection on accept
-    conn->ctx = (SSL_CTX *)ssl_ctx;
+    conn->fd     = -1;
+    conn->ssl    = NULL; // Will be filled in case of TLS connection on accept
+    conn->ctx    = (SSL_CTX *)ssl_ctx;
+    conn->family = family;
     if (ssl_ctx) {
         // We need a TLS connection
         conn->accept = conn_tls_accept;
@@ -721,10 +724,10 @@ void connection_init(struct connection *conn, const SSL_CTX *ssl_ctx)
  * simply call accept, send, recv or close without actually worrying of the
  * type of the underlying communication.
  */
-struct connection *connection_new(const SSL_CTX *ssl_ctx)
+struct connection *connection_new(const SSL_CTX *ssl_ctx, int family)
 {
     struct connection *conn = try_alloc(sizeof(*conn));
-    connection_init(conn, ssl_ctx);
+    connection_init(conn, ssl_ctx, family);
     return conn;
 }
 

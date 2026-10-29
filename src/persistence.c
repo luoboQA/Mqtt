@@ -120,12 +120,12 @@ static off_t wal_mark                    = 0;
 /* persistence_file is a char[0xFFF], the suffix and the NUL fit after it */
 static char wal_path_buf[0x1004];
 
-static bool wal_path(void)
+static bool wal_path(struct server *server)
 {
-    if (!conf || !conf->persistence_file[0])
+    if (!server || !server->conf || !server->conf->persistence_file[0])
         return false;
     int n = snprintf(wal_path_buf, sizeof(wal_path_buf), "%s.wal",
-                     conf->persistence_file);
+                     server->conf->persistence_file);
     return n > 0 && (size_t)n < sizeof(wal_path_buf);
 }
 
@@ -134,9 +134,9 @@ static bool wal_path(void)
  * failed append can be truncated away instead of leaving a half line for the
  * next start to parse
  */
-static bool wal_ready(void)
+static bool wal_ready(struct server *server)
 {
-    if (wal_loading || !wal_path())
+    if (wal_loading || !wal_path(server))
         return false;
 
     if (!wal_fh) {
@@ -184,19 +184,20 @@ static void wal_finish(void)
  * A session is recorded only when it survives its connection: the snapshot
  * and the log deliberately ignore clean sessions
  */
-static bool wal_persistent(const char *id)
+static bool wal_persistent(struct server *server, const char *id)
 {
     if (!id || !id[0])
         return false;
     struct client_session *s = NULL;
-    HASH_FIND_STR(server.sessions, id, s);
+    HASH_FIND_STR(server->sessions, id, s);
     return s && !s->clean_session;
 }
 
-void persistence_wal_retained(const char *topic, const unsigned char *payload,
-                              size_t len, unsigned char qos)
+void persistence_wal_retained(struct server *server, const char *topic,
+                              const unsigned char *payload, size_t len,
+                              unsigned char qos)
 {
-    if (!topic || !wal_ready())
+    if (!topic || !wal_ready(server))
         return;
     fputs("retained ", wal_fh);
     fput_hex(wal_fh, (const unsigned char *)topic, strlen(topic));
@@ -206,9 +207,9 @@ void persistence_wal_retained(const char *topic, const unsigned char *payload,
     wal_finish();
 }
 
-void persistence_wal_retained_clear(const char *topic)
+void persistence_wal_retained_clear(struct server *server, const char *topic)
 {
-    if (!topic || !wal_ready())
+    if (!topic || !wal_ready(server))
         return;
     fputs("retained-clear ", wal_fh);
     fput_hex(wal_fh, (const unsigned char *)topic, strlen(topic));
@@ -216,9 +217,9 @@ void persistence_wal_retained_clear(const char *topic)
     wal_finish();
 }
 
-void persistence_wal_session(const char *session_id)
+void persistence_wal_session(struct server *server, const char *session_id)
 {
-    if (!wal_persistent(session_id) || !wal_ready())
+    if (!wal_persistent(server, session_id) || !wal_ready(server))
         return;
     fputs("session ", wal_fh);
     fput_hex(wal_fh, (const unsigned char *)session_id, strlen(session_id));
@@ -226,9 +227,9 @@ void persistence_wal_session(const char *session_id)
     wal_finish();
 }
 
-void persistence_wal_session_del(const char *session_id)
+void persistence_wal_session_del(struct server *server, const char *session_id)
 {
-    if (!session_id || !session_id[0] || !wal_ready())
+    if (!session_id || !session_id[0] || !wal_ready(server))
         return;
     fputs("session-del ", wal_fh);
     fput_hex(wal_fh, (const unsigned char *)session_id, strlen(session_id));
@@ -236,10 +237,11 @@ void persistence_wal_session_del(const char *session_id)
     wal_finish();
 }
 
-void persistence_wal_sub(const char *session_id, const char *filter,
-                         unsigned char qos, bool multilevel)
+void persistence_wal_sub(struct server *server, const char *session_id,
+                         const char *filter, unsigned char qos,
+                         bool multilevel)
 {
-    if (!wal_persistent(session_id) || !filter || !wal_ready())
+    if (!wal_persistent(server, session_id) || !filter || !wal_ready(server))
         return;
     fputs("sub ", wal_fh);
     fput_hex(wal_fh, (const unsigned char *)session_id, strlen(session_id));
@@ -249,10 +251,10 @@ void persistence_wal_sub(const char *session_id, const char *filter,
     wal_finish();
 }
 
-void persistence_wal_unsub(const char *session_id, const char *filter,
-                           bool multilevel)
+void persistence_wal_unsub(struct server *server, const char *session_id,
+                           const char *filter, bool multilevel)
 {
-    if (!wal_persistent(session_id) || !filter || !wal_ready())
+    if (!wal_persistent(server, session_id) || !filter || !wal_ready(server))
         return;
     fputs("unsub ", wal_fh);
     fput_hex(wal_fh, (const unsigned char *)session_id, strlen(session_id));
@@ -262,11 +264,12 @@ void persistence_wal_unsub(const char *session_id, const char *filter,
     wal_finish();
 }
 
-void persistence_wal_queued(const char *session_id, const char *topic,
-                            unsigned char qos, unsigned short mid,
+void persistence_wal_queued(struct server *server, const char *session_id,
+                            const char *topic, unsigned char qos,
+                            unsigned short mid,
                             const unsigned char *payload, size_t len)
 {
-    if (!wal_persistent(session_id) || !topic || !wal_ready())
+    if (!wal_persistent(server, session_id) || !topic || !wal_ready(server))
         return;
     fputs("queued ", wal_fh);
     fput_hex(wal_fh, (const unsigned char *)session_id, strlen(session_id));
@@ -278,9 +281,10 @@ void persistence_wal_queued(const char *session_id, const char *topic,
     wal_finish();
 }
 
-void persistence_wal_dropped(const char *session_id, unsigned short mid)
+void persistence_wal_dropped(struct server *server, const char *session_id,
+                             unsigned short mid)
 {
-    if (!wal_persistent(session_id) || !wal_ready())
+    if (!wal_persistent(server, session_id) || !wal_ready(server))
         return;
     fputs("dropped ", wal_fh);
     fput_hex(wal_fh, (const unsigned char *)session_id, strlen(session_id));
@@ -288,9 +292,10 @@ void persistence_wal_dropped(const char *session_id, unsigned short mid)
     wal_finish();
 }
 
-void persistence_wal_flush(const char *session_id, unsigned long count)
+void persistence_wal_flush(struct server *server, const char *session_id,
+                           unsigned long count)
 {
-    if (!wal_persistent(session_id) || !wal_ready())
+    if (!wal_persistent(server, session_id) || !wal_ready(server))
         return;
     fputs("flush ", wal_fh);
     fput_hex(wal_fh, (const unsigned char *)session_id, strlen(session_id));
@@ -301,8 +306,9 @@ void persistence_wal_flush(const char *session_id, unsigned long count)
 void persistence_wal_inflight(struct client_session *session,
                               struct inflight_msg *imsg)
 {
-    if (!session || !imsg || !imsg->packet ||
-        !wal_persistent(session->session_id) || !wal_ready())
+    struct server *server = session ? session->server : NULL;
+    if (!session || !imsg || !imsg->packet || !server ||
+        !wal_persistent(server, session->session_id) || !wal_ready(server))
         return;
     fputs("inflight ", wal_fh);
     fput_hex(wal_fh, (const unsigned char *)session->session_id,
@@ -317,9 +323,10 @@ void persistence_wal_inflight(struct client_session *session,
     wal_finish();
 }
 
-void persistence_wal_inflight_del(const char *session_id, unsigned short mid)
+void persistence_wal_inflight_del(struct server *server,
+                                  const char *session_id, unsigned short mid)
 {
-    if (!wal_persistent(session_id) || !wal_ready())
+    if (!wal_persistent(server, session_id) || !wal_ready(server))
         return;
     fputs("inflight-del ", wal_fh);
     fput_hex(wal_fh, (const unsigned char *)session_id, strlen(session_id));
@@ -327,10 +334,10 @@ void persistence_wal_inflight_del(const char *session_id, unsigned short mid)
     wal_finish();
 }
 
-void persistence_wal_ack(const char *session_id, unsigned short mid,
-                         time_t ack_sent)
+void persistence_wal_ack(struct server *server, const char *session_id,
+                         unsigned short mid, time_t ack_sent)
 {
-    if (!wal_persistent(session_id) || !wal_ready())
+    if (!wal_persistent(server, session_id) || !wal_ready(server))
         return;
     fputs("ack ", wal_fh);
     fput_hex(wal_fh, (const unsigned char *)session_id, strlen(session_id));
@@ -338,9 +345,10 @@ void persistence_wal_ack(const char *session_id, unsigned short mid,
     wal_finish();
 }
 
-void persistence_wal_q2(const char *session_id, unsigned short mid)
+void persistence_wal_q2(struct server *server, const char *session_id,
+                        unsigned short mid)
 {
-    if (!wal_persistent(session_id) || !wal_ready())
+    if (!wal_persistent(server, session_id) || !wal_ready(server))
         return;
     fputs("q2 ", wal_fh);
     fput_hex(wal_fh, (const unsigned char *)session_id, strlen(session_id));
@@ -348,9 +356,10 @@ void persistence_wal_q2(const char *session_id, unsigned short mid)
     wal_finish();
 }
 
-void persistence_wal_q2_del(const char *session_id, unsigned short mid)
+void persistence_wal_q2_del(struct server *server, const char *session_id,
+                            unsigned short mid)
 {
-    if (!wal_persistent(session_id) || !wal_ready())
+    if (!wal_persistent(server, session_id) || !wal_ready(server))
         return;
     fputs("q2-del ", wal_fh);
     fput_hex(wal_fh, (const unsigned char *)session_id, strlen(session_id));
@@ -358,15 +367,16 @@ void persistence_wal_q2_del(const char *session_id, unsigned short mid)
     wal_finish();
 }
 
-void persistence_wal_compact(void)
+void persistence_wal_compact(struct server *server)
 {
-    if (wal_loading || !conf || !conf->persistence_file[0])
+    if (wal_loading || !server || !server->conf ||
+        !server->conf->persistence_file[0])
         return;
     if (wal_fh) {
         fclose(wal_fh);
         wal_fh = NULL;
     }
-    if (!wal_path())
+    if (!wal_path(server))
         return;
     if (remove(wal_path_buf) != 0 && errno != ENOENT) {
         log_warning("Cannot remove the write-ahead log %s: %s", wal_path_buf,
@@ -487,7 +497,8 @@ static void save_wildcard_sub(const char *filter, bool multilevel,
     save_sub_record(ctx->fh, ctx->id, filter, qos, multilevel);
 }
 
-static void save_session(FILE *fh, struct client_session *s)
+static void save_session(struct server *server, FILE *fh,
+                         struct client_session *s)
 {
     fputs("session ", fh);
     fput_hex(fh, (const unsigned char *)s->session_id, strlen(s->session_id));
@@ -510,7 +521,7 @@ static void save_session(FILE *fh, struct client_session *s)
     }
 
     struct wildcard_save_ctx ctx = {.fh = fh, .id = s->session_id};
-    topic_store_wildcards_foreach(server.store, s->session_id,
+    topic_store_wildcards_foreach(server->store, s->session_id,
                                   save_wildcard_sub, &ctx);
 
     /*
@@ -579,23 +590,23 @@ static void save_session(FILE *fh, struct client_session *s)
     }
 }
 
-static void persistence_write(FILE *fh)
+static void persistence_write(struct server *server, FILE *fh)
 {
     fprintf(fh, "# sol persistence v2 %llu %lu\n", wal_generation,
             wal_records);
 
     /* Retained messages, one record per topic holding one */
-    topic_store_map(server.store, NULL, save_retained, fh);
+    topic_store_map(server->store, NULL, save_retained, fh);
 
     /* Persistent sessions with their subscriptions and queued messages */
     struct client_session *s, *tmp;
-    HASH_ITER(hh, server.sessions, s, tmp)
+    HASH_ITER(hh, server->sessions, s, tmp)
     {
         /* A clean session dies with the connection of its client: there is
            nothing to keep for the next run */
         if (s->clean_session)
             continue;
-        save_session(fh, s);
+        save_session(server, fh, s);
     }
 }
 
@@ -623,7 +634,7 @@ static void fsync_parent_dir(const char *path)
     free_memory(copy);
 }
 
-void persistence_save(const char *path)
+void persistence_save(struct server *server, const char *path)
 {
     if (!path || !path[0])
         return;
@@ -646,7 +657,7 @@ void persistence_save(const char *path)
         return;
     }
 
-    persistence_write(fh);
+    persistence_write(server, fh);
 
     /*
      * fclose() only hands the bytes to the kernel: without fsync() a power
@@ -673,7 +684,7 @@ void persistence_save(const char *path)
            state change could slip in behind the write. The log is now
            redundant: truncating it here is the compaction point */
         dirty = false;
-        persistence_wal_compact();
+        persistence_wal_compact(server);
         log_info("Persisted the broker state to %s", path);
     }
     free_memory(tmp);
@@ -706,24 +717,26 @@ static char *next_field(char **cursor)
     return field;
 }
 
-static struct client_session *load_session_id(const char *id)
+static struct client_session *load_session_id(struct server *server,
+                                              const char *id)
 {
     struct client_session *s = NULL;
-    HASH_FIND_STR(server.sessions, id, s);
+    HASH_FIND_STR(server->sessions, id, s);
     if (s)
         return s;
-    return session_restore(id);
+    return session_restore(server, id);
 }
 
 /* Look up a session without creating it: used by the undo records */
-static struct client_session *find_session_id(const char *id)
+static struct client_session *find_session_id(struct server *server,
+                                              const char *id)
 {
     struct client_session *s = NULL;
-    HASH_FIND_STR(server.sessions, id, s);
+    HASH_FIND_STR(server->sessions, id, s);
     return s;
 }
 
-static void load_retained_record(char *fields)
+static void load_retained_record(struct server *server, char *fields)
 {
     char *cursor      = fields;
     char *topic_field = next_field(&cursor);
@@ -758,7 +771,7 @@ static void load_retained_record(char *fields)
      * wrote the raw name too (the trailing '/' it added lived only in the
      * key), so the same rule migrates both formats without inventing a level
      */
-    struct topic *t = topic_store_get_or_put(server.store, (char *)topic);
+    struct topic *t = topic_store_get_or_put(server->store, (char *)topic);
 
     if (t->retained) {
         /* Two records for the same topic: the last one wins */
@@ -778,7 +791,7 @@ static void load_retained_record(char *fields)
     t->retained = pkt;
 }
 
-static void load_sub_record(char *fields)
+static void load_sub_record(struct server *server, char *fields)
 {
     char *cursor       = fields;
     char *id_field     = next_field(&cursor);
@@ -802,7 +815,7 @@ static void load_sub_record(char *fields)
         return;
     }
 
-    struct client_session *s = load_session_id((const char *)id);
+    struct client_session *s = load_session_id(server, (const char *)id);
     free_memory(id);
     if (!s) {
         free_memory(filter);
@@ -867,7 +880,7 @@ static unsigned char *decode_payload(const char *field, size_t *len)
     return hex_decode(field, len);
 }
 
-static void load_queued_record(char *fields)
+static void load_queued_record(struct server *server, char *fields)
 {
     char *cursor      = fields;
     char *id_field    = next_field(&cursor);
@@ -913,7 +926,7 @@ static void load_queued_record(char *fields)
         return;
     }
 
-    struct client_session *s = load_session_id((const char *)id);
+    struct client_session *s = load_session_id(server, (const char *)id);
     if (s) {
         int qos = atoi(qos_field);
         if (qos < AT_LEAST_ONCE || qos > EXACTLY_ONCE)
@@ -932,7 +945,7 @@ static void load_queued_record(char *fields)
     free_memory(payload);
 }
 
-static void load_inflight_record(char *fields)
+static void load_inflight_record(struct server *server, char *fields)
 {
     char *cursor      = fields;
     char *id_field    = next_field(&cursor);
@@ -966,7 +979,7 @@ static void load_inflight_record(char *fields)
         return;
     }
 
-    struct client_session *s = load_session_id((const char *)id);
+    struct client_session *s = load_session_id(server, (const char *)id);
     if (s) {
         int qos = atoi(qos_field);
         if (qos < AT_LEAST_ONCE || qos > EXACTLY_ONCE)
@@ -980,7 +993,7 @@ static void load_inflight_record(char *fields)
     free_memory(payload);
 }
 
-static void load_inflight_del_record(char *fields)
+static void load_inflight_del_record(struct server *server, char *fields)
 {
     char *cursor     = fields;
     char *id_field   = next_field(&cursor);
@@ -1000,13 +1013,13 @@ static void load_inflight_del_record(char *fields)
         return;
     }
 
-    struct client_session *s = find_session_id((const char *)id);
+    struct client_session *s = find_session_id(server, (const char *)id);
     if (s)
         session_restore_inflight_del(s, mid);
     free_memory(id);
 }
 
-static void load_ack_record(char *fields)
+static void load_ack_record(struct server *server, char *fields)
 {
     char *cursor      = fields;
     char *id_field    = next_field(&cursor);
@@ -1026,13 +1039,13 @@ static void load_ack_record(char *fields)
         return;
     }
 
-    struct client_session *s = load_session_id((const char *)id);
+    struct client_session *s = load_session_id(server, (const char *)id);
     if (s)
         session_restore_ack(s, mid, (time_t)strtol(sent_field, NULL, 10));
     free_memory(id);
 }
 
-static void load_q2_record(char *fields)
+static void load_q2_record(struct server *server, char *fields)
 {
     char *cursor     = fields;
     char *id_field   = next_field(&cursor);
@@ -1051,13 +1064,13 @@ static void load_q2_record(char *fields)
         return;
     }
 
-    struct client_session *s = load_session_id((const char *)id);
+    struct client_session *s = load_session_id(server, (const char *)id);
     if (s)
         session_restore_q2(s, mid);
     free_memory(id);
 }
 
-static void load_q2_del_record(char *fields)
+static void load_q2_del_record(struct server *server, char *fields)
 {
     char *cursor     = fields;
     char *id_field   = next_field(&cursor);
@@ -1077,13 +1090,13 @@ static void load_q2_del_record(char *fields)
         return;
     }
 
-    struct client_session *s = find_session_id((const char *)id);
+    struct client_session *s = find_session_id(server, (const char *)id);
     if (s)
         session_restore_q2_del(s, mid);
     free_memory(id);
 }
 
-static void load_retained_clear_record(char *fields)
+static void load_retained_clear_record(struct server *server, char *fields)
 {
     char *cursor      = fields;
     char *topic_field = next_field(&cursor);
@@ -1100,7 +1113,7 @@ static void load_retained_clear_record(char *fields)
         return;
     }
 
-    struct topic *t = topic_store_get(server.store, (const char *)topic);
+    struct topic *t = topic_store_get(server->store, (const char *)topic);
     if (t && t->retained) {
         DECREF(t->retained, struct mqtt_packet);
         t->retained = NULL;
@@ -1108,7 +1121,7 @@ static void load_retained_clear_record(char *fields)
     free_memory(topic);
 }
 
-static void load_unsub_record(char *fields)
+static void load_unsub_record(struct server *server, char *fields)
 {
     char *cursor       = fields;
     char *id_field     = next_field(&cursor);
@@ -1130,14 +1143,14 @@ static void load_unsub_record(char *fields)
         return;
     }
 
-    struct client_session *s = find_session_id((const char *)id);
+    struct client_session *s = find_session_id(server, (const char *)id);
     if (s)
         session_unsubscribe(s, (const char *)filter);
     free_memory(id);
     free_memory(filter);
 }
 
-static void load_dropped_record(char *fields)
+static void load_dropped_record(struct server *server, char *fields)
 {
     char *cursor     = fields;
     char *id_field   = next_field(&cursor);
@@ -1157,13 +1170,13 @@ static void load_dropped_record(char *fields)
         return;
     }
 
-    struct client_session *s = find_session_id((const char *)id);
+    struct client_session *s = find_session_id(server, (const char *)id);
     if (s)
         session_restore_dropped(s, mid);
     free_memory(id);
 }
 
-static void load_flush_record(char *fields)
+static void load_flush_record(struct server *server, char *fields)
 {
     char *cursor     = fields;
     char *id_field   = next_field(&cursor);
@@ -1182,13 +1195,13 @@ static void load_flush_record(char *fields)
         return;
     }
 
-    struct client_session *s = find_session_id((const char *)id);
+    struct client_session *s = find_session_id(server, (const char *)id);
     if (s)
         session_flush_queue(s, strtoul(count_field, NULL, 10));
     free_memory(id);
 }
 
-static void load_session_del_record(char *fields)
+static void load_session_del_record(struct server *server, char *fields)
 {
     char *cursor     = fields;
     char *id_field   = next_field(&cursor);
@@ -1205,11 +1218,11 @@ static void load_session_del_record(char *fields)
                     "skipped");
         return;
     }
-    session_delete((const char *)id);
+    session_delete(server, (const char *)id);
     free_memory(id);
 }
 
-static bool load_line(char *line)
+static bool load_line(struct server *server, char *line)
 {
     if (line[0] == '#' || line[0] == '\0')
         return false;
@@ -1220,11 +1233,11 @@ static bool load_line(char *line)
         return false;
 
     if (STREQ(tag, "retained-clear", 14)) {
-        load_retained_clear_record(cursor);
+        load_retained_clear_record(server, cursor);
     } else if (STREQ(tag, "retained", 8)) {
-        load_retained_record(cursor);
+        load_retained_record(server, cursor);
     } else if (STREQ(tag, "session-del", 11)) {
-        load_session_del_record(cursor);
+        load_session_del_record(server, cursor);
     } else if (STREQ(tag, "session", 7)) {
         size_t id_len      = 0;
         char *id_field     = next_field(&cursor);
@@ -1233,28 +1246,28 @@ static bool load_line(char *line)
             log_warning("Malformed session record, skipped");
             return false;
         }
-        load_session_id((const char *)id);
+        load_session_id(server, (const char *)id);
         free_memory(id);
     } else if (STREQ(tag, "sub", 3)) {
-        load_sub_record(cursor);
+        load_sub_record(server, cursor);
     } else if (STREQ(tag, "unsub", 5)) {
-        load_unsub_record(cursor);
+        load_unsub_record(server, cursor);
     } else if (STREQ(tag, "queued", 6)) {
-        load_queued_record(cursor);
+        load_queued_record(server, cursor);
     } else if (STREQ(tag, "inflight-del", 12)) {
-        load_inflight_del_record(cursor);
+        load_inflight_del_record(server, cursor);
     } else if (STREQ(tag, "inflight", 8)) {
-        load_inflight_record(cursor);
+        load_inflight_record(server, cursor);
     } else if (STREQ(tag, "dropped", 7)) {
-        load_dropped_record(cursor);
+        load_dropped_record(server, cursor);
     } else if (STREQ(tag, "flush", 5)) {
-        load_flush_record(cursor);
+        load_flush_record(server, cursor);
     } else if (STREQ(tag, "ack", 3)) {
-        load_ack_record(cursor);
+        load_ack_record(server, cursor);
     } else if (STREQ(tag, "q2-del", 6)) {
-        load_q2_del_record(cursor);
+        load_q2_del_record(server, cursor);
     } else if (STREQ(tag, "q2", 2)) {
-        load_q2_record(cursor);
+        load_q2_record(server, cursor);
     } else {
         log_warning("Unknown persistence record '%s', skipped", tag);
         return false;
@@ -1327,8 +1340,8 @@ static unsigned long long snapshot_header(char *content,
  * records it already contains; a trailing fragment without its newline is an
  * append a crash cut short and is ignored rather than parsed
  */
-static unsigned long load_records(char *content, unsigned long skip,
-                                  size_t *applied)
+static unsigned long load_records(struct server *server, char *content,
+                                  unsigned long skip, size_t *applied)
 {
     unsigned long index = 0;
     char *line          = content;
@@ -1339,7 +1352,7 @@ static unsigned long load_records(char *content, unsigned long skip,
             break;
         *eol = '\0';
         if (line[0] != '#' && line[0] != '\0') {
-            if (index >= skip && load_line(line))
+            if (index >= skip && load_line(server, line))
                 (*applied)++;
             index++;
         }
@@ -1348,7 +1361,7 @@ static unsigned long load_records(char *content, unsigned long skip,
     return index;
 }
 
-void persistence_load(const char *path)
+void persistence_load(struct server *server, const char *path)
 {
     if (!path || !path[0])
         return;
@@ -1371,7 +1384,7 @@ void persistence_load(const char *path)
                  path);
     } else {
         snap_gen = snapshot_header(content, &snap_records);
-        load_records(content, 0, &applied);
+        load_records(server, content, 0, &applied);
         log_info("Restored %lu records from %s", (unsigned long)applied, path);
         free_memory(content);
     }
@@ -1429,7 +1442,7 @@ void persistence_load(const char *path)
                 unsigned long skip = gen == snap_gen ? snap_records : 0;
                 size_t replayed    = 0;
                 load_version       = 2;
-                wal_records        = load_records(content, skip, &replayed);
+                wal_records = load_records(server, content, skip, &replayed);
                 wal_generation     = gen;
                 wal_seen           = true;
                 log_info("Replayed %lu records from %s (generation %llu)",

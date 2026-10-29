@@ -32,6 +32,7 @@
 #include <stddef.h>
 #include <time.h>
 
+struct server;
 struct topic;
 struct mqtt_packet;
 struct io_event;
@@ -52,14 +53,16 @@ bool outgoing_reserve(struct client *, size_t);
 struct inflight_msg *session_inflight(struct client_session *,
                                       unsigned short);
 
-int publish_message(struct mqtt_packet *, const struct topic *);
+int publish_message(struct server *, struct mqtt_packet *,
+                    const struct topic *);
 
 /*
  * Create a persistent session and register it in the server map, the entry
  * point the persistence loader uses to rebuild what it read back from disk.
  * Meant to run before the event loops start: it takes no lock
  */
-struct client_session *session_restore(const char *session_id);
+struct client_session *session_restore(struct server *server,
+                                       const char *session_id);
 
 /*
  * Register `filter` for `session`, exactly like one tuple of a SUBSCRIBE
@@ -126,7 +129,7 @@ bool session_drop_oldest_queued(struct client_session *);
  * holds, exactly like the teardown of a clean session does. Used by the
  * persistence loader to replay a `session-del` record
  */
-void session_delete(const char *session_id);
+void session_delete(struct server *server, const char *session_id);
 
 /*
  * Remove one filter from a session, the body of an UNSUBSCRIBE tuple shared
@@ -139,7 +142,7 @@ bool session_unsubscribe(struct client_session *, const char *filter);
  * (exact topic key, wildcard subscriber attach): acquires the locks it needs
  * itself
  */
-void publish_lwt(struct mqtt_packet *);
+void publish_lwt(struct server *, struct mqtt_packet *);
 
 int handle_command(unsigned, struct io_event *);
 

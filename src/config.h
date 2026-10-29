@@ -208,8 +208,6 @@ struct config {
     bool require_client_cert;
 };
 
-extern struct config *conf;
-
 /*
  * Authentication structure to represent a login composed by username and salt.
  * It's an hashable structure, for more info check
@@ -233,15 +231,15 @@ struct authentication {
         }                                                                      \
     } while (0);
 
-void config_set_default(void);
-void config_print(void);
-int config_load(const char *);
+void config_set_default(struct config *);
+void config_print(const struct config *);
+int config_load(struct config *, const char *);
 /*
  * Cross field and file checks (port range, TLS files, password/ACL files).
  * config_load() only parses; this is what --check-config and the startup
  * path call once the command line overrides are applied.
  */
-bool config_check(void);
+bool config_check(const struct config *);
 bool config_read_passwd_file(const char *, struct authentication **);
 char *time_to_string(size_t);
 char *memory_to_string(size_t);

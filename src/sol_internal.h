@@ -234,6 +234,9 @@ enum client_status {
 struct client {
     struct ev_ctx
         *ctx;   /* An event context refrence mostly used to fire write events */
+    struct server *server; /* The broker this connection belongs to, the way
+                              handlers reach the config and the shared maps
+                              without a process wide global */
     int rc;     /* Return code of the message just handled */
     int status; /* Current status of the client (state machine) */
     volatile atomic_int rpos;    /* The nr of bytes to skip after a complete
@@ -329,6 +332,9 @@ struct client_session {
     bool clean_session;               /* Clean session flag */
     char session_id[MQTT_CLIENT_ID_LEN]; /* The client_id the session refers to
                                           */
+    struct server *server; /* The broker that owns the session, so the helpers
+                              called from persistence and from a client both
+                              find the shared maps without a global */
     struct mqtt_packet
         lwt_msg;    /* A possibly NULL LWT message, will be set on connection */
     /*

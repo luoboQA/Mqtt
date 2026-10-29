@@ -31,6 +31,8 @@
 #include "mqtt.h"
 #include <openssl/ssl.h>
 
+struct config;
+
 /*
  * Number of worker threads to be created. Each one will host his own ev_ctx
  * loop. This doesn't take into account the main thread, so to know the total
@@ -53,6 +55,8 @@
  */
 #define BASE_CLIENTS_NUM     1024
 
+struct server;
+
 /*
  * IO event structure, the argument handed to the command handlers. It pairs
  * the client the bytes arrived on with the decoded packet: process_message()
@@ -64,6 +68,7 @@
  */
 struct io_event {
     struct client *client;
+    struct server *server;
     struct mqtt_packet data;
 };
 
@@ -116,6 +121,12 @@ extern struct sol_info info;
  * messages to push out and acks respectively.
  */
 struct server {
+    /*
+     * The configuration this broker runs with: owned by main() and only read
+     * after startup, so every module gets it through the server instead of a
+     * process wide global
+     */
+    struct config *conf;
     // The main topics store
     struct topic_store *store;
     // A memory pool for clients allocation
@@ -138,7 +149,6 @@ struct server {
     SSL_CTX *ssl_ctx;
 };
 
-extern struct server server;
 
 /*
  * Main entry point for the server, to be called with an address and a port
@@ -146,7 +156,7 @@ extern struct server server;
  * error occurs or listen call fails, on the other cases it should just log
  * unexpected errors.
  */
-int start_server(const char *, const char *);
+int start_server(struct server *, const char *, const char *);
 
 /*
  * Fire a write callback to reply after a client request, under the hood it

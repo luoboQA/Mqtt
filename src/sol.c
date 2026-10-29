@@ -43,11 +43,24 @@
 /* PID file written after daemonize(), removed on a clean shutdown */
 static const char *pid_path;
 
+/*
+ * The descriptor the signal handler wakes the loops through. It is copied
+ * here from the configuration because a signal handler may only touch
+ * async-signal-safe state: it cannot dereference the struct config, which
+ * main() owns, and a process wide pointer would just move the global
+ */
+#ifdef __linux__
+static int signal_run_fd = -1;
+#else
+static int signal_run_pipe[2] = {-1, -1};
+#endif
+
 static void sigint_handler(int signum)
 {
     (void)signum;
 #ifdef __linux__
-    (void)eventfd_write(conf->run, 1);
+    if (signal_run_fd >= 0)
+        (void)eventfd_write(signal_run_fd, 1);
 #else
     /*
      * Write to the pipe's write end (index 1), the read end (index 0) is
@@ -55,7 +68,9 @@ static void sigint_handler(int signum)
      * and left the loops hanging, so SIGTERM could never stop the broker
      * without a kill -9
      */
-    (void)write(conf->run[1], &(unsigned long){1}, sizeof(unsigned long));
+    if (signal_run_pipe[1] >= 0)
+        (void)write(signal_run_pipe[1], &(unsigned long){1},
+                    sizeof(unsigned long));
 #endif
 }
 
@@ -116,6 +131,18 @@ void print_help(char *me)
 int main(int argc, char **argv)
 {
 
+    /*
+     * The configuration and the broker state live on main()'s stack: every
+     * module receives the struct server * it needs, so there is no process
+     * wide `conf` or `server` to reach for (and the tests can build as many
+     * brokers as they want)
+     */
+    struct config cfg;
+    struct server srv;
+    memset(&cfg, 0, sizeof(cfg));
+    memset(&srv, 0, sizeof(srv));
+    srv.conf = &cfg;
+
     /* NULL means "not given on the command line" */
     char *addr       = NULL;
     char *port       = NULL;
@@ -135,12 +162,19 @@ int main(int argc, char **argv)
         {NULL, 0, NULL, 0}};
 
     // Set default configuration
-    config_set_default();
+    config_set_default(&cfg);
+#ifdef __linux__
+    signal_run_fd = cfg.run;
+#else
+    signal_run_pipe[0] = cfg.run[0];
+    signal_run_pipe[1] = cfg.run[1];
+#endif
 
     /*
-     * The handlers read conf->run, so they must be installed only after
-     * config_set_default() has created it: a signal arriving in between used
-     * to dereference a NULL conf from inside the handler itself
+     * The handlers read the run descriptor, so they must be installed only
+     * after config_set_default() has created it: a signal arriving in
+     * between used to dereference a NULL configuration from inside the
+     * handler itself
      */
     struct sigaction sa = {0};
     sa.sa_handler       = sigint_handler;
@@ -202,7 +236,7 @@ int main(int argc, char **argv)
     }
 
     // Try to load a configuration, if found
-    int loaded = config_load(confpath);
+    int loaded = config_load(&cfg, confpath);
 
     /*
      * A missing or malformed file is fatal when it was named explicitly (or
@@ -223,26 +257,26 @@ int main(int argc, char **argv)
      * (this very bug made the integration tests connect to a closed port)
      */
     if (addr) {
-        if (strlen(addr) >= sizeof(conf->hostname)) {
+        if (strlen(addr) >= sizeof(cfg.hostname)) {
             fprintf(stderr, "Address too long\n");
             exit(EXIT_FAILURE);
         }
-        strcpy(conf->hostname, addr);
+        strcpy(cfg.hostname, addr);
     }
     if (port) {
-        if (strlen(port) >= sizeof(conf->port)) {
+        if (strlen(port) >= sizeof(cfg.port)) {
             fprintf(stderr, "Port too long\n");
             exit(EXIT_FAILURE);
         }
-        strcpy(conf->port, port);
+        strcpy(cfg.port, port);
     }
 
     /* -v forces DEBUG, without it the level set by the conf file (or the
      * default one) stands */
     if (debug == 1)
-        conf->loglevel = DEBUG;
+        cfg.loglevel = DEBUG;
 
-    if (!config_check()) {
+    if (!config_check(&cfg)) {
         fprintf(stderr, "Configuration check failed: %s\n", confpath);
         exit(EXIT_FAILURE);
     }
@@ -252,18 +286,18 @@ int main(int argc, char **argv)
         exit(EXIT_SUCCESS);
     }
 
-    sol_log_init(conf->logpath, conf->loglevel);
+    sol_log_init(cfg.logpath, cfg.loglevel);
 
     if (daemon == 1)
         daemonize();
 
-    if (write_pid_file(conf->pid_file) < 0)
+    if (write_pid_file(cfg.pid_file) < 0)
         exit(EXIT_FAILURE);
 
     // Print configuration
-    config_print();
+    config_print(&cfg);
 
-    start_server(conf->hostname, conf->port);
+    start_server(&srv, cfg.hostname, cfg.port);
 
     remove_pid_file();
     sol_log_close();

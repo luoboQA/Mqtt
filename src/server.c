@@ -76,9 +76,9 @@ static void ip_key(const char *ip, char *out, size_t outsz)
 }
 
 /* Caller holds the global mutex. False when the peer is over its limit */
-static bool ip_conn_acquire(const char *ip)
+static bool ip_conn_acquire(struct server *server, const char *ip)
 {
-    if (conf->max_connections_per_ip == 0)
+    if (server->conf->max_connections_per_ip == 0)
         return true;
 
     char key[INET6_ADDRSTRLEN + 8];
@@ -86,7 +86,7 @@ static bool ip_conn_acquire(const char *ip)
 
     struct ip_conn *entry = NULL;
     HASH_FIND_STR(ip_conns, key, entry);
-    if (entry && entry->count >= conf->max_connections_per_ip)
+    if (entry && entry->count >= server->conf->max_connections_per_ip)
         return false;
     if (!entry) {
         entry = try_alloc(sizeof(*entry));
@@ -101,9 +101,9 @@ static bool ip_conn_acquire(const char *ip)
 }
 
 /* Caller holds the global mutex */
-static void ip_conn_release(const char *ip)
+static void ip_conn_release(struct server *server, const char *ip)
 {
-    if (conf->max_connections_per_ip == 0 || !ip || !ip[0])
+    if (server->conf->max_connections_per_ip == 0 || !ip || !ip[0])
         return;
     char key[INET6_ADDRSTRLEN + 8];
     ip_key(ip, key, sizeof(key));
@@ -129,6 +129,7 @@ static void ip_conn_release(const char *ip)
 struct listen_payload {
     int fd;
     bool cronjobs;
+    struct server *server;
     /*
      * Slot this loop owns in the `loops` array below. Every thread gets a
      * payload of its own: they used to share one struct, and a worker could
@@ -155,9 +156,6 @@ static const double SOL_SECONDS = 88775.24;
  * periodically to internal topics
  */
 struct sol_info info;
-
-/* Broker global instance, contains the topic trie and the clients hashtable */
-struct server server;
 
 /*
  * TCP server, based on I/O multiplexing abstraction called ev_ctx. Each thread
@@ -273,7 +271,7 @@ static void client_shutdown(struct ev_ctx *ctx, struct client *c, int rc)
     pthread_mutex_unlock(&c->mutex);
 #endif
     if (lwt_session) {
-        publish_lwt(&lwt_session->lwt_msg);
+        publish_lwt(c->server, &lwt_session->lwt_msg);
         DECREF(lwt_session, struct client_session);
     }
     // Clean resources
@@ -401,12 +399,12 @@ static const char *solerr(int rc)
  * publish_message() is called with the lock released (it acquires it
  * itself), so the lookup and the publish cannot share one critical section
  */
-static struct topic *stats_topic(const char *name)
+static struct topic *stats_topic(struct server *server, const char *name)
 {
 #if THREADSNR > 0
     pthread_mutex_lock(&mutex);
 #endif
-    struct topic *t = topic_store_get(server.store, name);
+    struct topic *t = topic_store_get(server->store, name);
 #if THREADSNR > 0
     pthread_mutex_unlock(&mutex);
 #endif
@@ -432,6 +430,8 @@ static void collect_store_stats(struct trie_node *node, void *arg)
 
 static void publish_stats(struct ev_ctx *ctx, void *data)
 {
+    struct server *server = ctx->data;
+    struct config *conf   = server->conf;
     (void)data;
     (void)ctx;
 
@@ -497,12 +497,12 @@ static void publish_stats(struct ev_ctx *ctx, void *data)
 #if THREADSNR > 0
     pthread_mutex_lock(&mutex);
 #endif
-    for (struct client_session *s = server.sessions; s; s = s->hh.next) {
+    for (struct client_session *s = server->sessions; s; s = s->hh.next) {
         sessions++;
         subscriptions += list_size(s->subscriptions);
         inflight += s->inflights;
     }
-    topic_store_map(server.store, NULL, collect_store_stats, &st);
+    topic_store_map(server->store, NULL, collect_store_stats, &st);
 #if THREADSNR > 0
     pthread_mutex_unlock(&mutex);
 #endif
@@ -539,7 +539,7 @@ static void publish_stats(struct ev_ctx *ctx, void *data)
         p.publish.topic      = (unsigned char *)sys_topics[i].name;            \
         p.publish.payloadlen = strlen(val);                                    \
         p.publish.payload    = (unsigned char *)(val);                         \
-        publish_message(&p, stats_topic(sys_topics[i].name));                  \
+        publish_message(server, &p, stats_topic(server, sys_topics[i].name)); \
     } while (0)
 
     PUBLISH_STAT(0, ctotal);   /* $SOL/broker/clients/           */
@@ -574,6 +574,8 @@ static void publish_stats(struct ev_ctx *ctx, void *data)
  */
 static void inflight_msg_check(struct ev_ctx *ctx, void *data)
 {
+    struct server *server = ctx->data;
+    struct config *conf   = server->conf;
     (void)data;
     (void)ctx;
     size_t size    = 0;
@@ -582,7 +584,7 @@ static void inflight_msg_check(struct ev_ctx *ctx, void *data)
 #if THREADSNR > 0
     pthread_mutex_lock(&mutex);
 #endif
-    HASH_ITER(hh, server.clients_map, c, tmp)
+    HASH_ITER(hh, server->clients_map, c, tmp)
     {
         if (!c || !c->connected || !c->session || !has_inflight(c->session))
             continue;
@@ -712,6 +714,7 @@ static void keepalive_timeout_callback(struct ev_ctx *ctx, void *arg)
  */
 static void keepalive_check(struct ev_ctx *ctx, void *data)
 {
+    struct server *server = ctx->data;
     (void)data;
     /*
      * The one second tick is also where a SIGHUP requested log reopen is
@@ -723,7 +726,7 @@ static void keepalive_check(struct ev_ctx *ctx, void *data)
 #if THREADSNR > 0
     pthread_mutex_lock(&mutex);
 #endif
-    HASH_ITER(hh, server.clients_map, c, tmp)
+    HASH_ITER(hh, server->clients_map, c, tmp)
     {
         if (!c || !c->connected || c->keepalive == 0)
             continue;
@@ -761,6 +764,8 @@ static void keepalive_check(struct ev_ctx *ctx, void *data)
  */
 static void memory_check(struct ev_ctx *ctx, void *data)
 {
+    struct server *server = ctx->data;
+    struct config *conf   = server->conf;
     (void)ctx;
     (void)data;
 
@@ -782,7 +787,7 @@ static void memory_check(struct ev_ctx *ctx, void *data)
      * connections again, and waiting for the next reclamation interval would
      * keep it refusing them for up to `reclaim_interval` seconds
      */
-    if (!reclaim && !server.over_memory)
+    if (!reclaim && !server->over_memory)
         return;
 
 #if THREADSNR > 0
@@ -791,13 +796,13 @@ static void memory_check(struct ev_ctx *ctx, void *data)
 
     /* Level one: the topics nothing refers to anymore */
     if (reclaim)
-        topic_store_reclaim(server.store);
+        topic_store_reclaim(server->store);
 
     /* Level two: the oldest queued messages, until the limit is honoured */
     over = limited && memory_used() > conf->max_memory;
     if (over) {
         struct client_session *s, *tmp;
-        HASH_ITER(hh, server.sessions, s, tmp)
+        HASH_ITER(hh, server->sessions, s, tmp)
         {
             while (limited && memory_used() > conf->max_memory &&
                    session_drop_oldest_queued(s))
@@ -813,14 +818,14 @@ static void memory_check(struct ev_ctx *ctx, void *data)
      * byte has been reclaimed
      */
     bool still_over = limited && memory_used() > conf->max_memory;
-    if (still_over && !server.over_memory)
+    if (still_over && !server->over_memory)
         log_warning("Memory over the limit (%lu bytes used, %lu allowed): "
                     "refusing new connections until it drops",
                     (unsigned long)memory_used(),
                     (unsigned long)conf->max_memory);
-    else if (!still_over && server.over_memory)
+    else if (!still_over && server->over_memory)
         log_info("Memory back under the limit, accepting connections again");
-    server.over_memory = still_over;
+    server->over_memory = still_over;
 
 #if THREADSNR > 0
     pthread_mutex_unlock(&mutex);
@@ -839,6 +844,8 @@ static void memory_check(struct ev_ctx *ctx, void *data)
  */
 static void persistence_check(struct ev_ctx *ctx, void *data)
 {
+    struct server *server = ctx->data;
+    struct config *conf   = server->conf;
     (void)ctx;
     (void)data;
 
@@ -855,7 +862,7 @@ static void persistence_check(struct ev_ctx *ctx, void *data)
     pthread_mutex_lock(&mutex);
 #endif
     if (persistence_is_dirty())
-        persistence_save(conf->persistence_file);
+        persistence_save(server, conf->persistence_file);
 #if THREADSNR > 0
     pthread_mutex_unlock(&mutex);
 #endif
@@ -874,6 +881,7 @@ static void persistence_check(struct ev_ctx *ctx, void *data)
  */
 static void client_init(struct client *client)
 {
+    struct config *conf   = client->server->conf;
     client->online        = true;
     client->connected     = false;
     client->clean_session = true;
@@ -931,6 +939,7 @@ static void client_init(struct client *client)
  */
 static bool client_deactivate_locked(struct client *client)
 {
+    struct server *server = client->server;
 
     /*
      * Canonical lock order: the global mutex is always taken before the
@@ -956,7 +965,7 @@ static bool client_deactivate_locked(struct client *client)
     client->online = false;
 
     /* The peer address slot taken at accept time is free again */
-    ip_conn_release(client->conn.ip);
+    ip_conn_release(server, client->conn.ip);
 
     /*
      * The clients map indexes live connections only: drop the entry no
@@ -968,12 +977,12 @@ static bool client_deactivate_locked(struct client *client)
      * reconnected client was sitting right there
      */
     if (client->connected == true)
-        HASH_DEL(server.clients_map, client);
+        HASH_DEL(server->clients_map, client);
 
     if (client->clean_session == true && client->session) {
         /* The same teardown a CONNECT with clean_session over a persistent
            session performs, and the one the log records as session-del */
-        session_delete(client->client_id);
+        session_delete(server, client->client_id);
         client->session = NULL;
     }
     /*
@@ -999,7 +1008,7 @@ static bool client_deactivate_locked(struct client *client)
      * one pool slot per persistent client disconnect, and the slot kept
      * its rbuf/wbuf alive with it forever
      */
-    memorypool_free(server.pool, client);
+    memorypool_free(server->pool, client);
     return true;
 }
 
@@ -1065,8 +1074,9 @@ static void kick_callback(struct ev_ctx *ctx, void *arg)
 void server_kick_duplicate(const char *client_id, const struct client *keep,
                            struct mqtt_packet *will)
 {
-    struct client *old = NULL;
-    HASH_FIND_STR(server.clients_map, client_id, old);
+    struct server *server = keep->server;
+    struct client *old    = NULL;
+    HASH_FIND_STR(server->clients_map, client_id, old);
     /*
      * The map holds one entry per live connection: a duplicate key can only
      * be a client that is still connected while a new CONNECT arrives with
@@ -1102,7 +1112,7 @@ void server_kick_duplicate(const char *client_id, const struct client *keep,
     if (will && old->has_lwt && old->session &&
         old->session->lwt_msg.publish.topic)
         mqtt_packet_copy(will, &old->session->lwt_msg);
-    HASH_DEL(server.clients_map, old);
+    HASH_DEL(server->clients_map, old);
     old->connected = false;
     /*
      * The victim publishes nothing on its own from now on: the will was
@@ -1137,6 +1147,7 @@ void server_kick_duplicate(const char *client_id, const struct client *keep,
  */
 static bool recv_reserve(struct client *c, size_t len)
 {
+    struct config *conf = c->server->conf;
     if (len > conf->max_request_size)
         return false;
     if (len <= c->rbuf_cap)
@@ -1168,7 +1179,7 @@ static bool recv_reserve(struct client *c, size_t len)
  */
 static ssize_t recv_packet(struct client *c)
 {
-
+    struct config *conf = c->server->conf;
     ssize_t nread   = 0;
     unsigned opcode = 0, pos = 0;
     usize pktlen    = 0;
@@ -1489,7 +1500,9 @@ static void write_callback(struct ev_ctx *ctx, void *arg)
  */
 static void accept_callback(struct ev_ctx *ctx, void *data)
 {
-    int serverfd = *((int *)data);
+    struct server *server = ctx->data;
+    struct config *conf   = server->conf;
+    int serverfd          = *((int *)data);
     while (1) {
 
         /*
@@ -1498,7 +1511,8 @@ static void accept_callback(struct ev_ctx *ctx, void *data)
          * pointer passed as argument
          */
         struct connection conn;
-        connection_init(&conn, conf->tls ? server.ssl_ctx : NULL);
+        connection_init(&conn, conf->tls ? server->ssl_ctx : NULL,
+                        conf->socket_family);
         int fd = accept_connection(&conn, serverfd);
         /*
          * A negative descriptor is a failed accept (the TLS handshake could
@@ -1535,7 +1549,7 @@ static void accept_callback(struct ev_ctx *ctx, void *data)
          * would abandon it for good. The listening socket is level triggered,
          * so a small nap keeps the loop from spinning on a refusal
          */
-        if (server.over_memory) {
+        if (server->over_memory) {
             log_debug("Refusing connection from %s: memory over the limit",
                       conn.ip);
             close_connection(&conn);
@@ -1546,15 +1560,15 @@ static void accept_callback(struct ev_ctx *ctx, void *data)
 #if THREADSNR > 0
         pthread_mutex_lock(&mutex);
 #endif
-        struct client *c = memorypool_alloc(server.pool);
+        struct client *c = memorypool_alloc(server->pool);
         /*
          * Take the peer address slot in the same critical section: the
          * table is global, and a client that fails the per IP quota must
          * give its pool slot back before the lock is released
          */
-        bool ip_ok = c != NULL && ip_conn_acquire(conn.ip);
+        bool ip_ok = c != NULL && ip_conn_acquire(server, conn.ip);
         if (c && !ip_ok)
-            memorypool_free(server.pool, c);
+            memorypool_free(server->pool, c);
 #if THREADSNR > 0
         pthread_mutex_unlock(&mutex);
 #endif
@@ -1575,7 +1589,8 @@ static void accept_callback(struct ev_ctx *ctx, void *data)
             close_connection(&conn);
             break;
         }
-        c->conn = conn;
+        c->conn   = conn;
+        c->server = server;
         client_init(c);
         c->ctx = ctx;
 
@@ -1669,7 +1684,8 @@ static void read_callback(struct ev_ctx *ctx, void *data)
  */
 static void process_message(struct ev_ctx *ctx, struct client *c)
 {
-    struct io_event io = {.client = c};
+    struct server *server = c->server;
+    struct io_event io    = {.client = c, .server = server};
     /*
      * Unpack received bytes into a mqtt_packet structure and execute the
      * correct handler based on the type of the operation.
@@ -1801,10 +1817,13 @@ static void stop_handler(struct ev_ctx *ctx, void *arg)
 static void eventloop_start(void *args)
 {
     struct listen_payload *loop_data = args;
+    struct server *server            = loop_data->server;
+    struct config *conf              = server->conf;
     struct ev_ctx *ctx               = try_alloc(sizeof(*ctx));
     int sfd                          = loop_data->fd;
     loops[loop_data->index]          = ctx;
     ev_init(ctx, EVENTLOOP_MAX_EVENTS);
+    ctx->data = server;
     /*
      * Register the shared run descriptor: on Linux it is the eventfd, on
      * other platforms the *read* end of the pipe (index 0). The write end
@@ -1867,27 +1886,28 @@ void enqueue_event_write(const struct client *c)
  * error occurs or listen call fails, on the other cases it should just log
  * unexpected errors.
  */
-int start_server(const char *addr, const char *port)
+int start_server(struct server *server, const char *addr, const char *port)
 {
+    struct config *conf = server->conf;
 
     INIT_INFO;
 
     /* Initialize global Sol instance */
-    server.store = topic_store_new();
-    server.auths = NULL;
-    server.pool  = memorypool_new(BASE_CLIENTS_NUM, sizeof(struct client));
-    if (!server.pool)
+    server->store = topic_store_new();
+    server->auths = NULL;
+    server->pool  = memorypool_new(BASE_CLIENTS_NUM, sizeof(struct client));
+    if (!server->pool)
         log_fatal("Failed to allocate %d sized memory pool for clients",
                   BASE_CLIENTS_NUM);
     log_info("Client pool: %d blocks of %zu bytes, grown on demand",
              BASE_CLIENTS_NUM, sizeof(struct client));
-    server.clients_map = NULL;
-    server.sessions    = NULL;
-    server.over_memory = false;
+    server->clients_map = NULL;
+    server->sessions    = NULL;
+    server->over_memory = false;
     pthread_mutex_init(&mutex, NULL);
 
     if (conf->allow_anonymous == false)
-        if (!config_read_passwd_file(conf->password_file, &server.auths))
+        if (!config_read_passwd_file(conf->password_file, &server->auths))
             log_error("Failed to read password file");
 
     /* Generate stats topics */
@@ -1895,7 +1915,7 @@ int start_server(const char *addr, const char *port)
         struct topic *t = topic_new(try_strdup(sys_topics[i].name));
         if (!t)
             log_fatal("start_server failed: Out of memory");
-        topic_store_put(server.store, t);
+        topic_store_put(server->store, t);
     }
 
     /*
@@ -1911,7 +1931,7 @@ int start_server(const char *addr, const char *port)
      * so no client can race it, and persistence_load() takes no lock for the
      * same reason
      */
-    persistence_load(conf->persistence_file);
+    persistence_load(server, conf->persistence_file);
 
     /*
      * A limit below what the broker already holds would refuse every new
@@ -1925,29 +1945,33 @@ int start_server(const char *addr, const char *port)
                     conf->max_memory, memory_used());
 
     /* Start listening for new connections */
-    int sfd = make_listen(addr, port, conf->socket_family);
+    int sfd = make_listen(addr, port, conf->socket_family, conf);
 
     /* Setup SSL in case of flag true */
     if (conf->tls == true) {
         openssl_init();
-        server.ssl_ctx = create_ssl_context();
-        load_certificates(server.ssl_ctx, conf->cafile, conf->certfile,
+        server->ssl_ctx = create_ssl_context(conf);
+        load_certificates(server->ssl_ctx, conf->cafile, conf->certfile,
                           conf->keyfile, conf->require_client_cert);
     }
 
     log_info("Server start");
     info.start_time                  = time(NULL);
 
-    struct listen_payload main_loop = {.fd = sfd, .cronjobs = true,
-                                       .index = THREADSNR};
+    struct listen_payload main_loop = {.fd      = sfd,
+                                       .cronjobs = true,
+                                       .server   = server,
+                                       .index    = THREADSNR};
 
 #if THREADSNR > 0
     pthread_t thrs[THREADSNR];
     /* One payload per thread, alive until the joins below */
     struct listen_payload worker_loops[THREADSNR];
     for (int i = 0; i < THREADSNR; ++i) {
-        worker_loops[i] = (struct listen_payload){.fd = sfd, .cronjobs = false,
-                                                  .index = i};
+        worker_loops[i] = (struct listen_payload){.fd      = sfd,
+                                                  .cronjobs = false,
+                                                  .server   = server,
+                                                  .index    = i};
         pthread_create(&thrs[i], NULL, (void *(*)(void *)) & eventloop_start,
                        &worker_loops[i]);
     }
@@ -1977,16 +2001,16 @@ int start_server(const char *addr, const char *port)
      * loop has stopped by now, so there is no lock left to take
      */
     if (conf->persistence_file[0] && persistence_is_dirty())
-        persistence_save(conf->persistence_file);
+        persistence_save(server, conf->persistence_file);
 
     close(sfd);
-    AUTH_DESTROY(server.auths);
+    AUTH_DESTROY(server->auths);
     acl_destroy();
-    topic_store_destroy(server.store);
+    topic_store_destroy(server->store);
 
     /* Destroy SSL context, if any present */
     if (conf->tls == true) {
-        SSL_CTX_free(server.ssl_ctx);
+        SSL_CTX_free(server->ssl_ctx);
         openssl_cleanup();
     }
     pthread_mutex_destroy(&mutex);

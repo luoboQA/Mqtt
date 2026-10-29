@@ -31,6 +31,8 @@
 
 #include <arpa/inet.h>
 #include <openssl/ssl.h>
+
+struct config;
 #include <stdbool.h>
 
 // Socket families
@@ -58,6 +60,9 @@ struct connection {
     int fd;
     SSL *ssl;
     SSL_CTX *ctx;
+    /* Socket family of the listener, so accept_conn() knows whether
+     * TCP_NODELAY applies without reaching for the global configuration */
+    int family;
     /*
      * Big enough for the worst case "IPv6 literal in brackets + port", i.e.
      * [ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535 plus the NUL: the old
@@ -71,9 +76,9 @@ struct connection {
     void (*close)(struct connection *);
 };
 
-void connection_init(struct connection *, const SSL_CTX *);
+void connection_init(struct connection *, const SSL_CTX *, int);
 
-struct connection *connection_new(const SSL_CTX *);
+struct connection *connection_new(const SSL_CTX *, int);
 
 int accept_connection(struct connection *, int);
 
@@ -87,7 +92,7 @@ void close_connection(struct connection *);
  * Create a non-blocking socket and make it listen on the specfied address and
  * port
  */
-int make_listen(const char *, const char *, int);
+int make_listen(const char *, const char *, int, const struct config *);
 
 /* I/O management functions */
 
@@ -104,7 +109,7 @@ ssize_t send_bytes(int, const unsigned char *, size_t);
 ssize_t recv_bytes(int, unsigned char *, size_t);
 
 // Init SSL context
-SSL_CTX *create_ssl_context(void);
+SSL_CTX *create_ssl_context(const struct config *);
 
 /* Init openssl library */
 void openssl_init(void);

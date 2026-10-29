@@ -40,10 +40,6 @@
 #include "network.h"
 #include "util.h"
 
-/* The main configuration structure */
-static struct config config;
-struct config *conf;
-
 /*
  * Number of problems found by the last config_load(): an unknown key, an
  * unparsable value, an out of range number. The parser keeps going so the
@@ -380,7 +376,8 @@ static bool set_config_str(const char *key, char *dest, size_t destsz,
     return true;
 }
 
-static bool add_config_value(const char *key, const char *value)
+static bool add_config_value(struct config *c, const char *key,
+                            const char *value)
 {
 
     size_t klen = strlen(key);
@@ -392,22 +389,22 @@ static bool add_config_value(const char *key, const char *value)
          * INFORMATION, which the parser used to ignore without warning */
         for (size_t i = 0; i < sizeof(lmap) / sizeof(*lmap); i++) {
             if (STREQ(lmap[i].lname, value, vlen) == true) {
-                config.loglevel = lmap[i].loglevel;
+                c->loglevel = lmap[i].loglevel;
                 return true;
             }
         }
         config_error(key, value, "unknown log level");
         return false;
     } else if (STREQ("log_path", key, klen) == true) {
-        return set_config_str(key, config.logpath, sizeof(config.logpath),
+        return set_config_str(key, c->logpath, sizeof(c->logpath),
                               value);
     } else if (STREQ("unix_socket", key, klen) == true) {
-        config.socket_family = UNIX;
-        return set_config_str(key, config.hostname, sizeof(config.hostname),
+        c->socket_family = UNIX;
+        return set_config_str(key, c->hostname, sizeof(c->hostname),
                               value);
     } else if (STREQ("ip_address", key, klen) == true) {
-        config.socket_family = INET;
-        return set_config_str(key, config.hostname, sizeof(config.hostname),
+        c->socket_family = INET;
+        return set_config_str(key, c->hostname, sizeof(c->hostname),
                               value);
     } else if (STREQ("ip_port", key, klen) == true) {
         unsigned port = 0;
@@ -415,89 +412,89 @@ static bool add_config_value(const char *key, const char *value)
             config_error(key, value, "not a TCP port between 1 and 65535");
             return false;
         }
-        return set_config_str(key, config.port, sizeof(config.port), value);
+        return set_config_str(key, c->port, sizeof(c->port), value);
     } else if (STREQ("max_memory", key, klen) == true) {
         if (!parse_memory(value, &num) || num == 0) {
             config_error(key, value, "expected a positive size, e.g. 512MB");
             return false;
         }
-        config.max_memory = num;
+        c->max_memory = num;
     } else if (STREQ("max_request_size", key, klen) == true) {
         if (!parse_memory(value, &num) || num < MQTT_MIN_REQUEST_SIZE) {
             config_error(key, value,
                          "expected a size of at least 16 bytes, e.g. 512KB");
             return false;
         }
-        config.max_request_size = num;
+        c->max_request_size = num;
     } else if (STREQ("tcp_backlog", key, klen) == true) {
         unsigned backlog = 0;
         if (!parse_port(value, &backlog)) {
             config_error(key, value, "expected a positive number");
             return false;
         }
-        config.tcp_backlog =
+        c->tcp_backlog =
             (int)(backlog <= SOMAXCONN ? backlog : SOMAXCONN);
     } else if (STREQ("stats_publish_interval", key, klen) == true) {
         if (!parse_interval(value, &num) || num == 0) {
             config_error(key, value, "expected a positive interval, e.g. 10s");
             return false;
         }
-        config.stats_pub_interval = num;
+        c->stats_pub_interval = num;
     } else if (STREQ("keepalive", key, klen) == true) {
         /* 0 is a valid value here: it disables the configured cap */
         if (!parse_interval(value, &num)) {
             config_error(key, value, "expected an interval, e.g. 60s or 0");
             return false;
         }
-        config.keepalive = num;
+        c->keepalive = num;
     } else if (STREQ("retransmit_interval", key, klen) == true) {
         if (!parse_interval(value, &num) || num == 0) {
             config_error(key, value, "expected a positive interval, e.g. 20s");
             return false;
         }
-        config.retransmit_interval = num;
+        c->retransmit_interval = num;
     } else if (STREQ("cafile", key, klen) == true) {
-        config.tls = true;
-        return set_config_str(key, config.cafile, sizeof(config.cafile),
+        c->tls = true;
+        return set_config_str(key, c->cafile, sizeof(c->cafile),
                               value);
     } else if (STREQ("certfile", key, klen) == true) {
-        return set_config_str(key, config.certfile, sizeof(config.certfile),
+        return set_config_str(key, c->certfile, sizeof(c->certfile),
                               value);
     } else if (STREQ("keyfile", key, klen) == true) {
-        return set_config_str(key, config.keyfile, sizeof(config.keyfile),
+        return set_config_str(key, c->keyfile, sizeof(c->keyfile),
                               value);
     } else if (STREQ("allow_anonymous", key, klen) == true) {
         if (strcasecmp(value, "true") == 0)
-            config.allow_anonymous = true;
+            c->allow_anonymous = true;
         else if (strcasecmp(value, "false") == 0)
-            config.allow_anonymous = false;
+            c->allow_anonymous = false;
         else {
             config_error(key, value, "expected true or false");
             return false;
         }
     } else if (STREQ("acl_file", key, klen) == true) {
-        return set_config_str(key, config.acl_file, sizeof(config.acl_file),
+        return set_config_str(key, c->acl_file, sizeof(c->acl_file),
                               value);
     } else if (STREQ("persistence_file", key, klen) == true) {
-        return set_config_str(key, config.persistence_file,
-                              sizeof(config.persistence_file), value);
+        return set_config_str(key, c->persistence_file,
+                              sizeof(c->persistence_file), value);
     } else if (STREQ("persistence_interval", key, klen) == true) {
         if (!parse_interval(value, &num) || num == 0) {
             config_error(key, value, "expected a positive interval, e.g. 30s");
             return false;
         }
-        config.persistence_interval = num;
+        c->persistence_interval = num;
     } else if (STREQ("reclaim_interval", key, klen) == true) {
         if (!parse_interval(value, &num) || num == 0) {
             config_error(key, value, "expected a positive interval, e.g. 60s");
             return false;
         }
-        config.reclaim_interval = num;
+        c->reclaim_interval = num;
     } else if (STREQ("password_file", key, klen) == true) {
-        return set_config_str(key, config.password_file,
-                              sizeof(config.password_file), value);
+        return set_config_str(key, c->password_file,
+                              sizeof(c->password_file), value);
     } else if (STREQ("pid_file", key, klen) == true) {
-        return set_config_str(key, config.pid_file, sizeof(config.pid_file),
+        return set_config_str(key, c->pid_file, sizeof(c->pid_file),
                               value);
     } else if (STREQ("max_inflight", key, klen) == true) {
         unsigned n = 0;
@@ -506,7 +503,7 @@ static bool add_config_value(const char *key, const char *value)
                          "expected a non negative number of messages");
             return false;
         }
-        config.max_inflight = n;
+        c->max_inflight = n;
     } else if (STREQ("max_publish_rate", key, klen) == true) {
         unsigned n = 0;
         if (!parse_uint(value, &n)) {
@@ -515,7 +512,7 @@ static bool add_config_value(const char *key, const char *value)
                          "second");
             return false;
         }
-        config.max_publish_rate = n;
+        c->max_publish_rate = n;
     } else if (STREQ("max_connections_per_ip", key, klen) == true) {
         unsigned n = 0;
         if (!parse_uint(value, &n)) {
@@ -523,12 +520,12 @@ static bool add_config_value(const char *key, const char *value)
                          "expected a non negative number of connections");
             return false;
         }
-        config.max_connections_per_ip = n;
+        c->max_connections_per_ip = n;
     } else if (STREQ("require_client_cert", key, klen) == true) {
         if (strcasecmp(value, "true") == 0)
-            config.require_client_cert = true;
+            c->require_client_cert = true;
         else if (strcasecmp(value, "false") == 0)
-            config.require_client_cert = false;
+            c->require_client_cert = false;
         else {
             config_error(key, value, "expected true or false");
             return false;
@@ -552,7 +549,7 @@ static bool add_config_value(const char *key, const char *value)
             protocols |= parsed;
             token = strtok_r(NULL, ",", &saveptr);
         }
-        config.tls_protocols = protocols;
+        c->tls_protocols = protocols;
     } else {
         config_error(key, value, "unknown configuration key");
         return false;
@@ -582,7 +579,7 @@ static inline void unpack_bytes(char **str, char *dest, size_t destsz)
     dest[i] = '\0';
 }
 
-int config_load(const char *configpath)
+int config_load(struct config *c, const char *configpath)
 {
 
     assert(configpath);
@@ -640,7 +637,7 @@ int config_load(const char *configpath)
 
         // At this point we have key -> value ready to be ingested on the
         // global configuration object
-        add_config_value(key, value);
+        add_config_value(c, key, value);
     }
 
     fclose(fh);
@@ -656,14 +653,14 @@ int config_load(const char *configpath)
  * Cross field checks, run after the command line overrides so that a bad -p
  * is caught as well. Returns false and logs every problem found.
  */
-bool config_check(void)
+bool config_check(const struct config *c)
 {
     unsigned before = config_errors;
 
-    if (config.socket_family == INET) {
+    if (c->socket_family == INET) {
         unsigned port = 0;
-        if (!parse_port(config.port, &port))
-            config_error("ip_port", config.port,
+        if (!parse_port(c->port, &port))
+            config_error("ip_port", c->port,
                          "not a TCP port between 1 and 65535");
     }
 
@@ -674,9 +671,9 @@ bool config_check(void)
      * one clear message instead of three OpenSSL errors followed by exit()
      * from inside start_server()
      */
-    if (config.tls) {
-        const char *files[] = {config.cafile, config.certfile,
-                               config.keyfile};
+    if (c->tls) {
+        const char *files[] = {c->cafile, c->certfile,
+                               c->keyfile};
         const char *keys[]  = {"cafile", "certfile", "keyfile"};
         for (size_t i = 0; i < sizeof(files) / sizeof(*files); i++) {
             if (files[i][0] == '\0') {
@@ -688,86 +685,82 @@ bool config_check(void)
         }
     }
 
-    if (config.max_inflight > 65535)
+    if (c->max_inflight > 65535)
         config_error("max_inflight", "> 65535",
                      "the MQTT packet identifier space holds at most 65535 "
                      "messages in flight");
 
-    if (config.require_client_cert && !config.tls)
+    if (c->require_client_cert && !c->tls)
         config_error("require_client_cert", "true",
                      "requires TLS (set cafile, certfile and keyfile)");
 
-    if (config.allow_anonymous == false) {
-        if (config.password_file[0] == '\0')
+    if (c->allow_anonymous == false) {
+        if (c->password_file[0] == '\0')
             config_error("password_file", "",
                          "required when allow_anonymous is false");
-        else if (access(config.password_file, R_OK) != 0)
-            config_error("password_file", config.password_file,
+        else if (access(c->password_file, R_OK) != 0)
+            config_error("password_file", c->password_file,
                          "file is not readable");
     }
 
-    if (config.acl_file[0] != '\0' && access(config.acl_file, R_OK) != 0)
-        config_error("acl_file", config.acl_file, "file is not readable");
+    if (c->acl_file[0] != '\0' && access(c->acl_file, R_OK) != 0)
+        config_error("acl_file", c->acl_file, "file is not readable");
 
     return config_errors == before;
 }
 
-void config_set_default(void)
+void config_set_default(struct config *c)
 {
-
-    // Set the global pointer
-    conf                 = &config;
-
     // Set default values
-    config.version       = VERSION;
-    config.socket_family = DEFAULT_SOCKET_FAMILY;
-    config.loglevel      = DEFAULT_LOG_LEVEL;
-    memset(config.logpath, 0x00, 0xFFF);
-    strcpy(config.hostname, DEFAULT_HOSTNAME);
-    strcpy(config.port, DEFAULT_PORT);
+    c->version       = VERSION;
+    c->socket_family = DEFAULT_SOCKET_FAMILY;
+    c->loglevel      = DEFAULT_LOG_LEVEL;
+    memset(c->logpath, 0x00, 0xFFF);
+    strcpy(c->hostname, DEFAULT_HOSTNAME);
+    strcpy(c->port, DEFAULT_PORT);
 #ifdef __linux__
-    config.run = eventfd(0, EFD_NONBLOCK);
+    c->run = eventfd(0, EFD_NONBLOCK);
 #else
-    pipe(config.run);
+    pipe(c->run);
 #endif
-    config.max_memory         = read_memory_with_mul(DEFAULT_MAX_MEMORY);
-    config.max_request_size   = read_memory_with_mul(DEFAULT_MAX_REQUEST_SIZE);
-    config.tcp_backlog        = SOMAXCONN;
-    config.stats_pub_interval = read_time_with_mul(DEFAULT_STATS_INTERVAL);
-    memset(config.acl_file, 0x00, sizeof(config.acl_file));
-    memset(config.persistence_file, 0x00, sizeof(config.persistence_file));
-    memset(config.pid_file, 0x00, sizeof(config.pid_file));
-    config.persistence_interval =
+    c->max_memory         = read_memory_with_mul(DEFAULT_MAX_MEMORY);
+    c->max_request_size   = read_memory_with_mul(DEFAULT_MAX_REQUEST_SIZE);
+    c->tcp_backlog        = SOMAXCONN;
+    c->stats_pub_interval = read_time_with_mul(DEFAULT_STATS_INTERVAL);
+    memset(c->acl_file, 0x00, sizeof(c->acl_file));
+    memset(c->persistence_file, 0x00, sizeof(c->persistence_file));
+    memset(c->pid_file, 0x00, sizeof(c->pid_file));
+    c->persistence_interval =
         read_time_with_mul(DEFAULT_PERSISTENCE_INTERVAL);
-    config.reclaim_interval = read_time_with_mul(DEFAULT_RECLAIM_INTERVAL);
-    config.keepalive          = read_time_with_mul(DEFAULT_KEEPALIVE);
-    config.retransmit_interval = read_time_with_mul(DEFAULT_RETRANSMIT);
-    config.max_inflight       = DEFAULT_MAX_INFLIGHT;
-    config.max_publish_rate   = 0;
-    config.max_connections_per_ip = 0;
-    config.require_client_cert = false;
-    config.tls                = false;
-    config.tls_protocols      = DEFAULT_TLS_PROTOCOLS;
-    config.allow_anonymous    = true;
+    c->reclaim_interval     = read_time_with_mul(DEFAULT_RECLAIM_INTERVAL);
+    c->keepalive            = read_time_with_mul(DEFAULT_KEEPALIVE);
+    c->retransmit_interval  = read_time_with_mul(DEFAULT_RETRANSMIT);
+    c->max_inflight         = DEFAULT_MAX_INFLIGHT;
+    c->max_publish_rate     = 0;
+    c->max_connections_per_ip = 0;
+    c->require_client_cert  = false;
+    c->tls                  = false;
+    c->tls_protocols        = DEFAULT_TLS_PROTOCOLS;
+    c->allow_anonymous      = true;
 }
 
-void config_print_tls_versions(void)
+static void config_print_tls_versions(const struct config *c)
 {
     char protocols[64] = {0};
     int pos            = 0;
-    if (config.tls_protocols & SOL_TLSv1) {
+    if (c->tls_protocols & SOL_TLSv1) {
         strncpy(protocols, "TLSv1, ", 64);
         pos += 7;
     }
-    if (config.tls_protocols & SOL_TLSv1_1) {
+    if (c->tls_protocols & SOL_TLSv1_1) {
         strncpy(protocols + pos, "TLSv1_1, ", 64 - pos);
         pos += 9;
     }
-    if (config.tls_protocols & SOL_TLSv1_2) {
+    if (c->tls_protocols & SOL_TLSv1_2) {
         strncpy(protocols + pos, "TLSv1_2, ", 64 - pos);
         pos += 9;
     }
-    if (config.tls_protocols & SOL_TLSv1_3) {
+    if (c->tls_protocols & SOL_TLSv1_3) {
         strncpy(protocols + pos, "TLSv1_3, ", 64 - pos);
         pos += 9;
     }
@@ -781,51 +774,51 @@ void config_print_tls_versions(void)
     log_info("\tTLS: %s", protocols);
 }
 
-void config_print(void)
+void config_print(const struct config *c)
 {
-    if (config.loglevel < WARNING) {
-        const char *sfamily = config.socket_family == UNIX ? "UNIX" : "TCP";
+    if (c->loglevel < WARNING) {
+        const char *sfamily = c->socket_family == UNIX ? "UNIX" : "TCP";
         const char *llevel  = NULL;
         for (int i = 0; i < 4; i++) {
-            if (lmap[i].loglevel == config.loglevel)
+            if (lmap[i].loglevel == c->loglevel)
                 llevel = lmap[i].lname;
         }
         log_info("Sol v%s is starting", VERSION);
         log_info("Network settings:");
         log_info("\tSocket family: %s", sfamily);
-        if (config.socket_family == UNIX) {
-            log_info("\tUnix socket: %s", config.hostname);
+        if (c->socket_family == UNIX) {
+            log_info("\tUnix socket: %s", c->hostname);
         } else {
-            log_info("\tAddress: %s", config.hostname);
-            log_info("\tPort: %s", config.port);
-            log_info("\tTcp backlog: %d", config.tcp_backlog);
-            log_info("\tKeepalive: %zu", config.keepalive);
-            log_info("\tRetransmit interval: %zu", config.retransmit_interval);
-            if (config.acl_file[0])
-                log_info("\tAccess control file: %s", config.acl_file);
-            if (config.persistence_file[0])
+            log_info("\tAddress: %s", c->hostname);
+            log_info("\tPort: %s", c->port);
+            log_info("\tTcp backlog: %d", c->tcp_backlog);
+            log_info("\tKeepalive: %zu", c->keepalive);
+            log_info("\tRetransmit interval: %zu", c->retransmit_interval);
+            if (c->acl_file[0])
+                log_info("\tAccess control file: %s", c->acl_file);
+            if (c->persistence_file[0])
                 log_info("\tPersistence file: %s (every %zu seconds)",
-                         config.persistence_file, config.persistence_interval);
-            if (config.tls == true)
-                config_print_tls_versions();
-            if (config.max_inflight)
+                         c->persistence_file, c->persistence_interval);
+            if (c->tls == true)
+                config_print_tls_versions(c);
+            if (c->max_inflight)
                 log_info("\tMax inflight messages per session: %u",
-                         config.max_inflight);
-            if (config.max_publish_rate)
+                         c->max_inflight);
+            if (c->max_publish_rate)
                 log_info("\tMax publish rate per client: %u msg/s",
-                         config.max_publish_rate);
-            if (config.max_connections_per_ip)
+                         c->max_publish_rate);
+            if (c->max_connections_per_ip)
                 log_info("\tMax connections per IP: %u",
-                         config.max_connections_per_ip);
+                         c->max_connections_per_ip);
             log_info("\tFile handles soft limit: %li", get_fh_soft_limit());
         }
-        const char *human_rsize = memory_to_string(config.max_request_size);
+        const char *human_rsize = memory_to_string(c->max_request_size);
         log_info("\tMax request size: %s", human_rsize);
         log_info("Logging:");
         log_info("\tlevel: %s", llevel);
-        if (config.logpath[0])
-            log_info("\tlogpath: %s", config.logpath);
-        const char *human_memory = memory_to_string(config.max_memory);
+        if (c->logpath[0])
+            log_info("\tlogpath: %s", c->logpath);
+        const char *human_memory = memory_to_string(c->max_memory);
         log_info("Max memory: %s", human_memory);
         log_info("Event loop backend: %s", EVENTLOOP_BACKEND);
         free_memory((char *)human_memory);

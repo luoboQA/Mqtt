@@ -74,45 +74,56 @@ bool persistence_is_dirty(void);
  * no-ops when persistence is disabled, during the initial load, and for the
  * state of a clean session (which the snapshot never keeps).
  */
+struct server;
 struct client_session;
 struct inflight_msg;
 
-void persistence_wal_retained(const char *topic, const unsigned char *payload,
-                              size_t len, unsigned char qos);
-void persistence_wal_retained_clear(const char *topic);
-void persistence_wal_session(const char *session_id);
-void persistence_wal_session_del(const char *session_id);
-void persistence_wal_sub(const char *session_id, const char *filter,
-                         unsigned char qos, bool multilevel);
-void persistence_wal_unsub(const char *session_id, const char *filter,
-                           bool multilevel);
-void persistence_wal_queued(const char *session_id, const char *topic,
-                            unsigned char qos, unsigned short mid,
+void persistence_wal_retained(struct server *server, const char *topic,
+                              const unsigned char *payload, size_t len,
+                              unsigned char qos);
+void persistence_wal_retained_clear(struct server *server,
+                                    const char *topic);
+void persistence_wal_session(struct server *server, const char *session_id);
+void persistence_wal_session_del(struct server *server,
+                                 const char *session_id);
+void persistence_wal_sub(struct server *server, const char *session_id,
+                         const char *filter, unsigned char qos,
+                         bool multilevel);
+void persistence_wal_unsub(struct server *server, const char *session_id,
+                           const char *filter, bool multilevel);
+void persistence_wal_queued(struct server *server, const char *session_id,
+                            const char *topic, unsigned char qos,
+                            unsigned short mid,
                             const unsigned char *payload, size_t len);
-void persistence_wal_dropped(const char *session_id, unsigned short mid);
-void persistence_wal_flush(const char *session_id, unsigned long count);
+void persistence_wal_dropped(struct server *server, const char *session_id,
+                             unsigned short mid);
+void persistence_wal_flush(struct server *server, const char *session_id,
+                           unsigned long count);
 void persistence_wal_inflight(struct client_session *session,
                               struct inflight_msg *imsg);
-void persistence_wal_inflight_del(const char *session_id, unsigned short mid);
-void persistence_wal_ack(const char *session_id, unsigned short mid,
-                         time_t ack_sent);
-void persistence_wal_q2(const char *session_id, unsigned short mid);
-void persistence_wal_q2_del(const char *session_id, unsigned short mid);
+void persistence_wal_inflight_del(struct server *server,
+                                  const char *session_id, unsigned short mid);
+void persistence_wal_ack(struct server *server, const char *session_id,
+                         unsigned short mid, time_t ack_sent);
+void persistence_wal_q2(struct server *server, const char *session_id,
+                        unsigned short mid);
+void persistence_wal_q2_del(struct server *server, const char *session_id,
+                            unsigned short mid);
 
 /* Truncate the log after a successful snapshot (compaction) */
-void persistence_wal_compact(void);
+void persistence_wal_compact(struct server *server);
 
 /*
  * Write the state to `path`. A NULL or empty path disables persistence
  * entirely, as does a file that cannot be opened (logged, not fatal)
  */
-void persistence_save(const char *path);
+void persistence_save(struct server *server, const char *path);
 
 /*
  * Rebuild the state saved by persistence_save(). Meant to run at startup,
  * before the event loops exist: it takes no lock and never fails, a missing
  * or unreadable file simply means "start empty"
  */
-void persistence_load(const char *path);
+void persistence_load(struct server *server, const char *path);
 
 #endif
