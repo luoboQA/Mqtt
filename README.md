@@ -24,9 +24,13 @@ hidden behind a promise the code does not keep.
   following one byte from the socket to another client, and a map of which
   file to touch for each kind of change.
 - [`docs/conformance.md`](docs/conformance.md) — the MQTT 3.1.1 conformance
-  matrix: every requirement, where it is implemented, which test covers it.
+  matrix: representative requirements, implementation locations, and tests,
+  with known deviations called out explicitly.
 - [`docs/design.md`](docs/design.md) — the design trade-offs: event loop and
-  threads, global state, topic indexes, persistence, memory policy, security.
+  threads, explicit broker context, topic indexes, persistence, memory policy,
+  security.
+- [`docs/teaching-guide.md`](docs/teaching-guide.md) — a suggested lesson path
+  with code-reading checkpoints and hands-on experiments.
 
                     ┌─────────────────────────────┐
                     │         sol.c (main)        │

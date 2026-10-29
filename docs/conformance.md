@@ -1,11 +1,23 @@
-# MQTT 3.1.1 一致性矩阵
+# MQTT 3.1.1 实现与一致性矩阵
 
-对照 OASIS MQTT v3.1.1 规范逐条列出实现状态。状态含义：
+对照基准是 [OASIS MQTT Version 3.1.1](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/mqtt-v3.1.1.html)。
+这份表用于源码教学走读，列出代表性要求、实现位置和对应测试；它不是 OASIS
+符合性认证，也不声称覆盖规范中的每一条要求。OASIS 对符合规范的服务器有
+更广的要求：相关章节里的全部 MUST 都必须满足。
 
-- **完整**：规范要求的行为已实现，且有测试覆盖。
-- **有意偏离**：规范允许实现自行决定，或本实现明确选择了更严格的策略，
-  在“说明”里写清理由。
-- **未实现**：v3.1.1 未要求，或属于已知边界。
+状态含义：
+
+- **完整**：本行描述的行为已实现，且有测试覆盖；不代表整个服务器已通过正式
+  符合性评估。
+- **实现策略**：规范留给服务器选择的行为，或规范之外的运维功能。
+- **有意偏离**：项目选择了会改变规范保证的行为；教学时要明确指出差异。
+- **未实现**：属于已知边界，且本项目没有实现。
+
+**重要边界**：`max_inflight` 会丢弃发给窗口已满会话的 QoS 1/2 投递，
+`max_memory` 会丢弃离线队列中的 QoS 1/2 消息；当前都不会因此终止会话。这是教学项目为了展示资源策略而作的简化。
+MQTT 3.1.1 要求持久会话保存断线期间匹配订阅的 QoS 1/2 消息；规范提及因管理
+或资源原因丢弃会话状态时，其效果是终止会话。因此这些限制不能作为可靠投递的
+符合性示例。参见规范 §3.1.2.4、§4.1。
 
 测试列中 `proto:` 指 `tests/mqtt_test.c` / `tests/topic_match_test.c` /
 `tests/config_test.c`，`it:` 指 `tests/integration/` 下的用例。
@@ -14,13 +26,13 @@
 
 | 条目 | 状态 | 实现 | 测试 / 说明 |
 |---|---|---|---|
-| §2.2 包类型 0 保留 | 完整 | `mqtt.c:mqtt_unpack` | `it:test_reserved_packet_type_zero` 断开连接 |
+| §2.2.1 包类型 0 保留 | 完整 | `mqtt.c:mqtt_unpack` | `it:test_reserved_packet_type_zero` 断开连接 |
 | §2.2.2 固定头 flags 必须合法 | 完整 | `valid_fixed_header_flags()` | `proto:mqtt::reject_*`、`it:test_subscribe_with_bad_flags_rejected` |
 | §2.2.3 Remaining Length 最多 4 字节 | 完整 | `recv_packet()` | `it:test_remaining_length_five_bytes` |
 | §2.2.3 Remaining Length 与实际字节一致 | 完整 | `mqtt_unpack()` 各分支 | 尾部多余字节按畸形包拒绝 |
-| §3.1.2.2 协议名必须是 `MQTT` | 完整 | `unpack_mqtt_connect()` | `it:test_bad_protocol_name` |
-| §3.1.2.2 协议级别必须是 4 | 完整 | `connect_handler()` | `it:test_connect_wrong_protocol_level` 回 0x01 |
-| §3.1.2.8 客户端不得发送 CONNACK/SUBACK/UNSUBACK/PINGRESP | 完整 | `protocol_violation_handler` | `it:test_pingresp_from_client` |
+| §3.1.2.1 协议名必须是 `MQTT` | 完整 | `unpack_mqtt_connect()` | `it:test_bad_protocol_name` |
+| §3.1.2.2 协议级别必须是 4 | 完整 | `unpack_mqtt_connect()` | `it:test_connect_wrong_protocol_level` 回 0x01 |
+| 客户端不得发送服务器专用包（CONNACK/SUBACK/UNSUBACK/PINGRESP） | 完整 | `protocol_violation_handler` | `it:test_pingresp_from_client` |
 | 包大小上限 | 有意偏离 | `conf->max_request_size` | 超过即断开，防止内存放大；v3.1.1 无协商机制 |
 | 客户端发 CONNECT 之前的包 | 完整 | `client->status` 检查 | `it:test_subscribe_before_connect`、`test_publish_before_connect` |
 
@@ -28,13 +40,13 @@
 
 | 条目 | 状态 | 实现 | 测试 / 说明 |
 |---|---|---|---|
-| §3.1.2.1 client id | 完整 | `MQTT_CLIENT_ID_LEN` | 最长 63 字节；更长的 id 拒绝（`it:test_long_client_id`） |
-| §3.1.2.3 clean session | 完整 | `connect_handler`、`client_deactivate` | 0 保留会话与离线队列，1 断开即删 |
-| §3.1.2.3 空 client id + clean session 0 | 完整 | `connect_handler` | 回 0x02 Identifier Rejected |
-| §3.1.2.5 遗嘱 flag 与 QoS/retain 组合 | 完整 | `unpack_mqtt_connect()` | 非法组合拒绝；遗嘱 payload 保留 NUL（`it:test_will_payload_keeps_nul_bytes`） |
-| §3.1.2.5 遗嘱主题不能含通配符 | 完整 | `connect_handler` | `it:test_will_topic_with_wildcard_rejected` |
+| §3.1.3.1 ClientId | 完整 | `MQTT_CLIENT_ID_LEN` | 最长 63 字节；更长的 id 拒绝（`it:test_long_client_id`）；支持规范要求的 1–23 字节字符集 |
+| §3.1.2.4 Clean Session | 完整 | `connect_handler`、`client_deactivate` | 0 保留会话与离线队列，1 断开即删；队列限额行为见下方偏离说明 |
+| §3.1.3.1 空 ClientId + Clean Session 0 | 完整 | `connect_handler` | 回 0x02 Identifier Rejected |
+| §3.1.2.5–.7 遗嘱 flag 与 QoS/retain 组合 | 完整 | `unpack_mqtt_connect()` | 非法组合拒绝；遗嘱 payload 保留 NUL（`it:test_will_payload_keeps_nul_bytes`） |
+| §3.1.3.2 遗嘱主题不能含通配符 | 完整 | `unpack_mqtt_connect()` | `it:test_will_topic_with_wildcard_rejected` |
 | §3.1.2.5 协议错误/踢下线时发布遗嘱 | 完整 | `process_message`、`server_kick_duplicate` | `it:test_will_published_on_protocol_error`、`test_will_published_on_client_id_takeover` |
-| §3.1.2.6 用户名/密码 | 完整 | `config_read_passwd_file`、`check_passwd` | `allow_anonymous=0` 时校验；错误回 0x04 |
+| §3.1.2.8/.9 用户名/密码标志和字段 | 完整 | `config_read_passwd_file`、`check_passwd` | `allow_anonymous=0` 时校验；错误回 0x04 |
 | §3.1.2.10 Keep Alive | 完整 | `keepalive_check()` | 1.5 倍超时断开；配置值是上限 |
 | §3.1.4 重复 client id 踢旧连接 | 完整 | `server_kick_duplicate()` | `it:test_duplicate_client_id_kicks_old` |
 | §3.2.2.2 session present | 完整 | `connect_handler` | 恢复持久会话时置 1 |
@@ -47,13 +59,13 @@
 |---|---|---|---|
 | §3.3.1.2 QoS 0/1/2 | 完整 | `unpack_mqtt_publish`、`publish_handler` | `it:test_qos_one_roundtrip`、`test_qos_two_*` |
 | §3.3.1.2 QoS 3 非法 | 完整 | `unpack_mqtt_publish` | `proto:mqtt::reject_qos3`、`it:test_publish_qos_three_rejected` |
-| §3.3.1.2 DUP flag | 完整 | 重传时置位 | `it:test_qos_one_retransmit_sets_dup` |
-| §3.3.1.3 主题名不能含 `+`/`#` | 完整 | `valid_topic_name()` | `it:test_publish_to_wildcard_topic` |
-| §3.3.1.3 主题名不能为空 | 完整 | `valid_topic_name()` | `proto:mqtt::reject_empty_topic` |
-| §3.3.1.1 QoS > 0 时 packet id 非 0 | 完整 | `unpack_mqtt_publish` | `it:test_publish_zero_mid_rejected` |
+| §3.3.1.1 DUP flag | 完整 | 重传时置位 | `it:test_qos_one_retransmit_sets_dup` |
+| §3.3.2.1 Topic Name 不能含 `+`/`#` | 完整 | `valid_topic_name()` | `it:test_publish_to_wildcard_topic` |
+| §3.3.2.1 / §4.7.3 Topic Name 不能为空 | 完整 | `valid_topic_name()` | `proto:mqtt::reject_empty_topic` |
+| §2.3.1 QoS > 0 时 packet id 非 0 | 完整 | `unpack_mqtt_publish` | `it:test_publish_zero_mid_rejected` |
 | §3.3.1.3 retain=1 保存保留消息 | 完整 | `publish_message()` | `it:test_retained_message` |
 | §3.3.1.3 retain=1 且空 payload 清除 | 完整 | `publish_message()` | 订阅后收不到 |
-| §3.3.1.3 发布到 `$` 主题 | 有意偏离 | `publish_handler` | 客户端发布被丢弃；`$SOL` 只由 broker 写 |
+| 客户端发布到 `$` 主题 | 实现策略 | `publish_handler` | 按 §4.7.2 的 SHOULD 保留 `$` 命名空间；客户端消息被丢弃，`$SOL` 由 broker 写 |
 | §3.3.4 QoS 1 回 PUBACK | 完整 | `publish_handler` | 收到 PUBACK 后清 inflight |
 | §3.3.4 QoS 2 回 PUBREC，PUBREL 后回 PUBCOMP | 完整 | `publish_handler`、`pubrel_handler` | `it:test_qos_two_counter_returns_to_zero` |
 | §4.3.3 入站 QoS 2 去重 | 完整 | `q2_recv_mids` | `it:test_qos_two_duplicate_publish_deduplicated` |
@@ -67,7 +79,7 @@
 | §3.6 PUBREL 清除入站 QoS2 状态并回 PUBCOMP | 完整 | `pubrel_handler` | `it:test_qos_two_*` |
 | §3.7 PUBCOMP 清除出站 QoS2 | 完整 | `pubcomp_handler` | `it:test_qos_two_counter_returns_to_zero` |
 | 未在途的 ack | 完整 | 各 ack handler | 忽略，不断开 |
-| §4.4 重传间隔与 DUP | 完整 | `inflight_msg_check()` | `retransmit_interval`；`it:test_qos_one_retransmit_sets_dup`、`test_qos_two_pubrel_retransmit` |
+| §4.4 重传间隔与 DUP | 完整 | `cron_inflight_msg_check()` | `retransmit_interval`；`it:test_qos_one_retransmit_sets_dup`、`test_qos_two_pubrel_retransmit` |
 
 ## 5. SUBSCRIBE / SUBACK
 
@@ -77,9 +89,9 @@
 | §3.8.3 至少一个 topic filter | 完整 | `unpack_mqtt_subscribe` | 空包拒绝 |
 | §3.8.3 请求 QoS 0/1/2 | 完整 | `unpack_mqtt_subscribe` | `it:test_subscribe_with_qos_*`、`test_subscribe_with_invalid_qos` |
 | §3.8.3 topic filter 语法 | 完整 | `valid_topic_filter()` | `+`/`#` 只能独占一层；非法项单独回 0x80 |
-| §3.8.4 SUBACK 顺序与返回码 | 完整 | `subscribe_handler` | 逐项 0x00/0x01/0x02/0x80 |
+| §3.9.3 SUBACK 顺序与返回码 | 完整 | `subscribe_handler` | 逐项 0x00/0x01/0x02/0x80 |
 | §3.8.4 ACL 拒绝的订阅回 0x80 | 完整 | `subscribe_handler` + `acl.c` | `it:test_denied_subscription_is_answered_with_failure_code` |
-| §3.8.4 订阅后立即投递保留消息 | 完整 | `subscribe_handler` | 重叠过滤器只投一次（`it:test_retained_overlapping_filters_delivered_once`） |
+| §3.3.1.6 订阅后投递保留消息 | 完整 | `subscribe_handler` | 重叠过滤器只投一次（`it:test_retained_overlapping_filters_delivered_once`） |
 | §3.8.4 保留消息按订阅 QoS 投递 | 完整 | `deliver_retained()` | `it:test_retained_delivered_at_subscription_qos` |
 
 ## 6. UNSUBSCRIBE / UNSUBACK
@@ -118,7 +130,7 @@
 | 离线队列按发布顺序 | 完整 | `session_queue_message()` | `it:test_offline_queue_keeps_publication_order` |
 | §4.6 同一客户端消息顺序 | 完整 | 单队列 + 单写缓冲 | QoS 0 与 QoS 1/2 共用顺序 |
 | 重连后重发 inflight | 完整 | `session_flush_queue()` | `it:test_inflight_message_survives_a_restart` |
-| 内存压力下丢最旧离线消息 | 有意偏离 | `session_drop_oldest_queued()` | 保证进程存活；规范未规定服务器资源耗尽行为 |
+| 内存压力下丢最旧离线 QoS 1/2 消息 | 有意偏离 | `session_drop_oldest_queued()` | 当前仍保留会话；会丢失持久会话的消息保存保证，不能概括为规范未规定 |
 | 遗嘱不持久化 | 有意偏离 | — | 遗嘱绑定网络连接，进程重启不补发 |
 
 ## 10. 安全与运维（规范之外）
@@ -132,11 +144,11 @@
 | 双向 TLS（`require_client_cert`） | 完整 | `network.c:load_certificates` | `it:test_tls.py::TestMutualTls` |
 | 匿名开关 | 完整 | `allow_anonymous` | 配置测试 |
 | UTF-8 校验（client id/username/主题/遗嘱/过滤器） | 完整 | `util.c:utf8_valid` | `proto:util::utf8_valid`、`proto:mqtt::reject_invalid_utf8_*`、`it:test_invalid_utf8_*` |
-| 每会话 inflight 窗口 | 完整 | `max_inflight` | `it:test_inflight_window_bounds_the_offline_queue` |
-| 每客户端发布限流 | 完整 | `max_publish_rate` | `it:test_publish_rate_limit_acks_but_drops` |
+| 每会话 inflight 窗口 | 有意偏离 | `max_inflight` | 窗口满时可丢在线或离线 QoS 1/2 投递；见本表顶部边界说明和 `it:test_inflight_window_bounds_the_offline_queue` |
+| 每客户端发布限流 | 实现策略 | `max_publish_rate` | 超限 PUBLISH 被确认后丢弃；这是规范之外的应用层限流策略，`it:test_publish_rate_limit_acks_but_drops` |
 | 每 IP 连接数上限 | 完整 | `max_connections_per_ip` | `it:test_max_connections_per_ip` |
 | 守护进程 | 完整 | `daemonize()` | `it:test_daemon.py` |
-| 统计主题 `$SOL` | 完整 | `publish_stats()` | `it:test_stats_topic` |
+| 统计主题 `$SOL` | 完整 | `cron_publish_stats()` | `it:test_stats_topic` |
 
 ## 11. 明确未实现
 

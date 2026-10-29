@@ -78,7 +78,7 @@ ev_register_cron/ev_fire_event/ev_stop`，上层不出现 `epoll_event` 之类�
 
 ## 3. 一个连接的完整生命周期
 
-1. **accept**：`accept_callback()` 从 `server.pool` 取一个 `struct client`，
+1. **accept**：`client_accept_callback()` 从 `server.pool` 取一个 `struct client`，
    初始化读写缓冲为 NULL/0（按需增长，空闲连接不占 64KB），注册 `EV_READ`。
 2. **分帧**：`recv_packet()` 先读 2 字节固定头，再按 Remaining Length 的
    变长编码算出总长；超过 `conf->max_request_size` 直接断开。缓冲区按需
@@ -143,7 +143,7 @@ publish_handler
 ```
 
 出站 QoS 1/2 的状态在 `session->i_msgs`（按 packet id 稀疏存放）和
-`pending_mids`（只扫描真正在途的 id）。`inflight_msg_check()` 每秒扫描一次，
+`pending_mids`（只扫描真正在途的 id）。`cron_inflight_msg_check()` 每秒扫描一次，
 超时重发并置 DUP；收到 PUBACK/PUBCOMP 后清除，PUBREC 后改发 PUBREL。
 
 ## 6. 持久化
@@ -153,7 +153,8 @@ publish_handler
 - 快照文件由 `persistence_file` 指定，默认关闭。内容：保留消息、持久会话的
   订阅、离线队列、inflight、PUBREL 阶段、入站 QoS2 去重集合。文件头有版本
   号，v1 记录在加载时迁移。
-- 每次状态变更先追加到 `<file>.wal` 并 `fsync`，再改内存；`persistence_check()`
+- 每次状态变更先追加到 `<file>.wal` 并 `fsync`，再改内存；
+  `cron_persistence_check()`
   每秒检查 `persistence_interval`，到点写新快照并清空/轮转 WAL。
 - 启动时先读快照，再按 generation 重放 WAL；已经在快照里的记录按序号跳过。
 - 干净退出（SIGINT/SIGTERM）会再写一次快照。
@@ -164,11 +165,11 @@ publish_handler
 
 所有堆分配走 `memory.c` 的 `try_alloc/try_calloc/try_realloc/free_memory`，
 它维护一个全局原子计数器，`memory_used()` 是 `max_memory` 判定的依据。
-`memory_check()` 每秒运行，超限时按顺序：
+`cron_memory_check()` 每秒运行，超限时按顺序：
 
 1. 回收没有任何订阅者/保留消息引用的主题（`topic_store_reclaim`）；
 2. 丢弃离线队列里最旧的消息（`session_drop_oldest_queued`）；
-3. 仍超限则置 `server.over_memory`，`accept_callback()` 拒绝新连接，直到
+3. 仍超限则置 `server.over_memory`，`client_accept_callback()` 拒绝新连接，直到
    内存回落到限制以下。
 
 客户端结构体来自 `memorypool.c` 的固定块池，避免频繁 malloc；读写缓冲按需
@@ -178,7 +179,7 @@ publish_handler
 
 - `struct sol_info info`：连接数、收发消息数、字节数、启动时间/uptime，全部
   原子类型。
-- `publish_stats()` 每 `stats_pub_interval` 秒向 `$SOL/...` 发布统计；这些
+- `cron_publish_stats()` 每 `stats_pub_interval` 秒向 `$SOL/...` 发布统计；这些
   主题对以通配符开头的订阅不可见（§4.7.2），只能显式订阅。
 - 日志在 `logging.c`，级别由 `log_level` 控制，`-v` 打开 DEBUG；支持
   `logpath` 写文件。
