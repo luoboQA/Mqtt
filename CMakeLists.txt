@@ -31,8 +31,10 @@ set(EXECUTABLE_OUTPUT_PATH ${CMAKE_BINARY_DIR})
 set(SOURCES
     src/acl.c
     src/bst.c
+    src/client.c
     src/config.c
     src/connect.c
+    src/cron.c
     src/ev.c
     src/handlers.c
     src/iterator.c

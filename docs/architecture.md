@@ -14,10 +14,15 @@
                                             │
                         ┌───────────────────▼─────────────────────┐
                         │                server.c                 │
-                        │ 监听 socket、事件循环、client 生命周期、  │
-                        │ 定时任务（统计/重传/keepalive/内存/持久化）│
-                        └───────┬───────────────────────┬─────────┘
-                                │                       │
+                        │ 监听 socket、事件循环、启动与关闭        │
+                        └───────┬──────────┬────────────┘
+                                │          │
+                    ┌───────────▼──┐   ┌───▼────────────┐
+                    │  client.c    │   │   cron.c       │
+                    │连接生命周期、│   │统计/重传/保活/│
+                    │网络回调      │   │内存/持久化任务│
+                    └───────┬──────┘   └───────┬────────┘
+                            │                  │
                  ┌──────────────▼──────────┐   ┌────────▼─────────────┐
                  │ handlers.c（分发表）      │   │  topic_store.c        │
                  │ connect.c  CONNECT/遗嘱  │   │  精确主题 + 通配索引   │
@@ -38,10 +43,12 @@
         └───────────────┘   └──────────────┘   └──────────────────┘
 ```
 
-依赖方向基本是单向的：`sol.c → server.c → handlers.c（及 connect/session/
-subscribe/publish）→ mqtt/topic_store/persistence/acl → memory/util`。
-`handlers_internal.h` 只放这几个命令模块之间共享的内部原型。`topic_match.c` 是叶子模块，不依赖任何东西，
-这是它能在没有 broker 的情况下被单测的原因。
+依赖方向基本是单向的：`sol.c → server.c → client.c/cron.c`，网络回调再进入
+`handlers.c`（及 `connect/session/subscribe/publish`），最终使用
+`mqtt/topic_store/persistence/acl → memory/util`。`handlers_internal.h` 和
+`server_internal.h` 分别放命令模块、服务器模块之间共享的内部原型。
+`topic_match.c` 是叶子模块，不依赖任何东西，这是它能在没有 broker 的情况下
+被单测的原因。
 
 ## 2. 进程、线程与事件循环
 
@@ -196,11 +203,13 @@ publish_handler
 | 改 QoS/会话行为 | `session.c`、`publish.c`、`sol_internal.h` |
 | 改 CONNECT/遗嘱 | `connect.c` |
 | 改订阅/保留消息 | `subscribe.c` |
-| 改连接/事件循环 | `server.c`、`ev.c`、`network.c` |
+| 改连接生命周期/网络回调 | `client.c`、`server_internal.h`、`network.c` |
+| 改事件循环/监听启停 | `server.c`、`ev.c`、`network.c` |
+| 改定时任务 | `cron.c`、`server_internal.h` |
 | 改持久化格式 | `persistence.c`、`tests/integration/test_persistence.py` |
 | 改配置项 | `config.c`、`config.h`、`etc/conf/sol.conf`、`tests/config_test.c` |
 | 改 ACL | `acl.c`、`tests/integration/test_acl.py` |
-| 改内存策略 | `memory.c`、`server.c:memory_check()` |
+| 改内存策略 | `memory.c`、`cron.c:cron_memory_check()` |
 
 ## 11. 已知边界
 

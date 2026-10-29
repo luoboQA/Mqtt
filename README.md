@@ -34,7 +34,7 @@ hidden behind a promise the code does not keep.
                     └──────────────┬──────────────┘
                                    │
                     ┌──────────────▼──────────────┐
-                    │      server.c (核心)         │
+                    │ server.c / client.c / cron.c │
                     │  event-loop + 回调 + 客户端池  │
                     └──┬────────┬────────┬─────────┘
                        │        │        │
