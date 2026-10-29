@@ -40,7 +40,8 @@ class TestPersistence(unittest.TestCase):
 
     def start_broker(self):
         self.broker = subprocess.Popen(
-            f'./sol -a {HOST} -p {PORT} -c {self.conf}'.split(),
+            f'{sol_test.broker_bin()} -a {HOST} -p {PORT} '
+            f'-c {self.conf}'.split(),
             stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
             preexec_fn=os.setsid)
         deadline = time.time() + 5

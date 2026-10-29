@@ -81,7 +81,8 @@ class TestDaemon(unittest.TestCase):
     def start_daemon(self):
         """Start the broker with -d and return once it is listening"""
         started = subprocess.run(
-            f'./sol -d -a {HOST} -p {PORT} -c {CONF_PATH}'.split(),
+            f'{sol_test.broker_bin()} -d -a {HOST} -p {PORT} '
+            f'-c {CONF_PATH}'.split(),
             timeout=5)
         self.assertEqual(started.returncode, 0,
                          'the parent should return immediately')

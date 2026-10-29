@@ -27,7 +27,8 @@ class TestTls(unittest.TestCase):
     def setUpClass(cls):
         ensure_certs()
         cls.broker = subprocess.Popen(
-            f'./sol -a {HOST} -p {PORT} -c {CONF}'.split(),
+            f'{sol_test.broker_bin()} -a {HOST} -p {PORT} '
+            f'-c {CONF}'.split(),
             stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
             preexec_fn=os.setsid)
         deadline = time.time() + 5

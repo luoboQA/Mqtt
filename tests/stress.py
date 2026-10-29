@@ -64,8 +64,8 @@ def main():
     args = parser.parse_args()
 
     broker = subprocess.Popen(
-        f'./sol -a 127.0.0.1 -p {args.port} -c tests/integration/'
-        f'sol_test.conf'.split(),
+        f'{sol_test.broker_bin()} -a 127.0.0.1 -p {args.port} '
+        f'-c tests/integration/sol_test.conf'.split(),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         preexec_fn=os.setsid)
     time.sleep(0.5)

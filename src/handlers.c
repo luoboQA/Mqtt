@@ -34,6 +34,7 @@
 #include "persistence.h"
 #include "server.h"
 #include "sol_internal.h"
+#include "topic_match.h"
 #include <stdio.h>
 
 /* Prototype for a command handler */
@@ -1009,82 +1010,6 @@ exit:
 }
 
 /*
- * Next '/' separated level of a topic or filter. Unlike the old helpers this
- * reports an empty level as a level of its own: "a/" is ["a", ""], which is
- * what makes it different from "a". Returns false once the string is
- * exhausted; `*p` is set to NULL at that point
- */
-static inline bool next_level(const char **p, const char **level, size_t *len)
-{
-    const char *start = *p;
-    if (!start)
-        return false;
-
-    const char *slash = strchr(start, '/');
-    *level            = start;
-    if (slash) {
-        *len = (size_t)(slash - start);
-        *p   = slash + 1;
-    } else {
-        *len = strlen(start);
-        *p   = NULL;
-    }
-    return true;
-}
-
-/*
- * Check if a topic matches a subscription filter, supporting the single level
- * wildcard '+' and the multilevel wildcard '#'. Topics and filters are keyed
- * exactly as written (MQTT v3.1.1 §4.7): levels are the sequences separated
- * by '/', and a trailing '/' introduces a final empty level.
- *
- * `multilevel` is only a hint from the caller (the filter ends with '#'): the
- * '#' itself is kept in the filter and matched below, so a v1 filter that was
- * stored with the wildcard stripped still matches its descendants
- */
-static inline int match_subscription(const char *topic, const char *wtopic,
-                                     bool multilevel)
-{
-    const char *wp = wtopic;
-    const char *tp = topic;
-    const char *w, *t;
-    size_t wlen, tlen;
-
-    /*
-     * MQTT v3.1.1 §4.7.2: a filter starting with a wildcard must never match
-     * a topic name beginning with '$' (the broker's own $SOL statistics live
-     * there), only a filter spelling the '$' explicitly is allowed to
-     */
-    if (topic[0] == '$' && (wp[0] == '#' || wp[0] == '+'))
-        return -SOL_ERR;
-
-    while (next_level(&wp, &w, &wlen)) {
-        /* '#' consumes the rest of the topic, including no level at all */
-        if (wlen == 1 && w[0] == '#')
-            return SOL_OK;
-
-        if (!next_level(&tp, &t, &tlen))
-            return -SOL_ERR;
-
-        /*
-         * '+' consumes exactly one level, whatever it contains (the empty
-         * level included), every other level is a literal that must match
-         * the topic byte for byte
-         */
-        if (!(wlen == 1 && w[0] == '+') &&
-            (wlen != tlen || memcmp(w, t, wlen) != 0))
-            return -SOL_ERR;
-    }
-
-    /*
-     * The filter is exhausted: the topic must be exhausted as well, unless
-     * the caller flagged the filter as multilevel (a v1 record whose '#' was
-     * stored as a prefix)
-     */
-    return (tp == NULL || multilevel) ? SOL_OK : -SOL_ERR;
-}
-
-/*
  * Command handlers
  */
 
@@ -1817,7 +1742,7 @@ bool topic_access_match(const char *topic, const char *filter)
     char *pattern = try_alloc(strlen(filter) + 1);
     bool multilevel = normalize_filter(pattern, filter);
 
-    bool match = match_subscription(topic, pattern, multilevel) == SOL_OK;
+    bool match = topic_match(topic, pattern, multilevel);
     free_memory(pattern);
     return match;
 }
@@ -1992,8 +1917,7 @@ static int subscribe_handler(struct io_event *e)
             if (sent[j])
                 continue;
             struct topic *t = rc.topics[j];
-            if (match_subscription(t->name, rd[i].filter,
-                                   rd[i].multilevel) != SOL_OK)
+            if (!topic_match(t->name, rd[i].filter, rd[i].multilevel))
                 continue;
             deliver_retained(c, t, rd[i].qos);
             sent[j] = true;
@@ -2084,7 +2008,7 @@ static void detach_wild_attached(struct client_session *session,
     while (item) {
         struct list_node *next = item->next;
         struct topic *t        = item->data;
-        if (match_subscription(t->name, filter, multilevel) == SOL_OK) {
+        if (topic_match(t->name, filter, multilevel)) {
             struct subscriber *sub = NULL;
             HASH_FIND_STR(t->subscribers, session->session_id, sub);
             if (sub && (sub->origins & SUBSCRIBER_WILD)) {

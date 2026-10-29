@@ -5,9 +5,15 @@ import signal
 import subprocess
 
 
+def broker_bin():
+    """Path of the broker under test: CTest points SOL_BIN at the freshly
+    built binary, a manual run falls back to the ./sol symlink"""
+    return os.environ.get('SOL_BIN', './sol')
+
+
 def start_broker(host='127.0.0.1', port=1883):
     proc = subprocess.Popen(
-        f'./sol -a {host} -p {port} '
+        f'{broker_bin()} -a {host} -p {port} '
         f'-c tests/integration/sol_test.conf'.split(),
         stdout=subprocess.PIPE,
         preexec_fn=os.setsid
